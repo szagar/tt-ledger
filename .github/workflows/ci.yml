@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests + dual-dialect migrations
+    runs-on: ubuntu-latest
+
+    # Throwaway Postgres for the dual-dialect guarantee.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+          POSTGRES_DB: ledger_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # asyncpg URL for the throwaway Postgres above
+      PG_URL: postgresql+asyncpg://ledger:ledger@localhost:5432/ledger_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (+ Python 3.12)
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package (dev + postgres + securities extras)
+        # [securities] pulls security-universe from GitHub (not yet on PyPI)
+        run: uv pip install --system -e ".[dev,postgres,securities]"
+
+      - name: Unit + smoke tests (SQLite and Postgres)
+        env:
+          TT_LEDGER_TEST_PG: ${{ env.PG_URL }}   # conftest adds this URL to the store_url fixture
+        run: pytest -q
+
+      - name: Migrations — SQLite (upgrade head)
+        env:
+          TT_LEDGER_DATABASE_URL: sqlite+aiosqlite:///./ci_sqlite.db
+        run: alembic upgrade head
+
+      - name: Migrations — Postgres (upgrade head)   # the dual-dialect guarantee
+        env:
+          TT_LEDGER_DATABASE_URL: ${{ env.PG_URL }}
+        run: alembic upgrade head
+
+      - name: Migrations — Postgres round-trip (downgrade base -> upgrade head)
+        env:
+          TT_LEDGER_DATABASE_URL: ${{ env.PG_URL }}
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Assert Postgres uses NUMERIC for Money columns (not INTEGER)
+        env:
+          PGPASSWORD: ledger
+        run: |
+          # The Money decorator must render NUMERIC on Postgres (docs/storage.md). Fail if any
+          # money column came through as integer/bigint.
+          got=$(psql -h localhost -U ledger -d ledger_test -tAc \
+            "select data_type from information_schema.columns
+             where table_name='securities' and column_name='strike'")
+          echo "securities.strike data_type = '$got'"
+          test "$got" = "numeric"

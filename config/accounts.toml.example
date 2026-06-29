@@ -1,0 +1,14 @@
+# config/accounts.toml — PLACEHOLDER values only. Copy to accounts.toml and fill in real
+# credentials locally; NEVER commit real logins, account numbers, or secrets.
+# See docs/identity.md → Rule 1.
+
+[trader1]                       # login = a broker credential set
+default       = "ACCT0001"
+client_id     = "CHANGE_ME"     # broker OAuth
+client_secret = "CHANGE_ME"
+refresh_token = "CHANGE_ME"
+
+  [trader1.accounts]
+  ACCT0001 = { nickname = "main" }
+  ACCT0002 = { nickname = "ira" }
+  PAPER001 = { nickname = "main_paper", env = "paper" }   # a paper nickname MUST contain "paper"

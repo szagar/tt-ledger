@@ -1,0 +1,12 @@
+# config/securities.toml — OPTIONAL. Only consumed by a security resolver you inject.
+# With the default PassthroughResolver (security_id == the vendor symbol), this file is unused.
+# See docs/symbology.md and docs/identity.md → Rule 2.
+
+# Example rules a CUSTOM resolver might read (the built-in passthrough ignores them):
+
+[index_option_roots]            # a resolver could route index options and keep the weekly root distinct
+SPX = ["SPX", "SPXW"]
+NDX = ["NDX", "NDXP"]
+
+[futures]                       # a resolver could attach exchange / multiplier / roll policy
+ES = { exchange = "CME", multiplier = 50 }
