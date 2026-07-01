@@ -14,12 +14,12 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from tt_ledger.enums import Ingest, Origin
+from tt_ledger.enums import Ingest, Origin, OrderStatus
 from tt_ledger.identity import AccountMapper, PassthroughResolver
 from tt_ledger.ingest.broker import BrokerPosition, BrokerTransaction, PlacedFill, PlacedLeg, PlacedOrder
 from tt_ledger.ingest.mock_broker import MockTastyTradeClient
 from tt_ledger.ingest.pull import sync_all, sync_orders, sync_positions, sync_transactions
-from tt_ledger.repositories import TransactionRepository
+from tt_ledger.repositories import TransactionRepository, map_order_status
 from tt_ledger.rows import ActivityFilter, OrderFilter, OrderRow, TradeGroupRow
 from tt_ledger.schema import metadata, models
 from tt_ledger.store.memory import InMemoryStore
@@ -62,8 +62,12 @@ async def test_sync_orders_creates_a_broker_order_with_legs_and_fills(store, acc
     assert order.security_id == "AAPL"  # single-leg -> order-level security_id set
     assert order.oms_status == "filled"
     assert order.tt_status == "Filled"
-    assert order.average_fill_price == Decimal("150.25")
+    assert order.average_fill_price == Decimal("150.25")  # derived from the leg's single fill
+    assert order.filled_quantity == Decimal("10")
+    assert order.remaining_quantity == Decimal("0")
     assert order.filled_at is not None
+    assert order.is_complex is False
+    assert order.complex_order_type is None
 
     order_id = store._orders.id_of("O-1")
     legs = [row for _, row in store._legs.all() if row.order_id == order_id]
@@ -128,7 +132,7 @@ async def test_sync_orders_multi_leg_iron_condor(store, accounts, resolver):
     client.add_order(
         PlacedOrder(
             id="O-IC", account_number="ACCT1", received_at=datetime(2026, 1, 5, tzinfo=UTC),
-            underlying_symbol="SPX", is_complex=True, complex_order_type="Iron Condor",
+            underlying_symbol="SPX", complex_order_id="CO-1", complex_order_tag="Iron Condor",
             status="Filled", terminal_at=datetime(2026, 1, 5, 10, tzinfo=UTC),
             legs=[
                 PlacedLeg(
@@ -151,6 +155,14 @@ async def test_sync_orders_multi_leg_iron_condor(store, accounts, resolver):
     orders = await store.query_orders(OrderFilter(account="main"))
     assert orders[0].security_id is None  # ambiguous across 2 legs -> left unset
     assert orders[0].underlying == "SPX"
+    # a 2-leg spread's net price isn't a plain average of its legs' fill prices, and TastyTrade's
+    # real Order object has no order-level fill fields anyway (verified against their OpenAPI
+    # spec) -- these stay unset for anything but a single-leg order.
+    assert orders[0].average_fill_price is None
+    assert orders[0].filled_quantity is None
+    assert orders[0].remaining_quantity is None
+    assert orders[0].is_complex is True
+    assert orders[0].complex_order_type == "Iron Condor"
 
     order_id = store._orders.id_of("O-IC")
     legs = sorted((row for _, row in store._legs.all() if row.order_id == order_id), key=lambda leg: leg.leg_index)
@@ -209,6 +221,42 @@ async def test_sync_orders_unrecognized_status_keeps_raw_tt_status(store, accoun
     order = (await store.query_orders(OrderFilter(account="main")))[0]
     assert order.oms_status is None
     assert order.tt_status == "Some Future TastyTrade Status"
+
+
+async def test_sync_orders_captures_reject_reason_as_status_message(store, accounts, resolver):
+    client = MockTastyTradeClient()
+    client.add_order(
+        PlacedOrder(
+            id="O-1", account_number="ACCT1", received_at=datetime(2026, 1, 5, tzinfo=UTC),
+            status="Rejected", reject_reason="Insufficient buying power",
+            terminal_at=datetime(2026, 1, 5, tzinfo=UTC),
+        )
+    )
+    await sync_orders(store, "main", client=client, accounts=accounts, resolver=resolver)
+
+    order = (await store.query_orders(OrderFilter(account="main")))[0]
+    assert order.oms_status == "rejected"
+    assert order.status_message == "Insufficient buying power"
+
+
+async def test_sync_orders_enrich_updates_status_message_from_reject_reason(store, accounts, resolver):
+    # seed a ZTS-origin order the way the (not-yet-implemented) push path would.
+    await store.upsert_orders(
+        [OrderRow(tt_order_id="O-1", account="main", origin=Origin.ZTS, ingest=Ingest.OMS_SUBMIT, oms_status="submitted")]
+    )
+    client = MockTastyTradeClient()
+    client.add_order(
+        PlacedOrder(
+            id="O-1", account_number="ACCT1", received_at=datetime(2026, 1, 5, tzinfo=UTC),
+            status="Rejected", reject_reason="Insufficient buying power",
+            terminal_at=datetime(2026, 1, 5, tzinfo=UTC),
+        )
+    )
+    await sync_orders(store, "main", client=client, accounts=accounts, resolver=resolver)
+
+    order = await store.get_order("O-1")
+    assert order.origin is Origin.ZTS  # untouched
+    assert order.status_message == "Insufficient buying power"  # enriched
 
 
 async def test_sync_orders_uses_since_as_the_lower_bound(store, accounts, resolver):
@@ -446,8 +494,7 @@ async def test_sync_positions_creates_rows_and_resolves_security(store, accounts
             BrokerPosition(
                 account_number="ACCT1", symbol="AAPL", instrument_type="Equity",
                 quantity=Decimal("100"), quantity_direction="Long",
-                average_open_price=Decimal("150"), mark_price=Decimal("155.50"),
-                unrealized_pnl=Decimal("550.00"), multiplier=1,
+                average_open_price=Decimal("150"), mark_price=Decimal("155.50"), multiplier=1,
             )
         ],
     )
@@ -461,7 +508,7 @@ async def test_sync_positions_creates_rows_and_resolves_security(store, accounts
     assert position.quantity_direction == "Long"
     assert position.average_open_price == Decimal("150")
     assert position.mark_price == Decimal("155.50")
-    assert position.unrealized_pnl == Decimal("550.00")
+    assert position.unrealized_pnl == Decimal("550.00")  # derived: (155.50-150)*100*1, no broker field for this
 
     security = store._securities.get_by_key("AAPL")
     assert security is not None
@@ -512,6 +559,72 @@ async def test_sync_positions_returns_zero_for_no_positions(store, accounts, res
     assert count == 0
 
 
+async def test_sync_positions_derives_unrealized_pnl_for_a_short_position(store, accounts, resolver):
+    # TastyTrade's real CurrentPosition has no unrealized-pnl field -- for a short, a rising mark
+    # is a loss, so the sign flips relative to the long-position case tested above.
+    client = MockTastyTradeClient()
+    client.set_positions(
+        "ACCT1",
+        [
+            BrokerPosition(
+                account_number="ACCT1", symbol="AAPL", instrument_type="Equity",
+                quantity=Decimal("100"), quantity_direction="Short",
+                average_open_price=Decimal("150"), mark_price=Decimal("155.50"),
+            )
+        ],
+    )
+    await sync_positions(store, "main", client=client, accounts=accounts, resolver=resolver)
+
+    position = await store.get_position("main", "AAPL")
+    assert position.unrealized_pnl == Decimal("-550.00")  # -(155.50-150)*100*1
+
+
+async def test_sync_positions_leaves_unrealized_pnl_none_without_mark_or_open_price(store, accounts, resolver):
+    client = MockTastyTradeClient()
+    client.set_positions(
+        "ACCT1",
+        [BrokerPosition(account_number="ACCT1", symbol="AAPL", quantity=Decimal("100"), quantity_direction="Long")],
+    )
+    await sync_positions(store, "main", client=client, accounts=accounts, resolver=resolver)
+
+    position = await store.get_position("main", "AAPL")
+    assert position.unrealized_pnl is None
+
+
+async def test_sync_positions_applies_realized_day_gain_effect(store, accounts, resolver):
+    # TastyTrade sends realized-day-gain as a magnitude + a separate Credit/Debit/None effect
+    # string (the same convention as BrokerTransaction's value/value-effect) -- PositionRepository
+    # combines them into the one signed value the internal schema stores.
+    client = MockTastyTradeClient()
+    client.set_positions(
+        "ACCT1",
+        [BrokerPosition(account_number="ACCT1", symbol="AAPL", quantity=Decimal("100"), quantity_direction="Long", realized_day_gain=Decimal("42"), realized_day_gain_effect="Credit")],
+    )
+    await sync_positions(store, "main", client=client, accounts=accounts, resolver=resolver)
+    assert (await store.get_position("main", "AAPL")).realized_day_gain == Decimal("42")
+
+    client.set_positions(
+        "ACCT1",
+        [BrokerPosition(account_number="ACCT1", symbol="AAPL", quantity=Decimal("100"), quantity_direction="Long", realized_day_gain=Decimal("42"), realized_day_gain_effect="Debit")],
+    )
+    await sync_positions(store, "main", client=client, accounts=accounts, resolver=resolver)
+    assert (await store.get_position("main", "AAPL")).realized_day_gain == Decimal("-42")
+
+    client.set_positions(
+        "ACCT1",
+        [BrokerPosition(account_number="ACCT1", symbol="AAPL", quantity=Decimal("100"), quantity_direction="Long", realized_day_gain=Decimal("0"), realized_day_gain_effect="None")],
+    )
+    await sync_positions(store, "main", client=client, accounts=accounts, resolver=resolver)
+    assert (await store.get_position("main", "AAPL")).realized_day_gain == Decimal("0")
+
+    client.set_positions(
+        "ACCT1",
+        [BrokerPosition(account_number="ACCT1", symbol="AAPL", quantity=Decimal("100"), quantity_direction="Long")],
+    )
+    await sync_positions(store, "main", client=client, accounts=accounts, resolver=resolver)
+    assert (await store.get_position("main", "AAPL")).realized_day_gain is None
+
+
 async def test_sync_positions_against_sql_store_fresh_idempotent_and_preserves_attribution(sql_store, accounts, resolver):
     client = MockTastyTradeClient()
     client.set_positions(
@@ -521,7 +634,6 @@ async def test_sync_positions_against_sql_store_fresh_idempotent_and_preserves_a
                 account_number="ACCT1", symbol="AAPL", instrument_type="Equity",
                 quantity=Decimal("100"), quantity_direction="Long",
                 average_open_price=Decimal("150"), mark_price=Decimal("155.50"),
-                unrealized_pnl=Decimal("550.00"),
             )
         ],
     )
@@ -531,7 +643,7 @@ async def test_sync_positions_against_sql_store_fresh_idempotent_and_preserves_a
 
     position = await sql_store.get_position("main", "AAPL")
     assert position.mark_price == Decimal("155.50")
-    assert position.unrealized_pnl == Decimal("550.00")
+    assert position.unrealized_pnl == Decimal("550.00")  # derived: (155.50-150)*100*1
 
     # trade_group_id/opening_order_id are real FKs (unlike strategy_id, a documented soft ref) --
     # seed the rows they'd actually reference.
@@ -637,3 +749,33 @@ async def test_sync_all_against_sql_store(sql_store, accounts, resolver):
     assert result.transactions == 1
     assert result.positions == 1
     assert result.errors == []
+
+
+# --- map_order_status: verified against TastyTrade's real Order Flow vocabulary -------------
+
+
+def test_map_order_status_matches_the_documented_vocabulary():
+    assert map_order_status("Received") is OrderStatus.PENDING
+    assert map_order_status("Routed") is OrderStatus.SUBMITTED
+    assert map_order_status("In Flight") is OrderStatus.SUBMITTED
+    assert map_order_status("Live") is OrderStatus.WORKING
+    assert map_order_status("Cancel Requested") is OrderStatus.WORKING
+    assert map_order_status("Replace Requested") is OrderStatus.WORKING
+    assert map_order_status("Contingent") is OrderStatus.WORKING
+    assert map_order_status("Filled") is OrderStatus.FILLED
+    assert map_order_status("Cancelled") is OrderStatus.CANCELLED
+    assert map_order_status("Rejected") is OrderStatus.REJECTED
+    assert map_order_status("Expired") is OrderStatus.EXPIRED
+
+
+def test_map_order_status_removed_and_partially_removed_are_both_cancelled():
+    # "Partially Removed" means an admin manually removed part of the order -- an admin action,
+    # unrelated to fills -- so it maps like "Removed" does, not like a partial fill.
+    assert map_order_status("Removed") is OrderStatus.CANCELLED
+    assert map_order_status("Partially Removed") is OrderStatus.CANCELLED
+
+
+def test_map_order_status_has_no_partially_filled_entry():
+    # TastyTrade's real order-status vocabulary has no "Partially Filled" status at all --
+    # partial-fill information lives on the leg's quantity/remaining-quantity, not order status.
+    assert map_order_status("Partially Filled") is None

@@ -79,7 +79,7 @@ async def test_position_message_creates_and_resolves_the_position(store, account
         BrokerPosition(
             account_number="ACCT1", symbol="AAPL", instrument_type="Equity",
             quantity=Decimal("100"), quantity_direction="Long",
-            mark_price=Decimal("155.50"), unrealized_pnl=Decimal("550"),
+            mark_price=Decimal("155.50"),
         )
     )
     consumer = StreamConsumer(store, source, accounts=accounts, resolver=resolver)

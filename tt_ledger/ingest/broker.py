@@ -62,15 +62,22 @@ class PlacedOrder:
     stop_trigger: Decimal | None = None
     price_effect: str | None = None  # "Credit" | "Debit"
     status: str | None = None  # raw broker status string -> tt_status
-    is_complex: bool = False
-    complex_order_type: str | None = None
-    # broker-reported aggregates (order-level, not derived from legs/fills client-side — a
-    # multi-leg spread's net execution price isn't a plain average of its legs' fill prices).
-    average_fill_price: Decimal | None = None
-    filled_quantity: Decimal | None = None
-    remaining_quantity: Decimal | None = None
+    reject_reason: str | None = None  # -> OrderRow.status_message
+    # TastyTrade's real Order object has no "is complex" boolean — only complex_order_id
+    # (non-null when this order belongs to a complex order) and complex_order_tag. There is
+    # also no order-level average-fill-price / filled-quantity / remaining-quantity field on
+    # their Order schema (verified against developer.tastytrade.com's OpenAPI spec) — only
+    # each leg's own quantity / remaining_quantity, which is why OrderRepository derives the
+    # order-level aggregates itself for single-leg orders instead of expecting the broker to
+    # supply them.
+    complex_order_id: str | None = None
+    complex_order_tag: str | None = None
     updated_at: datetime | None = None
     terminal_at: datetime | None = None
+
+    @property
+    def is_complex(self) -> bool:
+        return self.complex_order_id is not None
 
 
 @dataclass
@@ -115,10 +122,16 @@ class BrokerPosition:
     average_open_price: Decimal | None = None
     mark_price: Decimal | None = None
     close_price: Decimal | None = None
-    # broker-reported, not derived client-side (sign conventions for short positions and options/
-    # futures multipliers make this easy to get subtly wrong; the broker already computes it).
-    unrealized_pnl: Decimal | None = None
+    # TastyTrade's real CurrentPosition has no unrealized-pnl field either (verified against
+    # their OpenAPI spec) — only mark/mark-price and average-open-price. PositionRepository
+    # derives unrealized_pnl itself from those, same reasoning as the Order fields above.
+    #
+    # realized_day_gain is the *magnitude* (non-negative) — TastyTrade splits it into a magnitude
+    # + a Credit/Debit/None effect string, the same value/value-effect convention BrokerTransaction
+    # already uses. PositionRepository combines the two into one signed value (the internal
+    # ``positions`` table has a single realized_day_gain column, no separate effect column).
     realized_day_gain: Decimal | None = None
+    realized_day_gain_effect: str | None = None  # "Credit" | "Debit" | "None"
     multiplier: int = 1
     expires_at: datetime | None = None
 

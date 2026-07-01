@@ -43,9 +43,14 @@ class SecurityRepository(_Repo):
         )
 
 
-# Best-effort TastyTrade raw order-status -> normalized OrderStatus. Not exhaustive (TastyTrade's
-# vocabulary isn't fully documented here); unrecognized values map to None and ``tt_status`` always
-# keeps the raw string regardless, so no information is lost either way.
+# TastyTrade raw order-status -> normalized OrderStatus, verified against their Order Flow doc
+# (developer.tastytrade.com) — the full real vocabulary: Received, Routed, In Flight, Live, Cancel
+# Requested, Replace Requested, Contingent (non-terminal); Filled, Cancelled, Expired, Rejected,
+# Removed, Partially Removed (terminal). There is no "Partially Filled" order status at all —
+# partial-fill information lives on the leg's quantity/remaining-quantity, not the order status —
+# and "Partially Removed" means an admin manually removed part of the order, unrelated to fills,
+# so it maps like "Removed" does. Unrecognized values map to None; ``tt_status`` always keeps the
+# raw string regardless, so no information is lost either way.
 _STATUS_MAP: dict[str, OrderStatus] = {
     "received": OrderStatus.PENDING,
     "routed": OrderStatus.SUBMITTED,
@@ -55,11 +60,10 @@ _STATUS_MAP: dict[str, OrderStatus] = {
     "cancel requested": OrderStatus.WORKING,
     "replace requested": OrderStatus.WORKING,
     "filled": OrderStatus.FILLED,
-    "partially filled": OrderStatus.PARTIALLY_FILLED,
-    "partially removed": OrderStatus.PARTIALLY_FILLED,
     "cancelled": OrderStatus.CANCELLED,
     "canceled": OrderStatus.CANCELLED,
     "removed": OrderStatus.CANCELLED,
+    "partially removed": OrderStatus.CANCELLED,
     "rejected": OrderStatus.REJECTED,
     "expired": OrderStatus.EXPIRED,
 }
@@ -101,6 +105,21 @@ def _vwap(fills: "list[PlacedFill]") -> Decimal | None:
     return sum((f.quantity * f.fill_price for f in fills), Decimal("0")) / total_qty
 
 
+def _order_level_fill_fields(legs: "list") -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """(average_fill_price, filled_quantity, remaining_quantity) for a SINGLE-leg order only.
+
+    TastyTrade's real Order object has no order-level fill fields at all (verified against their
+    OpenAPI spec) — only each leg's own quantity/remaining-quantity/fills. A multi-leg spread's
+    net execution price isn't a plain average of its legs' fill prices either, so this stays
+    ``(None, None, None)`` for anything but exactly one leg.
+    """
+    if len(legs) != 1:
+        return None, None, None
+    leg = legs[0]
+    filled_quantity = sum((f.quantity for f in leg.fills), Decimal("0"))
+    return _vwap(leg.fills), filled_quantity, leg.remaining_quantity
+
+
 class OrderRepository(_Repo):
     def __init__(self, store: "LedgerStore", *, resolver: "SecurityResolver") -> None:
         super().__init__(store)
@@ -130,6 +149,7 @@ class OrderRepository(_Repo):
             await self._build_order_row(
                 po, account=account,
                 security_id=(resolved_legs[i][0].security_id if len(po.legs) == 1 else None),
+                fill_fields=_order_level_fill_fields(po.legs),
             )
             for i, po in enumerate(placed_orders)
         ]
@@ -170,7 +190,11 @@ class OrderRepository(_Repo):
 
         return len(order_rows)
 
-    async def _build_order_row(self, po: "PlacedOrder", *, account: str, security_id: str | None) -> OrderRow:
+    async def _build_order_row(
+        self, po: "PlacedOrder", *, account: str, security_id: str | None,
+        fill_fields: tuple[Decimal | None, Decimal | None, Decimal | None],
+    ) -> OrderRow:
+        average_fill_price, filled_quantity, remaining_quantity = fill_fields
         existing = await self._store.get_order(po.id)
         oms_status = map_order_status(po.status)
         is_filled = oms_status is OrderStatus.FILLED
@@ -182,9 +206,10 @@ class OrderRepository(_Repo):
                 existing,
                 oms_status=(oms_status.value if oms_status else existing.oms_status),
                 tt_status=po.status,
-                average_fill_price=po.average_fill_price if po.average_fill_price is not None else existing.average_fill_price,
-                filled_quantity=po.filled_quantity if po.filled_quantity is not None else existing.filled_quantity,
-                remaining_quantity=po.remaining_quantity if po.remaining_quantity is not None else existing.remaining_quantity,
+                status_message=po.reject_reason if po.reject_reason is not None else existing.status_message,
+                average_fill_price=average_fill_price if average_fill_price is not None else existing.average_fill_price,
+                filled_quantity=filled_quantity if filled_quantity is not None else existing.filled_quantity,
+                remaining_quantity=remaining_quantity if remaining_quantity is not None else existing.remaining_quantity,
                 filled_at=po.terminal_at if is_filled else existing.filled_at,
             )
 
@@ -193,10 +218,10 @@ class OrderRepository(_Repo):
             security_id=security_id, underlying=po.underlying_symbol,
             order_type=po.order_type, time_in_force=po.time_in_force, gtc_date=po.gtc_date,
             price=po.price, stop_trigger=po.stop_trigger, price_effect=po.price_effect,
-            average_fill_price=po.average_fill_price, is_complex=po.is_complex,
-            complex_order_type=po.complex_order_type,
+            average_fill_price=average_fill_price, is_complex=po.is_complex,
+            complex_order_type=po.complex_order_tag, status_message=po.reject_reason,
             oms_status=(oms_status.value if oms_status else None), tt_status=po.status,
-            filled_quantity=po.filled_quantity, remaining_quantity=po.remaining_quantity,
+            filled_quantity=filled_quantity, remaining_quantity=remaining_quantity,
             received_at=po.received_at, submitted_at=po.received_at,
             filled_at=(po.terminal_at if is_filled else None), terminal_at=po.terminal_at,
         )
@@ -252,6 +277,31 @@ class TransactionRepository(_Repo):
         return await self._store.link_transactions_to_orders(account)
 
 
+def _derive_unrealized_pnl(p: "BrokerPosition") -> Decimal | None:
+    """TastyTrade's real CurrentPosition object has no unrealized-pnl field (verified against
+    their OpenAPI spec) — only mark/mark-price and average-open-price. Derive it: the sign flips
+    for a short position (mark rising is a loss when short), and multiplier scales options/futures
+    contracts to their actual notional (a $1 move on a 100-multiplier option contract is $100)."""
+    if p.mark_price is None or p.average_open_price is None:
+        return None
+    diff = p.mark_price - p.average_open_price
+    if (p.quantity_direction or "").strip().lower() == "short":
+        diff = -diff
+    return diff * p.quantity * p.multiplier
+
+
+def _apply_effect(magnitude: Decimal | None, effect: str | None) -> Decimal | None:
+    """A (non-negative) magnitude + a Credit/Debit/None effect string -> one signed Decimal —
+    TastyTrade's own value/value-effect convention (their docs example pairs effect=="None" with
+    magnitude==0). A missing/unrecognized effect leaves the magnitude's own sign untouched;
+    only "Debit" flips it negative."""
+    if magnitude is None:
+        return None
+    if (effect or "").strip().lower() == "debit":
+        return -magnitude
+    return magnitude
+
+
 class PositionRepository(_Repo):
     def __init__(self, store: "LedgerStore", *, resolver: "SecurityResolver") -> None:
         super().__init__(store)
@@ -281,8 +331,9 @@ class PositionRepository(_Repo):
                     account=account, security_id=resolved.security_id,
                     quantity=p.quantity, quantity_direction=p.quantity_direction,
                     average_open_price=p.average_open_price, mark_price=p.mark_price,
-                    close_price=p.close_price, unrealized_pnl=p.unrealized_pnl,
-                    realized_day_gain=p.realized_day_gain, multiplier=p.multiplier,
+                    close_price=p.close_price, unrealized_pnl=_derive_unrealized_pnl(p),
+                    realized_day_gain=_apply_effect(p.realized_day_gain, p.realized_day_gain_effect),
+                    multiplier=p.multiplier,
                     expires_at=p.expires_at,
                     strategy_id=existing.strategy_id if existing else None,
                     opening_order_id=existing.opening_order_id if existing else None,

@@ -60,7 +60,6 @@ class MockTastyTradeClient:
             id=order_id, account_number=account_number, received_at=filled_at,
             underlying_symbol=underlying_symbol or symbol, order_type=order_type,
             price=price, price_effect=price_effect, status=status, terminal_at=filled_at,
-            average_fill_price=fill_price, filled_quantity=quantity, remaining_quantity=Decimal("0"),
             legs=[
                 PlacedLeg(
                     instrument_type=instrument_type, symbol=symbol, action=action,

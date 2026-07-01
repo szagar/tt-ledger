@@ -127,7 +127,7 @@ def test_multi_leg_order_can_be_built_directly():
     client = MockTastyTradeClient()
     order = PlacedOrder(
         id="O-IC", account_number="ACCT1", received_at=datetime(2026, 1, 5, tzinfo=UTC),
-        underlying_symbol="SPX", is_complex=True, complex_order_type="Iron Condor",
+        underlying_symbol="SPX", complex_order_id="CO-1", complex_order_tag="Iron Condor",
         legs=[
             PlacedLeg(
                 instrument_type="Equity Option", symbol="SPXW  260117P05000000", action="Sell to Open",

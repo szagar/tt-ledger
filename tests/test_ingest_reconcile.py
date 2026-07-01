@@ -170,7 +170,7 @@ def _iron_condor_client(order_id: str = "O-IC", account_number: str = "ACCT1", e
     client.add_order(
         PlacedOrder(
             id=order_id, account_number=account_number, received_at=executed_at, underlying_symbol="SPX",
-            is_complex=True, complex_order_type="Iron Condor", status="Filled", terminal_at=executed_at, legs=legs,
+            complex_order_id="CO-1", complex_order_tag="Iron Condor", status="Filled", terminal_at=executed_at, legs=legs,
         )
     )
     for i, (symbol, action, _fill_price, net_value) in enumerate(IC_LEGS):
