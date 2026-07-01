@@ -1,13 +1,32 @@
 """AccountMapper — nickname↔account-number (docs/identity.md → Rule 1).
 
-PORT from the host platform's ``shared/accounts/`` (mapper.py + config.py) or reimplement
-(~200 lines). Internal code uses the nickname only; the raw account_number appears solely at
-broker calls and audit columns. A paper account's nickname MUST contain "paper".
+Internal code uses the nickname only; the raw account_number appears solely at broker calls and
+audit columns. A paper account's nickname MUST contain "paper".
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+
+from .._toml import load as _load_toml
+
+
+def _parse_login_section(login: str, section: dict) -> tuple[dict[str, str], dict[str, str], str | None]:
+    """One ``[login]`` table -> (nickname->account_number, nickname->env, default account_number)."""
+    n2num: dict[str, str] = {}
+    n2env: dict[str, str] = {}
+    for account_number, meta in section.get("accounts", {}).items():
+        nickname = meta["nickname"]
+        env = meta.get("env", "live")
+        if env == "paper" and "paper" not in nickname.lower():
+            raise ValueError(
+                f"{login!r}.accounts[{account_number!r}]: paper account nickname {nickname!r} "
+                "must contain 'paper'"
+            )
+        n2num[nickname] = account_number
+        n2env[nickname] = env
+    return n2num, n2env, section.get("default")
 
 
 class AccountMapper:
@@ -47,9 +66,36 @@ class AccountMapper:
 
     # loaders
     @classmethod
-    def from_toml(cls, config_path: str, login: str | None = None) -> "AccountMapper":
-        """Load config/accounts.toml. Enforce: paper nicknames contain 'paper'. TODO: implement."""
-        raise NotImplementedError("AccountMapper.from_toml — see docs/identity.md")
+    def from_toml(cls, config_path: str | os.PathLike[str], login: str | None = None) -> "AccountMapper":
+        """Load config/accounts.toml.
+
+        ``login`` scopes the mapper to one ``[login]`` table's ``.accounts``; omitted (the common
+        case), every login table in the file is merged into one nickname space — internal code
+        never needs to know which broker login an account came from.
+        """
+        data = _load_toml(config_path)
+        if login is not None and login not in data:
+            raise KeyError(f"login {login!r} not found in {config_path}")
+
+        sections = {login: data[login]} if login is not None else {
+            name: section for name, section in data.items() if isinstance(section, dict) and "accounts" in section
+        }
+
+        n2num: dict[str, str] = {}
+        n2env: dict[str, str] = {}
+        default_account: str | None = None
+        for name, section in sections.items():
+            s_n2num, s_n2env, s_default = _parse_login_section(name, section)
+            overlap = n2num.keys() & s_n2num.keys()
+            if overlap:
+                raise ValueError(f"duplicate nickname(s) across logins in {config_path}: {sorted(overlap)}")
+            n2num.update(s_n2num)
+            n2env.update(s_n2env)
+            if default_account is None:
+                default_account = s_default
+
+        resolved_login = login if login is not None else (next(iter(sections)) if len(sections) == 1 else None)
+        return cls(n2num, default_account=default_account, login=resolved_login, nickname_to_env=n2env)
 
 
 @dataclass
@@ -64,5 +110,16 @@ class LoginConfig:
     account_mapper: AccountMapper
 
     @classmethod
-    def from_toml(cls, login: str, config_path: str) -> "LoginConfig":
-        raise NotImplementedError("LoginConfig.from_toml — see docs/identity.md")
+    def from_toml(cls, login: str, config_path: str | os.PathLike[str]) -> "LoginConfig":
+        data = _load_toml(config_path)
+        if login not in data:
+            raise KeyError(f"login {login!r} not found in {config_path}")
+        section = data[login]
+        return cls(
+            login=login,
+            client_id=section["client_id"],
+            client_secret=section["client_secret"],
+            refresh_token=section["refresh_token"],
+            default_account=section.get("default"),
+            account_mapper=AccountMapper.from_toml(config_path, login=login),
+        )

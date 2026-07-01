@@ -1,8 +1,9 @@
 """FastAPI app factory (docs/api.md → HTTP server). Requires the ``[api]`` extra.
 
-Endpoints (to implement): GET /orders, GET /trades, GET /trades/{group_id},
+Endpoints: GET /orders, GET /trades, GET /trades/{group_id},
 GET /accounts/{nickname}/activity, POST /trades/{group_id}/{remap,regroup,dismiss},
-POST /ingest/{source_system}. DTOs are Pydantic models over the consolidated views.
+POST /ingest/{source_system} (reserved, 501). DTOs are Pydantic models over the consolidated
+views (``api/schemas.py``); routes live in ``api/routes.py``.
 """
 
 from __future__ import annotations
@@ -20,9 +21,11 @@ def create_app(client: "LedgerClient"):
     except ModuleNotFoundError as exc:  # pragma: no cover
         raise RuntimeError("FastAPI server needs the [api] extra: pip install tt-ledger[api]") from exc
 
-    app = FastAPI(title="tt-ledger", version="0.1.0")
+    from .routes import router
 
-    # TODO: register routers (orders, trades, activity, remap, ingest) over `client`.
+    app = FastAPI(title="tt-ledger", version="0.1.0")
+    app.state.client = client
+    app.include_router(router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

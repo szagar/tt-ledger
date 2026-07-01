@@ -133,6 +133,7 @@ class Order(Base):
 
 class OrderLeg(Base):
     __tablename__ = "order_legs"
+    __table_args__ = (Index("uq_order_legs_order_index", "order_id", "leg_index", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)

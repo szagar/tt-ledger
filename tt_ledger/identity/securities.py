@@ -41,14 +41,39 @@ class SecurityResolver(Protocol):
     def resolve(self, vendor_symbol: str, instrument_type: str | None = None) -> ResolvedSecurity: ...
 
 
+# TastyTrade instrument-type -> the schema's short ProductType code (docs/schema.md: S/I/F/OS/OI/OF/CR).
+# ``securities.product_type`` is a 2-char column — the raw instrument-type string (e.g. "Equity
+# Option") does not fit it, so even the zero-config passthrough path must normalize this one field.
+_TT_INSTRUMENT_TYPE_TO_PRODUCT: dict[str, str] = {
+    "equity": "S",
+    "index": "I",
+    "future": "F",
+    "equity option": "OS",
+    "index option": "OI",
+    "future option": "OF",
+    "cryptocurrency": "CR",
+    "crypto": "CR",
+}
+
+
+def _instrument_type_to_product_type(instrument_type: str | None) -> str | None:
+    if instrument_type is None:
+        return None
+    return _TT_INSTRUMENT_TYPE_TO_PRODUCT.get(instrument_type.strip().lower())
+
+
 class PassthroughResolver:
     """Default resolver — ``security_id`` *is* the vendor symbol; no decomposition.
 
-    This makes tt-ledger work with **zero symbology config**: canonical == vendor.
+    This makes tt-ledger work with **zero symbology config**: canonical == vendor. The vendor
+    ``instrument_type`` is still normalized to the schema's short ``product_type`` code (an
+    unrecognized/omitted instrument type maps to ``None``, not a truncated raw string).
     """
 
     def resolve(self, vendor_symbol: str, instrument_type: str | None = None) -> ResolvedSecurity:
-        return ResolvedSecurity(security_id=vendor_symbol, product_type=instrument_type)
+        return ResolvedSecurity(
+            security_id=vendor_symbol, product_type=_instrument_type_to_product_type(instrument_type),
+        )
 
 
 # TastyTrade instrument-type → security_universe SecurityType (value strings; resolved lazily).

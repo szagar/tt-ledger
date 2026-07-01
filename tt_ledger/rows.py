@@ -1,8 +1,8 @@
 """Lightweight transfer/row shapes used by the store, repositories, and SDK.
 
-Stubs — fields are illustrative; fill them out per docs/schema.md and docs/api.md.
-Internal rows are plain dataclasses (no dependency); API DTOs (Pydantic) live in
-``tt_ledger/api`` and map onto these.
+Field sets mirror docs/schema.md 1:1 so a row maps directly onto its ORM model's columns
+(minus surrogate ``id``/``created_at``/``updated_at``, which the store owns). Internal rows are
+plain dataclasses (no dependency); API DTOs (Pydantic) live in ``tt_ledger/api`` and map onto these.
 """
 
 from __future__ import annotations
@@ -21,9 +21,17 @@ class SecurityRow:
     security_id: str  # resolver output (default: the raw vendor symbol)
     product_type: str
     underlying: str | None = None
+    expiry: date | None = None
+    strike: Decimal | None = None
+    option_type: str | None = None  # P | C
+    multiplier: int | None = None
+    exchange: str | None = None
+    currency: str | None = None
     tt_symbol: str | None = None
+    occ_symbol: str | None = None
     streamer_symbol: str | None = None
-    # TODO: expiry, strike, option_type, multiplier, exchange, currency, metadata
+    source_system: str = "tastytrade"
+    metadata: dict | None = None
 
 
 @dataclass
@@ -32,8 +40,35 @@ class OrderRow:
     account: str  # nickname
     origin: Origin
     ingest: Ingest
+    oms_order_id: str | None = None
+    client_order_id: str | None = None
+    account_number: str | None = None  # audit
+    source_system: str = "tastytrade"
     security_id: str | None = None
-    # TODO: full columns per docs/schema.md (orders)
+    underlying: str | None = None
+    order_type: str | None = None
+    time_in_force: str | None = None
+    gtc_date: str | None = None
+    price: Decimal | None = None
+    stop_trigger: Decimal | None = None
+    price_effect: str | None = None
+    average_fill_price: Decimal | None = None
+    is_complex: bool = False
+    complex_order_type: str | None = None
+    oms_status: str | None = None
+    tt_status: str | None = None  # raw broker status
+    status_message: str | None = None
+    filled_quantity: Decimal | None = None
+    remaining_quantity: Decimal | None = None
+    signal_id: str | None = None
+    trace_id: str | None = None
+    strategy_id: int | None = None
+    trade_group_id: int | None = None
+    market_context_id: int | None = None
+    received_at: datetime | None = None
+    submitted_at: datetime | None = None
+    filled_at: datetime | None = None
+    terminal_at: datetime | None = None
 
 
 @dataclass
@@ -41,18 +76,26 @@ class LegRow:
     order_id: int
     leg_index: int
     security_id: str
-    action: str
-    # TODO: quantity, fill_price, …
+    action: str | None = None
+    quantity: Decimal | None = None
+    remaining_quantity: Decimal | None = None
+    quantity_direction: str | None = None
+    price: Decimal | None = None
+    fill_price: Decimal | None = None
 
 
 @dataclass
 class FillRow:
     fill_id: str
-    tt_order_id: str
+    order_id: int | None = None
+    order_leg_id: int | None = None
+    tt_order_id: str | None = None
     quantity: Decimal | None = None
     fill_price: Decimal | None = None
     filled_at: datetime | None = None
-    # TODO: order_id, order_leg_id, venue, ext ids
+    destination_venue: str | None = None
+    ext_exec_id: str | None = None
+    ext_group_fill_id: str | None = None
 
 
 @dataclass
@@ -60,15 +103,51 @@ class TxnRow:
     tt_transaction_id: str
     tt_order_id: str | None
     account: str
+    account_number: str | None = None  # audit
+    source_system: str = "tastytrade"
+    transaction_type: str | None = None
+    transaction_sub_type: str | None = None
+    action: str | None = None
     security_id: str | None = None
-    # TODO: type/sub_type, action, qty, price, value, fees, executed_at, …
+    underlying: str | None = None
+    quantity: Decimal | None = None
+    price: Decimal | None = None
+    value: Decimal | None = None
+    value_effect: str | None = None
+    net_value: Decimal | None = None
+    net_value_effect: str | None = None
+    commission: Decimal | None = None
+    clearing_fees: Decimal | None = None
+    regulatory_fees: Decimal | None = None
+    proprietary_index_option_fees: Decimal | None = None
+    is_estimated_fee: bool | None = None
+    description: str | None = None
+    order_id: int | None = None
+    order_leg_id: int | None = None
+    position_id: int | None = None
+    closed_position_id: int | None = None
+    trade_group_id: int | None = None
+    executed_at: datetime | None = None
+    transaction_date: date | None = None
 
 
 @dataclass
 class PositionRow:
     account: str
     security_id: str
-    # TODO: quantity, direction, avg_open, mark, unrealized_pnl, attribution
+    quantity: Decimal
+    quantity_direction: str
+    average_open_price: Decimal | None = None
+    mark_price: Decimal | None = None
+    close_price: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    realized_day_gain: Decimal | None = None
+    multiplier: int = 1
+    expires_at: datetime | None = None
+    strategy_id: int | None = None
+    opening_order_id: int | None = None
+    trade_group_id: int | None = None
+    position_opened_at: datetime | None = None
 
 
 @dataclass
@@ -76,16 +155,46 @@ class TradeGroupRow:
     group_id: str
     account: str
     origin: Origin
+    source_system: str = "tastytrade"
     review_status: ReviewStatus = ReviewStatus.NEEDS_REVIEW
     manually_attributed: bool = False
-    # TODO: strategy_type, premium, realized_pnl, status, attribution, …
+    reviewed_at: datetime | None = None
+    reviewed_by: str | None = None
+    underlying: str | None = None
+    security_id: str | None = None
+    strategy_type: str | None = None
+    leg_count: int = 1
+    total_premium: Decimal | None = None
+    quantity: Decimal | None = None
+    total_fees: Decimal | None = None
+    status: str = "open"
+    realized_pnl: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    max_profit: Decimal | None = None
+    max_loss: Decimal | None = None
+    profit_target: str | None = None
+    stop_loss: str | None = None
+    exit_strategy: str | None = None
+    order_id: int | None = None
+    strategy_id: int | None = None
+    bot_name: str | None = None
+    signal_id: str | None = None
+    executed_at: datetime | None = None
+    closed_at: datetime | None = None
 
 
 @dataclass
 class EventRow:
     trade_group_id: int
     event_type: str
-    # TODO: quantity_change, premium_change, realized_pnl, refs, event_at
+    quantity_change: Decimal = Decimal("0")
+    premium_change: Decimal = Decimal("0")
+    realized_pnl: Decimal | None = None
+    event_at: datetime | None = None
+    notes: str | None = None
+    rolled_to_group_id: int | None = None
+    transaction_id: int | None = None
+    order_id: int | None = None
 
 
 # --- read shapes ------------------------------------------------------------------
@@ -93,19 +202,63 @@ class EventRow:
 
 @dataclass
 class TradeRow:
-    """A row of v_trades_unified."""
+    """A row of v_trades_unified (== trade_groups, exposed with its own read shape)."""
 
     group_id: str
+    account: str
     origin: Origin
-    # TODO: account, strategy_type, realized/unrealized pnl, review_status, …
+    source_system: str = "tastytrade"
+    review_status: ReviewStatus = ReviewStatus.NEEDS_REVIEW
+    manually_attributed: bool = False
+    underlying: str | None = None
+    security_id: str | None = None
+    strategy_type: str | None = None
+    leg_count: int = 1
+    total_premium: Decimal | None = None
+    quantity: Decimal | None = None
+    total_fees: Decimal | None = None
+    status: str = "open"
+    realized_pnl: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    max_profit: Decimal | None = None
+    max_loss: Decimal | None = None
+    order_id: int | None = None
+    strategy_id: int | None = None
+    bot_name: str | None = None
+    signal_id: str | None = None
+    executed_at: datetime | None = None
+    closed_at: datetime | None = None
+
+
+def trade_group_to_row(tg: TradeGroupRow) -> TradeRow:
+    """A stored ``TradeGroupRow`` -> its ``TradeRow`` read shape (drops operator-only fields
+    like ``reviewed_at``/``reviewed_by``/``profit_target`` that ``TradeRow`` doesn't expose)."""
+    return TradeRow(**{f: getattr(tg, f) for f in TradeRow.__dataclass_fields__ if hasattr(tg, f)})
 
 
 @dataclass
 class ActivityRow:
-    """A row of v_account_activity (transaction joined to order + group)."""
+    """A row of v_account_activity (transaction joined to order + trade_group)."""
 
     tt_transaction_id: str
-    # TODO: origin, fees, net_value, order_id, trade_group_id, …
+    account: str
+    transaction_type: str | None = None
+    transaction_sub_type: str | None = None
+    action: str | None = None
+    security_id: str | None = None
+    underlying: str | None = None
+    quantity: Decimal | None = None
+    price: Decimal | None = None
+    net_value: Decimal | None = None
+    commission: Decimal | None = None
+    clearing_fees: Decimal | None = None
+    regulatory_fees: Decimal | None = None
+    executed_at: datetime | None = None
+    order_id: int | None = None
+    tt_order_id: str | None = None
+    trade_group_id: int | None = None
+    origin: Origin | None = None  # from the joined order; None when unreconciled
+    review_status: ReviewStatus | None = None  # from the joined trade_group
 
 
 # --- inputs / filters / results ---------------------------------------------------
@@ -113,18 +266,36 @@ class ActivityRow:
 
 @dataclass
 class OrderInput:
-    """An order recorded at submission (oms_submit path)."""
+    """An order recorded at submission (oms_submit path) — before any broker confirmation, so
+    no ``tt_order_id`` yet; that arrives later via push/pull enrichment (docs/ingestion.md)."""
 
     account: str
-    # TODO: legs, type/TIF, price, correlation ids
+    security_id: str | None = None
+    underlying: str | None = None
+    order_type: str | None = None
+    time_in_force: str | None = None
+    price: Decimal | None = None
+    price_effect: str | None = None
+    is_complex: bool = False
+    complex_order_type: str | None = None
+    signal_id: str | None = None
+    trace_id: str | None = None
+    strategy_id: int | None = None
+    market_context_id: int | None = None
 
 
 @dataclass
 class FillEvent:
-    """A fill arriving on the push (stream) path."""
+    """A fill/status update arriving on the push (stream) path — enriches an existing order by
+    ``tt_order_id`` only; never creates one (docs/ingestion.md: a stream fill with no matching
+    local order is not authoritative, sync_orders is)."""
 
     tt_order_id: str
-    # TODO: status, qty, price, time
+    status: str | None = None  # raw broker status string
+    average_fill_price: Decimal | None = None
+    filled_quantity: Decimal | None = None
+    remaining_quantity: Decimal | None = None
+    filled_at: datetime | None = None
 
 
 @dataclass
@@ -133,6 +304,7 @@ class OrderFilter:
     account: str | None = None
     status: str | None = None
     underlying: str | None = None
+    trade_group_id: int | None = None
     start: date | None = None
     end: date | None = None
 
@@ -141,6 +313,7 @@ class OrderFilter:
 class TradeFilter:
     origin: Origin | None = None
     review_status: ReviewStatus | None = None
+    status: str | None = None  # TradeGroupStatus: open|closed|expired|assigned|exercised|mixed
     account: str | None = None
     underlying: str | None = None
     start: date | None = None
@@ -159,6 +332,7 @@ class ActivityFilter:
 class SyncResult:
     orders: int = 0
     transactions: int = 0
+    positions: int = 0
     fills: int = 0
     trade_groups: int = 0
     errors: list[str] = field(default_factory=list)

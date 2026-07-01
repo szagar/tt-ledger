@@ -22,7 +22,7 @@ redis      = ["redis>=5.0"]                          # optional: consume a host 
 cli        = ["typer>=0.12", "rich>=13.0"]
 # Installed from GitHub for now (not yet on PyPI). Switch to "security-universe>=0.x" once published.
 securities = ["security-universe @ git+https://github.com/szagar/security-universe"]
-dev        = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.10"]
+dev        = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.10", "httpx>=0.26"]  # httpx: fastapi.testclient
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -8,7 +8,10 @@ that is algorithmic and lives in the ``securities`` table).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+
+from .._toml import load as _load_toml
 
 
 @dataclass
@@ -20,9 +23,18 @@ class SecurityRules:
     universes: dict[str, list[str]] = field(default_factory=dict)          # {"core_equity": ["S|SPY", ...]}
 
 
-def load_securities_toml(path: str) -> SecurityRules:
-    """Parse config/securities.toml into SecurityRules. TODO: implement."""
-    raise NotImplementedError("load_securities_toml — see docs/identity.md")
+def load_securities_toml(path: str | os.PathLike[str]) -> SecurityRules:
+    """Parse config/securities.toml into SecurityRules.
+
+    Only consumed by a resolver you inject (docs/identity.md → Rule 2) — the default
+    ``PassthroughResolver`` ignores this file entirely.
+    """
+    data = _load_toml(path)
+    return SecurityRules(
+        index_option_roots=data.get("index_option_roots", {}),
+        futures=data.get("futures", {}),
+        universes=data.get("universes", {}),
+    )
 
 
 __all__ = ["SecurityRules", "load_securities_toml"]

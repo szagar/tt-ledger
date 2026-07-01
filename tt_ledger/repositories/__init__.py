@@ -1,16 +1,24 @@
 """Repositories — domain operations over the LedgerStore (docs/storage.md, docs/schema.md).
 
 Each repository takes a ``LedgerStore`` and exposes intent-level methods; it owns the
-invariants (idempotent upsert keys, the consolidated-view query shapes). Stubs below.
+invariants (idempotent upsert keys, the consolidated-view query shapes). ``OrderRepository``
+directly consumes broker-native ``PlacedOrder`` shapes (``ingest/broker.py``) — the repository
+layer is where that translation happens, not the store.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from ..enums import Ingest, Origin, OrderStatus
+from ..rows import FillRow, LegRow, OrderRow, PositionRow, SecurityRow, TxnRow
+
 if TYPE_CHECKING:
-    from ..identity import ResolvedSecurity
-    from ..rows import OrderFilter, OrderRow, TradeFilter, TradeGroupRow, TradeRow
+    from ..identity import ResolvedSecurity, SecurityResolver
+    from ..ingest.broker import BrokerPosition, BrokerTransaction, PlacedFill, PlacedOrder
+    from ..rows import FillEvent, OrderFilter, TradeFilter, TradeGroupRow, TradeRow
     from ..store import LedgerStore
 
 
@@ -21,31 +29,270 @@ class _Repo:
 
 class SecurityRepository(_Repo):
     async def upsert(self, resolved: "ResolvedSecurity", *, tt_symbol: str | None = None) -> None:
-        """Upsert the securities dimension row from a resolver result (+ the vendor symbol). TODO."""
-        raise NotImplementedError
+        """Upsert the securities dimension row from a resolver result (+ the vendor symbol)."""
+        await self._store.upsert_security(
+            SecurityRow(
+                security_id=resolved.security_id,
+                product_type=resolved.product_type or "",
+                underlying=resolved.underlying,
+                expiry=resolved.expiry,
+                strike=resolved.strike,
+                option_type=resolved.option_type,
+                tt_symbol=tt_symbol,
+            )
+        )
+
+
+# Best-effort TastyTrade raw order-status -> normalized OrderStatus. Not exhaustive (TastyTrade's
+# vocabulary isn't fully documented here); unrecognized values map to None and ``tt_status`` always
+# keeps the raw string regardless, so no information is lost either way.
+_STATUS_MAP: dict[str, OrderStatus] = {
+    "received": OrderStatus.PENDING,
+    "routed": OrderStatus.SUBMITTED,
+    "in flight": OrderStatus.SUBMITTED,
+    "live": OrderStatus.WORKING,
+    "contingent": OrderStatus.WORKING,
+    "cancel requested": OrderStatus.WORKING,
+    "replace requested": OrderStatus.WORKING,
+    "filled": OrderStatus.FILLED,
+    "partially filled": OrderStatus.PARTIALLY_FILLED,
+    "partially removed": OrderStatus.PARTIALLY_FILLED,
+    "cancelled": OrderStatus.CANCELLED,
+    "canceled": OrderStatus.CANCELLED,
+    "removed": OrderStatus.CANCELLED,
+    "rejected": OrderStatus.REJECTED,
+    "expired": OrderStatus.EXPIRED,
+}
+
+
+def map_order_status(raw: str | None) -> OrderStatus | None:
+    if raw is None:
+        return None
+    return _STATUS_MAP.get(raw.strip().lower())
+
+
+async def apply_fill_event(store: "LedgerStore", evt: "FillEvent") -> OrderRow | None:
+    """A fill/status update from the push (stream) path. Enriches an existing order by
+    ``tt_order_id`` only -- a fill for an unknown order is a no-op and returns ``None``
+    (docs/ingestion.md: sync_orders, not the stream, is authoritative for order structure).
+    Shared by ``LedgerClient.apply_fill`` and ``ingest.push.StreamConsumer``."""
+    existing = await store.get_order(evt.tt_order_id)
+    if existing is None:
+        return None
+    oms_status = map_order_status(evt.status)
+    updated = replace(
+        existing,
+        oms_status=(oms_status.value if oms_status else existing.oms_status),
+        tt_status=(evt.status if evt.status is not None else existing.tt_status),
+        average_fill_price=(evt.average_fill_price if evt.average_fill_price is not None else existing.average_fill_price),
+        filled_quantity=(evt.filled_quantity if evt.filled_quantity is not None else existing.filled_quantity),
+        remaining_quantity=(evt.remaining_quantity if evt.remaining_quantity is not None else existing.remaining_quantity),
+        filled_at=(evt.filled_at if evt.filled_at is not None else existing.filled_at),
+    )
+    await store.upsert_orders([updated])
+    return updated
+
+
+def _vwap(fills: "list[PlacedFill]") -> Decimal | None:
+    """A leg's fills -> the quantity-weighted average fill price."""
+    total_qty = sum((f.quantity for f in fills), Decimal("0"))
+    if not fills or total_qty == 0:
+        return None
+    return sum((f.quantity * f.fill_price for f in fills), Decimal("0")) / total_qty
 
 
 class OrderRepository(_Repo):
-    async def upsert_from_history(self, placed_orders: list) -> int:  # noqa: ANN001
-        """sync_orders core: upsert orders+legs+fills; enrich ZTS rows, create broker rows. TODO."""
-        raise NotImplementedError
+    def __init__(self, store: "LedgerStore", *, resolver: "SecurityResolver") -> None:
+        super().__init__(store)
+        self._resolver = resolver
+        self._securities = SecurityRepository(store)
+
+    async def upsert_from_history(self, placed_orders: "list[PlacedOrder]", *, account: str) -> int:
+        """sync_orders core: upsert orders+legs+fills. One importer serves both origins —
+        an existing ``origin=zts`` row is enriched (fill/status fields only; attribution
+        untouched); a ``tt_order_id`` with no row is created ``origin=broker``."""
+        if not placed_orders:
+            return 0
+
+        seen_security_ids: set[str] = set()
+        resolved_legs: list[list["ResolvedSecurity"]] = []
+        for po in placed_orders:
+            resolved_for_order = []
+            for leg in po.legs:
+                resolved = self._resolver.resolve(leg.symbol, leg.instrument_type)
+                if resolved.security_id not in seen_security_ids:
+                    await self._securities.upsert(resolved, tt_symbol=leg.symbol)
+                    seen_security_ids.add(resolved.security_id)
+                resolved_for_order.append(resolved)
+            resolved_legs.append(resolved_for_order)
+
+        order_rows = [
+            await self._build_order_row(
+                po, account=account,
+                security_id=(resolved_legs[i][0].security_id if len(po.legs) == 1 else None),
+            )
+            for i, po in enumerate(placed_orders)
+        ]
+        order_ids = await self._store.upsert_orders(order_rows)
+
+        leg_rows: list[LegRow] = []
+        leg_owner: list[tuple[int, int]] = []  # (placed_order index, leg index), parallel to leg_rows
+        for po_index, po in enumerate(placed_orders):
+            order_id = order_ids[po_index]
+            for leg_index, leg in enumerate(po.legs):
+                resolved = resolved_legs[po_index][leg_index]
+                leg_rows.append(
+                    LegRow(
+                        order_id=order_id, leg_index=leg_index, security_id=resolved.security_id,
+                        action=leg.action, quantity=leg.quantity, remaining_quantity=leg.remaining_quantity,
+                        fill_price=_vwap(leg.fills),
+                    )
+                )
+                leg_owner.append((po_index, leg_index))
+        leg_ids = await self._store.upsert_legs(leg_rows) if leg_rows else []
+
+        fill_rows: list[FillRow] = []
+        for (po_index, leg_index), leg_id in zip(leg_owner, leg_ids):
+            po = placed_orders[po_index]
+            order_id = order_ids[po_index]
+            leg = po.legs[leg_index]
+            for f in leg.fills:
+                fill_rows.append(
+                    FillRow(
+                        fill_id=f.fill_id, order_id=order_id, order_leg_id=leg_id, tt_order_id=po.id,
+                        quantity=f.quantity, fill_price=f.fill_price, filled_at=f.filled_at,
+                        destination_venue=f.destination_venue, ext_exec_id=f.ext_exec_id,
+                        ext_group_fill_id=f.ext_group_fill_id,
+                    )
+                )
+        if fill_rows:
+            await self._store.upsert_fills(fill_rows)
+
+        return len(order_rows)
+
+    async def _build_order_row(self, po: "PlacedOrder", *, account: str, security_id: str | None) -> OrderRow:
+        existing = await self._store.get_order(po.id)
+        oms_status = map_order_status(po.status)
+        is_filled = oms_status is OrderStatus.FILLED
+
+        if existing is not None and existing.origin is Origin.ZTS:
+            # enrich only: fill/status fields; origin, signal_id, trace_id, strategy_id, and
+            # everything else about attribution/structure stays exactly as it was.
+            return replace(
+                existing,
+                oms_status=(oms_status.value if oms_status else existing.oms_status),
+                tt_status=po.status,
+                average_fill_price=po.average_fill_price if po.average_fill_price is not None else existing.average_fill_price,
+                filled_quantity=po.filled_quantity if po.filled_quantity is not None else existing.filled_quantity,
+                remaining_quantity=po.remaining_quantity if po.remaining_quantity is not None else existing.remaining_quantity,
+                filled_at=po.terminal_at if is_filled else existing.filled_at,
+            )
+
+        return OrderRow(
+            tt_order_id=po.id, account=account, origin=Origin.BROKER, ingest=Ingest.ORDER_HISTORY,
+            security_id=security_id, underlying=po.underlying_symbol,
+            order_type=po.order_type, time_in_force=po.time_in_force, gtc_date=po.gtc_date,
+            price=po.price, stop_trigger=po.stop_trigger, price_effect=po.price_effect,
+            average_fill_price=po.average_fill_price, is_complex=po.is_complex,
+            complex_order_type=po.complex_order_type,
+            oms_status=(oms_status.value if oms_status else None), tt_status=po.status,
+            filled_quantity=po.filled_quantity, remaining_quantity=po.remaining_quantity,
+            received_at=po.received_at, submitted_at=po.received_at,
+            filled_at=(po.terminal_at if is_filled else None), terminal_at=po.terminal_at,
+        )
 
     async def query(self, f: "OrderFilter") -> "list[OrderRow]":
-        raise NotImplementedError
+        return await self._store.query_orders(f)
 
 
 class TransactionRepository(_Repo):
-    async def upsert(self, txns: list) -> int:  # noqa: ANN001
-        """sync_transactions core: upsert on tt_transaction_id, capture broker order-id. TODO."""
-        raise NotImplementedError
+    def __init__(self, store: "LedgerStore", *, resolver: "SecurityResolver") -> None:
+        super().__init__(store)
+        self._resolver = resolver
+        self._securities = SecurityRepository(store)
+
+    async def upsert(self, txns: "list[BrokerTransaction]", *, account: str) -> int:
+        """sync_transactions core: upsert on tt_transaction_id, capturing the broker's order-id
+        into tt_order_id (the deterministic txn->order link key — actually linking to the
+        order's surrogate id is the reconcile pass's job, not this importer's)."""
+        if not txns:
+            return 0
+
+        seen_security_ids: set[str] = set()
+        rows: list[TxnRow] = []
+        for t in txns:
+            security_id = None
+            if t.symbol:
+                resolved = self._resolver.resolve(t.symbol, t.instrument_type)
+                if resolved.security_id not in seen_security_ids:
+                    await self._securities.upsert(resolved, tt_symbol=t.symbol)
+                    seen_security_ids.add(resolved.security_id)
+                security_id = resolved.security_id
+
+            rows.append(
+                TxnRow(
+                    tt_transaction_id=t.id, tt_order_id=t.order_id, account=account,
+                    account_number=t.account_number, transaction_type=t.transaction_type,
+                    transaction_sub_type=t.transaction_sub_type, action=t.action,
+                    security_id=security_id, underlying=t.underlying_symbol,
+                    quantity=t.quantity, price=t.price, value=t.value, value_effect=t.value_effect,
+                    net_value=t.net_value, net_value_effect=t.net_value_effect,
+                    commission=t.commission, clearing_fees=t.clearing_fees,
+                    regulatory_fees=t.regulatory_fees,
+                    proprietary_index_option_fees=t.proprietary_index_option_fees,
+                    is_estimated_fee=t.is_estimated_fee, description=t.description,
+                    executed_at=t.executed_at, transaction_date=t.transaction_date,
+                )
+            )
+
+        await self._store.upsert_transactions(rows)
+        return len(rows)
 
     async def link_to_orders(self, account: str) -> int:
-        raise NotImplementedError
+        return await self._store.link_transactions_to_orders(account)
 
 
 class PositionRepository(_Repo):
-    async def upsert(self, positions: list) -> int:  # noqa: ANN001
-        raise NotImplementedError
+    def __init__(self, store: "LedgerStore", *, resolver: "SecurityResolver") -> None:
+        super().__init__(store)
+        self._resolver = resolver
+        self._securities = SecurityRepository(store)
+
+    async def upsert(self, positions: "list[BrokerPosition]", *, account: str) -> int:
+        """sync_positions core: upsert on (account, security_id). Market-data fields (quantity,
+        prices, P&L) always take the broker's latest snapshot; attribution fields the broker
+        snapshot can't know (strategy_id, opening_order_id, trade_group_id, position_opened_at —
+        NULL for broker positions per docs/schema.md) are preserved from any existing row rather
+        than reset to NULL on every re-sync."""
+        if not positions:
+            return 0
+
+        seen_security_ids: set[str] = set()
+        rows: list[PositionRow] = []
+        for p in positions:
+            resolved = self._resolver.resolve(p.symbol, p.instrument_type)
+            if resolved.security_id not in seen_security_ids:
+                await self._securities.upsert(resolved, tt_symbol=p.symbol)
+                seen_security_ids.add(resolved.security_id)
+
+            existing = await self._store.get_position(account, resolved.security_id)
+            rows.append(
+                PositionRow(
+                    account=account, security_id=resolved.security_id,
+                    quantity=p.quantity, quantity_direction=p.quantity_direction,
+                    average_open_price=p.average_open_price, mark_price=p.mark_price,
+                    close_price=p.close_price, unrealized_pnl=p.unrealized_pnl,
+                    realized_day_gain=p.realized_day_gain, multiplier=p.multiplier,
+                    expires_at=p.expires_at,
+                    strategy_id=existing.strategy_id if existing else None,
+                    opening_order_id=existing.opening_order_id if existing else None,
+                    trade_group_id=existing.trade_group_id if existing else None,
+                    position_opened_at=existing.position_opened_at if existing else None,
+                )
+            )
+
+        await self._store.upsert_positions(rows)
+        return len(rows)
 
 
 class TradeGroupRepository(_Repo):
@@ -58,5 +305,5 @@ class TradeGroupRepository(_Repo):
 
 __all__ = [
     "SecurityRepository", "OrderRepository", "TransactionRepository",
-    "PositionRepository", "TradeGroupRepository",
+    "PositionRepository", "TradeGroupRepository", "map_order_status", "apply_fill_event",
 ]

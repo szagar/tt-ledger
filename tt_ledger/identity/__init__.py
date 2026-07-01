@@ -3,12 +3,14 @@
 * **accounts** — nickname↔account-number (``AccountMapper``).
 * **securities** — an *injectable* broker-symbol→canonical-``security_id`` resolver. Default is
   :class:`PassthroughResolver` (canonical == vendor symbol). Optional adapters:
-  :class:`SecurityUniverseResolver` and ``CanonicalSymbolResolver`` (lazy-imported on use).
+  :class:`SecurityUniverseResolver` (``security-universe`` is lazy-imported on use) and
+  :class:`CanonicalSymbolResolver` (ZTS-style structured scheme, no extra dependency).
 """
 
 from __future__ import annotations
 
 from .accounts import AccountMapper, LoginConfig
+from .canonical import CanonicalSymbol, CanonicalSymbolResolver
 from .securities import (
     PassthroughResolver,
     ResolvedSecurity,
@@ -23,4 +25,6 @@ __all__ = [
     "ResolvedSecurity",
     "PassthroughResolver",
     "SecurityUniverseResolver",
+    "CanonicalSymbol",
+    "CanonicalSymbolResolver",
 ]
