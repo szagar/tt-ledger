@@ -577,3 +577,49 @@ async def test_same_timestamp_delivery_batch_applies_opens_before_closes(store_u
         assert pos is not None and pos.quantity == Decimal("0")
     finally:
         await store.dispose()
+
+
+async def test_resolver_multiplier_reaches_replay_pnl(store_url):
+    """A resolver-supplied contract multiplier lands on the securities dimension and scales
+    replay P&L into dollars (without it, futures/options closed_positions were per-unit)."""
+    from tt_ledger.identity import AccountMapper
+    from tt_ledger.identity.securities import ResolvedSecurity
+    from tt_ledger.ingest.broker import BrokerTransaction
+    from tt_ledger.ingest.mock_broker import MockTastyTradeClient
+    from tt_ledger.ingest.pull import sync_transactions
+    from tt_ledger.ingest.replay import rebuild_positions_from_transactions
+    from tt_ledger.rows import AccountRow
+    from tt_ledger.schema import metadata
+    from tt_ledger.store.sql import SqlLedgerStore
+
+    class FiftyXResolver:
+        def resolve(self, vendor_symbol, instrument_type=None):
+            return ResolvedSecurity(security_id=vendor_symbol, product_type="F", multiplier=50)
+
+    store = SqlLedgerStore(store_url)
+    async with store._engine.begin() as conn:
+        await conn.run_sync(metadata.drop_all)
+    await store.create_all()
+    try:
+        await store.upsert_account(AccountRow(nickname="main", account_number="ACCT1", login="u"))
+        accounts = AccountMapper({"main": "ACCT1"})
+        client = MockTastyTradeClient()
+        client.add_transaction(BrokerTransaction(
+            id="T1", account_number="ACCT1", symbol="/ESM6", instrument_type="Future",
+            transaction_type="Trade", action="Sell to Open", quantity=Decimal("1"),
+            price=Decimal("7350"), executed_at=T0, transaction_date=T0.date(),
+        ))
+        client.add_transaction(BrokerTransaction(
+            id="T2", account_number="ACCT1", symbol="/ESM6", instrument_type="Future",
+            transaction_type="Trade", action="Buy to Close", quantity=Decimal("1"),
+            price=Decimal("7421.25"), executed_at=T0 + timedelta(days=1),
+            transaction_date=(T0 + timedelta(days=1)).date(),
+        ))
+        await sync_transactions(store, "main", client=client, accounts=accounts, resolver=FiftyXResolver())
+        await rebuild_positions_from_transactions(store, "main")
+
+        closed = await store.get_closed_positions("main", "/ESM6")
+        assert len(closed) == 1
+        assert closed[0].realized_pnl == Decimal("-3562.50")  # (7350 - 7421.25) x 1 x 50
+    finally:
+        await store.dispose()

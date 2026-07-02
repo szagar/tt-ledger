@@ -57,6 +57,7 @@ class SecurityRepository(_Repo):
                 expiry=resolved.expiry,
                 strike=resolved.strike,
                 option_type=resolved.option_type,
+                multiplier=resolved.multiplier,
                 tt_symbol=tt_symbol,
             )
         )

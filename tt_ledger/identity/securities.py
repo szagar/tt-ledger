@@ -32,6 +32,8 @@ class ResolvedSecurity:
     expiry: date | None = None
     strike: Decimal | None = None
     option_type: str | None = None       # "P" | "C"
+    multiplier: int | None = None        # contract multiplier (100 for equity options; per-product
+                                         # for futures) -- replay's P&L is per-unit without it
 
 
 @runtime_checkable
