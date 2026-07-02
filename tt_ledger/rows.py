@@ -151,6 +151,27 @@ class PositionRow:
 
 
 @dataclass
+class ClosedPositionRow:
+    """A completed open->close round-trip, produced by replaying transaction history
+    (``ingest/replay.py``) — the durable historical record ``positions`` itself can't hold, since
+    that table only ever reflects the account+security's CURRENT (or most recently reopened) lot."""
+
+    account: str
+    security_id: str
+    quantity: Decimal
+    quantity_direction: str
+    average_open_price: Decimal | None = None
+    average_close_price: Decimal | None = None
+    realized_pnl: Decimal | None = None
+    opening_order_id: int | None = None
+    closing_order_id: int | None = None
+    trade_group_id: int | None = None
+    opened_at: datetime | None = None
+    closed_at: datetime | None = None
+    holding_period_days: int | None = None
+
+
+@dataclass
 class TradeGroupRow:
     group_id: str
     account: str

@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 from ..rows import (
     ActivityFilter,
     ActivityRow,
+    ClosedPositionRow,
     EventRow,
     FillRow,
     LegRow,
@@ -34,9 +35,13 @@ class LedgerStore(Protocol):
     async def upsert_transactions(self, rows: list[TxnRow]) -> None: ...      # tt_transaction_id
     async def upsert_security(self, sec: SecurityRow) -> None: ...            # security_id
     async def upsert_positions(self, rows: list[PositionRow]) -> None: ...    # (account, security_id)
+    async def upsert_closed_position(self, row: ClosedPositionRow) -> int: ...  # (account, security_id, opened_at, closed_at); returns surrogate id
 
     # --- linking + grouping ---
     async def link_transactions_to_orders(self, account: str) -> int: ...    # by tt_order_id
+    async def link_transactions_to_positions(
+        self, links: list[tuple[str, int | None, int | None]],
+    ) -> int: ...                                                            # (tt_transaction_id, position_id, closed_position_id); returns count updated
     async def upsert_trade_group(self, tg: TradeGroupRow) -> int: ...        # group_id; returns surrogate id
     async def add_trade_group_event(self, ev: EventRow) -> None: ...
     async def attach_transactions_to_trade_group(
@@ -49,6 +54,8 @@ class LedgerStore(Protocol):
     # --- reads (consolidated views, as methods) ---
     async def get_order(self, tt_order_id: str) -> OrderRow | None: ...
     async def get_position(self, account: str, security_id: str) -> PositionRow | None: ...
+    async def get_position_id(self, account: str, security_id: str) -> int | None: ...
+    async def get_closed_positions(self, account: str, security_id: str | None = None) -> list[ClosedPositionRow]: ...
     async def get_security(self, security_id: str) -> SecurityRow | None: ...
     async def get_trade_group(self, group_id: str) -> TradeGroupRow | None: ...
     async def get_trade_group_by_id(self, trade_group_id: int) -> TradeGroupRow | None: ...

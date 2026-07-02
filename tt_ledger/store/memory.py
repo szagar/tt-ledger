@@ -17,6 +17,7 @@ from typing import Any, Callable, Generic, TypeVar
 from ..rows import (
     ActivityFilter,
     ActivityRow,
+    ClosedPositionRow,
     EventRow,
     FillRow,
     LegRow,
@@ -105,6 +106,9 @@ class InMemoryStore:
         self._transactions: _Table[TxnRow] = _Table(key=lambda r: r.tt_transaction_id)
         self._securities: _Table[SecurityRow] = _Table(key=lambda r: r.security_id)
         self._positions: _Table[PositionRow] = _Table(key=lambda r: (r.account, r.security_id))
+        self._closed_positions: _Table[ClosedPositionRow] = _Table(
+            key=lambda r: (r.account, r.security_id, r.opened_at, r.closed_at)
+        )
         self._trade_groups: _Table[TradeGroupRow] = _Table(key=lambda r: r.group_id)
         self._events: _Table[EventRow] = _Table()
 
@@ -131,6 +135,9 @@ class InMemoryStore:
         for row in rows:
             self._positions.upsert(row)
 
+    async def upsert_closed_position(self, row: ClosedPositionRow) -> int:
+        return self._closed_positions.upsert(row)
+
     # --- linking + grouping --------------------------------------------------------
 
     async def link_transactions_to_orders(self, account: str) -> int:
@@ -142,6 +149,16 @@ class InMemoryStore:
             if order is None or order.account != account:
                 continue
             txn.order_id = self._orders.id_of(txn.tt_order_id)
+            linked += 1
+        return linked
+
+    async def link_transactions_to_positions(self, links: list[tuple[str, int | None, int | None]]) -> int:
+        by_tt_transaction_id = {tt_transaction_id: (position_id, closed_position_id) for tt_transaction_id, position_id, closed_position_id in links}
+        linked = 0
+        for _, txn in self._transactions.all():
+            if txn.tt_transaction_id not in by_tt_transaction_id:
+                continue
+            txn.position_id, txn.closed_position_id = by_tt_transaction_id[txn.tt_transaction_id]
             linked += 1
         return linked
 
@@ -178,6 +195,15 @@ class InMemoryStore:
 
     async def get_position(self, account: str, security_id: str) -> PositionRow | None:
         return self._positions.get_by_key((account, security_id))
+
+    async def get_position_id(self, account: str, security_id: str) -> int | None:
+        return self._positions.id_of((account, security_id))
+
+    async def get_closed_positions(self, account: str, security_id: str | None = None) -> list[ClosedPositionRow]:
+        return [
+            row for _, row in self._closed_positions.all()
+            if row.account == account and (security_id is None or row.security_id == security_id)
+        ]
 
     async def get_security(self, security_id: str) -> SecurityRow | None:
         return self._securities.get_by_key(security_id)

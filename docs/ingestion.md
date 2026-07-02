@@ -1,4 +1,4 @@
-# Ingestion — pull, push, reconcile
+# Ingestion — pull, push, reconcile, replay
 
 Two capture paths feed the same store; both are **idempotent** (every row keyed on a broker id, written
 via the store's upserts). A reconciliation pass then structures broker-placed activity into trades.
@@ -76,3 +76,32 @@ is safe and never clobbers an operator's edits.
 - A trade also placed via the automated system → enriched in place by `tt_order_id`, never
   double-created as `broker`.
 - Stock + option legs mixed → `strategy_type = custom`; still grouped.
+
+## Replay (position history)
+
+`sync_positions` only ever gives the broker's **current** snapshot — there's no historical
+equivalent of `/positions`. `transactions` is the only endpoint with a real event log, so
+**`rebuild_positions_from_transactions`** (`ingest/replay.py`) reconstructs quantity, cost basis,
+and every completed open→close lifecycle by replaying it forward.
+
+- **Full rebuild, not incremental** — walks every position-affecting transaction for an account
+  from scratch, in `executed_at` order, maintaining a running weighted-average-cost lot per
+  security. Idempotent: `positions` upserts on `(account, security_id)`, `closed_positions`
+  "upserts" (app-level key, no DB unique constraint) on `(account, security_id, opened_at,
+  closed_at)`, and `transactions.position_id` / `closed_position_id` re-link to the same ids
+  every run.
+- `positions` stays the CURRENT (or most-recently-reopened) lot; `closed_positions` is the durable
+  record of each completed round trip (`average_open_price`/`average_close_price`/`realized_pnl`/
+  `holding_period_days`) that `positions` itself can't hold once a lot fully closes and reopens.
+- Replay owns `quantity` / `quantity_direction` / `average_open_price` / `opening_order_id` /
+  `position_opened_at` on the `positions` row; it never touches `mark_price` / `close_price` /
+  `unrealized_pnl` / `realized_day_gain` (broker-owned, from `sync_positions`) or `strategy_id` /
+  `trade_group_id` (operator-owned, from remap).
+- A direction-flip transaction (e.g. long 10, sell 15 → short 5) sets **both** `position_id`
+  (opens the new lot) and `closed_position_id` (closes the old one) on that one row.
+- **Known limitations:** gross P&L only (fees/commissions aren't netted out, matching
+  `unrealized_pnl`'s existing convention); a position whose opening predates the visible
+  transaction history (e.g. an ACAT transfer, or a sync window starting after inception) has its
+  cost basis/opening date understated to the visible window; a transaction with a `security_id` +
+  `quantity` but no `action` (some corporate actions) is applied as a signed delta using the
+  transaction's own quantity sign, not an inferred Buy/Sell direction.

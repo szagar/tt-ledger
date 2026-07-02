@@ -23,6 +23,7 @@ from ..enums import Ingest, Origin, ReviewStatus
 from ..rows import (
     ActivityFilter,
     ActivityRow,
+    ClosedPositionRow,
     EventRow,
     FillRow,
     LegRow,
@@ -172,7 +173,45 @@ class SqlLedgerStore:
         async with self._sessionmaker() as session, session.begin():
             await self._upsert(session, table, [_row_dict(r) for r in rows], ["account", "security_id"])
 
+    async def upsert_closed_position(self, row: ClosedPositionRow) -> int:
+        """App-level upsert on ``(account, security_id, opened_at, closed_at)`` -- there's no DB
+        unique constraint for it (closed_positions predates this writer), so conflict detection is
+        a plain SELECT-then-insert/update rather than ``ON CONFLICT`` (docs/ingestion.md → Replay)."""
+        table = models.ClosedPosition.__table__
+        data = _row_dict(row)
+        async with self._sessionmaker() as session, session.begin():
+            existing = (
+                await session.execute(
+                    select(table.c.id).where(
+                        table.c.account == row.account, table.c.security_id == row.security_id,
+                        table.c.opened_at == row.opened_at, table.c.closed_at == row.closed_at,
+                    )
+                )
+            ).first()
+            if existing is not None:
+                await session.execute(table.update().where(table.c.id == existing.id).values(**data))
+                return existing.id
+            result = await session.execute(table.insert().values(**data).returning(table.c.id))
+            return result.scalar_one()
+
     # --- linking + grouping ----------------------------------------------------------
+
+    async def link_transactions_to_positions(self, links: list[tuple[str, int | None, int | None]]) -> int:
+        if not links:
+            return 0
+        table = models.Transaction.__table__
+        updates = [
+            {"_tt_transaction_id": tt_transaction_id, "_position_id": position_id, "_closed_position_id": closed_position_id}
+            for tt_transaction_id, position_id, closed_position_id in links
+        ]
+        async with self._sessionmaker() as session, session.begin():
+            await session.execute(
+                update(table).where(table.c.tt_transaction_id == bindparam("_tt_transaction_id")).values(
+                    position_id=bindparam("_position_id"), closed_position_id=bindparam("_closed_position_id"),
+                ),
+                updates,
+            )
+        return len(updates)
 
     async def link_transactions_to_orders(self, account: str) -> int:
         txns = models.Transaction.__table__
@@ -269,6 +308,25 @@ class SqlLedgerStore:
                 )
             ).first()
         return _mapping_to(PositionRow, row) if row is not None else None
+
+    async def get_position_id(self, account: str, security_id: str) -> int | None:
+        table = models.Position.__table__
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(table.c.id).where(table.c.account == account, table.c.security_id == security_id)
+                )
+            ).first()
+        return row.id if row is not None else None
+
+    async def get_closed_positions(self, account: str, security_id: str | None = None) -> list[ClosedPositionRow]:
+        table = models.ClosedPosition.__table__
+        stmt = select(table).where(table.c.account == account)
+        if security_id is not None:
+            stmt = stmt.where(table.c.security_id == security_id)
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return [_mapping_to(ClosedPositionRow, r) for r in rows]
 
     async def get_security(self, security_id: str) -> SecurityRow | None:
         table = models.Security.__table__
