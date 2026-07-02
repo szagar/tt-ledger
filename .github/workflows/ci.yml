@@ -60,6 +60,15 @@ jobs:
           TT_LEDGER_DATABASE_URL: sqlite+aiosqlite:///./ci_sqlite.db
         run: alembic upgrade head
 
+      - name: Reset the Postgres schema
+        # The pytest step's fixtures create/drop tables directly via SQLAlchemy metadata (not
+        # alembic) against this same throwaway database, leaving tables behind with no
+        # alembic_version row -- `alembic upgrade head` below needs a genuinely clean schema to
+        # prove it can build one from scratch (the actual point of this dual-dialect guarantee).
+        env:
+          PGPASSWORD: ledger
+        run: psql -h localhost -U ledger -d ledger_test -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+
       - name: Migrations — Postgres (upgrade head)   # the dual-dialect guarantee
         env:
           TT_LEDGER_DATABASE_URL: ${{ env.PG_URL }}
