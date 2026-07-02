@@ -176,3 +176,6 @@ class LedgerClient:
         dispose = getattr(self._store, "dispose", None)
         if dispose is not None:
             await dispose()
+        broker_close = getattr(self._client, "close", None)
+        if broker_close is not None:
+            await broker_close()

@@ -35,7 +35,8 @@ def build_app():
 
     import asyncio
 
-    from .identity import AccountMapper
+    from .identity import AccountMapper, LoginConfig
+    from .ingest.tastytrade_client import PRODUCTION_URL, SANDBOX_URL, TastyTradeClient
     from .sdk import LedgerClient
 
     # a fixed width (rather than auto-detected) keeps tables from wrapping IDs mid-string when
@@ -46,6 +47,21 @@ def build_app():
     def _open_client(ctx: "typer.Context") -> "LedgerClient":
         accounts = AccountMapper.from_toml(ctx.obj["accounts_path"])
         return LedgerClient.open(ctx.obj["url"], accounts=accounts)
+
+    def _open_client_for_sync(ctx: "typer.Context", account: str) -> "LedgerClient":
+        """Like ``_open_client``, but also wires a real ``TastyTradeClient`` -- the only command
+        that needs a broker connection at all. ``TastyTradeClient`` needs the ``[tastytrade]``
+        extra; a paper account's ``env`` routes it to the sandbox/cert API (the same environment
+        TastyTrade itself uses for paper trading), not a separate global setting."""
+        accounts_path = ctx.obj["accounts_path"]
+        accounts = AccountMapper.from_toml(accounts_path)
+        login = accounts.login_for(account)
+        if login is None:
+            raise RuntimeError(f"no login section in {accounts_path} owns account {account!r}")
+        login_config = LoginConfig.from_toml(login, accounts_path)
+        base_url = SANDBOX_URL if accounts.env_for(account) == "paper" else PRODUCTION_URL
+        broker = TastyTradeClient.from_login_config(login_config, base_url=base_url)
+        return LedgerClient.open(ctx.obj["url"], accounts=accounts, client=broker)
 
     def _run(coro):
         try:
@@ -166,7 +182,7 @@ def build_app():
         """Pull (orders + transactions + positions) then reconcile."""
 
         async def _do():
-            client = _open_client(ctx)
+            client = _open_client_for_sync(ctx, account)
             try:
                 result = await client.sync(account, since=_parse_since(since))
                 _print_sync_result(result)

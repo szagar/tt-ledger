@@ -80,12 +80,23 @@ def test_from_toml_merges_multiple_logins_into_one_nickname_space(tmp_path):
     assert mapper.default_nickname == "main"
 
 
+def test_from_toml_tracks_login_for_each_nickname(tmp_path):
+    cfg = _write(tmp_path, _TWO_LOGINS)
+    mapper = AccountMapper.from_toml(cfg)
+
+    assert mapper.login_for("main") == "trader1"
+    assert mapper.login_for("main_paper") == "trader1"
+    assert mapper.login_for("side") == "trader2"
+    assert mapper.login_for("does-not-exist") is None
+
+
 def test_from_toml_scoped_to_one_login(tmp_path):
     cfg = _write(tmp_path, _TWO_LOGINS)
     mapper = AccountMapper.from_toml(cfg, login="trader2")
 
     assert mapper.list_nicknames() == ["side"]
     assert mapper.default_nickname == "side"
+    assert mapper.login_for("side") == "trader2"
     with pytest.raises(KeyError):
         mapper.to_account_number("main")
 

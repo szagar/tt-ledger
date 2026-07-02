@@ -105,10 +105,12 @@ def test_trades_list_empty(db_url, accounts_path):
     assert "No trades matched" in result.output
 
 
-def test_sync_without_a_broker_client_errors_clearly(db_url, accounts_path):
-    result = _invoke(db_url, accounts_path, "sync", "--account", "main")
+def test_sync_unknown_account_errors_clearly(db_url, accounts_path):
+    """``sync`` needs a real broker client wired from accounts.toml's [login] credentials
+    (docs/identity.md) -- an account nickname no [login] section owns can't build one."""
+    result = _invoke(db_url, accounts_path, "sync", "--account", "does-not-exist")
     assert result.exit_code == 1
-    assert "requires a broker client" in result.output
+    assert "no login section" in result.output
 
 
 def test_sync_missing_accounts_toml_errors_clearly(db_url, tmp_path):

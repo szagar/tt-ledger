@@ -37,6 +37,7 @@ refresh_token = "…"
 mapper.to_nickname("ACCT0002")        # -> "ira"
 mapper.to_account_number("main")      # -> "ACCT0001"
 mapper.env_for("main_paper")          # -> "paper"
+mapper.login_for("main")              # -> "trader1" -- which [login] section owns this nickname
 mapper.list_nicknames(env="live")     # -> ["main", "ira"]
 mapper.default_nickname               # -> "main"
 ```
