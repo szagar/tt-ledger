@@ -105,7 +105,7 @@ def _vwap(fills: "list[PlacedFill]") -> Decimal | None:
     return sum((f.quantity * f.fill_price for f in fills), Decimal("0")) / total_qty
 
 
-def _order_level_fill_fields(legs: "list") -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+def order_level_fill_fields(legs: "list") -> tuple[Decimal | None, Decimal | None, Decimal | None]:
     """(average_fill_price, filled_quantity, remaining_quantity) for a SINGLE-leg order only.
 
     TastyTrade's real Order object has no order-level fill fields at all (verified against their
@@ -149,7 +149,7 @@ class OrderRepository(_Repo):
             await self._build_order_row(
                 po, account=account,
                 security_id=(resolved_legs[i][0].security_id if len(po.legs) == 1 else None),
-                fill_fields=_order_level_fill_fields(po.legs),
+                fill_fields=order_level_fill_fields(po.legs),
             )
             for i, po in enumerate(placed_orders)
         ]
@@ -357,4 +357,5 @@ class TradeGroupRepository(_Repo):
 __all__ = [
     "SecurityRepository", "OrderRepository", "TransactionRepository",
     "PositionRepository", "TradeGroupRepository", "map_order_status", "apply_fill_event",
+    "order_level_fill_fields",
 ]

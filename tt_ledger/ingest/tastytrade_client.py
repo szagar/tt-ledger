@@ -87,6 +87,13 @@ class TastyTradeClient:
     async def close(self) -> None:
         await self._http.aclose()
 
+    async def access_token(self) -> str:
+        """The current (auto-refreshed) OAuth access token. Public so other transports that
+        reuse this login's auth -- e.g. ``TastyTradeMessageSource``, the account-streamer,
+        which needs a fresh token in its own connect/heartbeat messages too -- don't need their
+        own OAuth implementation."""
+        return await self._ensure_token()
+
     # --- auth ------------------------------------------------------------------------------
 
     async def _ensure_token(self) -> str:
@@ -149,19 +156,19 @@ class TastyTradeClient:
             f"/accounts/{account_number}/orders",
             {"start-date": start.isoformat(), "end-date": end.isoformat()},
         )
-        return [_to_placed_order(item) for item in items]
+        return [order_from_json(item) for item in items]
 
     async def get_transaction_history(self, account_number: str, start: date, end: date) -> list[BrokerTransaction]:
         items = await self._get_all_pages(
             f"/accounts/{account_number}/transactions",
             {"start-date": start.isoformat(), "end-date": end.isoformat()},
         )
-        return [_to_broker_transaction(item) for item in items]
+        return [transaction_from_json(item) for item in items]
 
     async def get_positions(self, account_number: str) -> list[BrokerPosition]:
         body = await self._get(f"/accounts/{account_number}/positions", {})
         items = body.get("data", {}).get("items", [])
-        return [_to_broker_position(item) for item in items]
+        return [position_from_json(item) for item in items]
 
 
 def now_with_margin(expires_in_seconds: int) -> datetime:
@@ -183,32 +190,37 @@ def _raise_for_error(resp: "httpx.Response") -> None:
     raise TastyTradeApiError(f"TastyTrade API error {resp.status_code} [{code}]: {message}")
 
 
-def _dec(value) -> Decimal | None:  # noqa: ANN001
+def parse_decimal(value) -> Decimal | None:  # noqa: ANN001
     return None if value is None else Decimal(str(value))
 
 
-def _dt(value: str | None) -> datetime | None:
+def parse_datetime(value: str | None) -> datetime | None:
     return None if value is None else datetime.fromisoformat(value)
 
 
-def _dt_date(value: str | None) -> date | None:
+def parse_date(value: str | None) -> date | None:
     return None if value is None else date.fromisoformat(value)
 
 
-def _to_placed_order(item: dict) -> PlacedOrder:
+def order_from_json(item: dict) -> PlacedOrder:
+    """A TastyTrade Order JSON object -> ``PlacedOrder``. Shared by the REST client (order-history,
+    where every field below is always present) and ``TastyTradeMessageSource`` (account-streamer
+    Order notifications, which per TastyTrade's own docs use "the same json object representations
+    as elsewhere in the API" but in practice omit some fields, e.g. ``received-at`` -- hence the
+    fallback to "now" rather than a hard KeyError for that one field)."""
     legs = [
         PlacedLeg(
             instrument_type=leg["instrument-type"],
             symbol=leg["symbol"],
             action=leg["action"],
-            quantity=_dec(leg.get("quantity")) or Decimal("0"),
-            remaining_quantity=_dec(leg.get("remaining-quantity")) or Decimal("0"),
+            quantity=parse_decimal(leg.get("quantity")) or Decimal("0"),
+            remaining_quantity=parse_decimal(leg.get("remaining-quantity")) or Decimal("0"),
             fills=[
                 PlacedFill(
                     fill_id=fill["fill-id"],
-                    quantity=_dec(fill.get("quantity")) or Decimal("0"),
-                    fill_price=_dec(fill.get("fill-price")) or Decimal("0"),
-                    filled_at=_dt(fill["filled-at"]),
+                    quantity=parse_decimal(fill.get("quantity")) or Decimal("0"),
+                    fill_price=parse_decimal(fill.get("fill-price")) or Decimal("0"),
+                    filled_at=parse_datetime(fill["filled-at"]),
                     destination_venue=fill.get("destination-venue"),
                     ext_exec_id=fill.get("ext-exec-id"),
                     ext_group_fill_id=fill.get("ext-group-fill-id"),
@@ -221,26 +233,26 @@ def _to_placed_order(item: dict) -> PlacedOrder:
     return PlacedOrder(
         id=str(item["id"]),
         account_number=str(item["account-number"]),
-        received_at=_dt(item["received-at"]),
+        received_at=parse_datetime(item.get("received-at")) or datetime.now(UTC),
         legs=legs,
         underlying_symbol=item.get("underlying-symbol"),
         underlying_instrument_type=item.get("underlying-instrument-type"),
         order_type=item.get("order-type"),
         time_in_force=item.get("time-in-force"),
         gtc_date=item.get("gtc-date"),
-        price=_dec(item.get("price")),
-        stop_trigger=_dec(item.get("stop-trigger")),
+        price=parse_decimal(item.get("price")),
+        stop_trigger=parse_decimal(item.get("stop-trigger")),
         price_effect=item.get("price-effect"),
         status=item.get("status"),
         reject_reason=item.get("reject-reason"),
         complex_order_id=item.get("complex-order-id"),
         complex_order_tag=item.get("complex-order-tag"),
-        updated_at=_dt(item.get("updated-at")),
-        terminal_at=_dt(item.get("terminal-at")),
+        updated_at=parse_datetime(item.get("updated-at")),
+        terminal_at=parse_datetime(item.get("terminal-at")),
     )
 
 
-def _to_broker_transaction(item: dict) -> BrokerTransaction:
+def transaction_from_json(item: dict) -> BrokerTransaction:
     order_id = item.get("order-id")
     return BrokerTransaction(
         id=str(item["id"]),
@@ -252,37 +264,37 @@ def _to_broker_transaction(item: dict) -> BrokerTransaction:
         transaction_type=item.get("transaction-type"),
         transaction_sub_type=item.get("transaction-sub-type"),
         action=item.get("action"),
-        quantity=_dec(item.get("quantity")),
-        price=_dec(item.get("price")),
-        value=_dec(item.get("value")),
+        quantity=parse_decimal(item.get("quantity")),
+        price=parse_decimal(item.get("price")),
+        value=parse_decimal(item.get("value")),
         value_effect=item.get("value-effect"),
-        net_value=_dec(item.get("net-value")),
+        net_value=parse_decimal(item.get("net-value")),
         net_value_effect=item.get("net-value-effect"),
-        commission=_dec(item.get("commission")),
-        clearing_fees=_dec(item.get("clearing-fees")),
-        regulatory_fees=_dec(item.get("regulatory-fees")),
-        proprietary_index_option_fees=_dec(item.get("proprietary-index-option-fees")),
+        commission=parse_decimal(item.get("commission")),
+        clearing_fees=parse_decimal(item.get("clearing-fees")),
+        regulatory_fees=parse_decimal(item.get("regulatory-fees")),
+        proprietary_index_option_fees=parse_decimal(item.get("proprietary-index-option-fees")),
         is_estimated_fee=item.get("is-estimated-fee"),
         description=item.get("description"),
-        executed_at=_dt(item.get("executed-at")),
-        transaction_date=_dt_date(item.get("transaction-date")),
+        executed_at=parse_datetime(item.get("executed-at")),
+        transaction_date=parse_date(item.get("transaction-date")),
     )
 
 
-def _to_broker_position(item: dict) -> BrokerPosition:
+def position_from_json(item: dict) -> BrokerPosition:
     multiplier = item.get("multiplier")
     return BrokerPosition(
         account_number=str(item["account-number"]),
         symbol=item["symbol"],
-        quantity=_dec(item.get("quantity")) or Decimal("0"),
+        quantity=parse_decimal(item.get("quantity")) or Decimal("0"),
         quantity_direction=item.get("quantity-direction", ""),
         underlying_symbol=item.get("underlying-symbol"),
         instrument_type=item.get("instrument-type"),
-        average_open_price=_dec(item.get("average-open-price")),
-        mark_price=_dec(item.get("mark-price")),
-        close_price=_dec(item.get("close-price")),
-        realized_day_gain=_dec(item.get("realized-day-gain")),
+        average_open_price=parse_decimal(item.get("average-open-price")),
+        mark_price=parse_decimal(item.get("mark-price")),
+        close_price=parse_decimal(item.get("close-price")),
+        realized_day_gain=parse_decimal(item.get("realized-day-gain")),
         realized_day_gain_effect=item.get("realized-day-gain-effect"),
         multiplier=int(multiplier) if multiplier is not None else 1,
-        expires_at=_dt(item.get("expires-at")),
+        expires_at=parse_datetime(item.get("expires-at")),
     )

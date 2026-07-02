@@ -10,6 +10,7 @@ from .reconcile import reconcile
 from .remap import dismiss_trade_group, regroup_transactions, remap_trade_group
 from .replay import rebuild_positions_from_transactions
 from .tastytrade_client import PRODUCTION_URL, SANDBOX_URL, TastyTradeApiError, TastyTradeClient
+from .tastytrade_stream import STREAMER_PRODUCTION_URL, STREAMER_SANDBOX_URL, TastyTradeMessageSource, TastyTradeStreamError
 
 __all__ = [
     "sync_orders", "sync_transactions", "sync_positions",
@@ -19,4 +20,5 @@ __all__ = [
     "BalanceMessage", "MockTastyTradeClient",
     "MessageSource", "StreamConsumer", "MockMessageSource",
     "TastyTradeClient", "TastyTradeApiError", "PRODUCTION_URL", "SANDBOX_URL",
+    "TastyTradeMessageSource", "TastyTradeStreamError", "STREAMER_PRODUCTION_URL", "STREAMER_SANDBOX_URL",
 ]
