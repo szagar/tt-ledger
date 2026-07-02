@@ -1,7 +1,8 @@
 """FastAPI app factory (docs/api.md → HTTP server). Requires the ``[api]`` extra.
 
 Endpoints: GET /orders, GET /trades, GET /trades/{group_id},
-GET /accounts/{nickname}/activity, POST /trades/{group_id}/{remap,regroup,dismiss},
+GET /accounts/{nickname}/activity, GET /accounts/{nickname}/positions[/{security_id}],
+GET /accounts/{nickname}/closed-positions, POST /trades/{group_id}/{remap,regroup,dismiss},
 POST /ingest/{source_system} (reserved, 501). DTOs are Pydantic models over the consolidated
 views (``api/schemas.py``); routes live in ``api/routes.py``.
 """

@@ -319,6 +319,12 @@ class SqlLedgerStore:
             ).first()
         return row.id if row is not None else None
 
+    async def get_positions(self, account: str) -> list[PositionRow]:
+        table = models.Position.__table__
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(select(table).where(table.c.account == account))).all()
+        return [_mapping_to(PositionRow, r) for r in rows]
+
     async def get_closed_positions(self, account: str, security_id: str | None = None) -> list[ClosedPositionRow]:
         table = models.ClosedPosition.__table__
         stmt = select(table).where(table.c.account == account)

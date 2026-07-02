@@ -208,6 +208,33 @@ def test_trades_regroup_requires_to_or_new(seeded):
     assert "--to" in result.output or "--new" in result.output
 
 
+def test_positions_empty(seeded):
+    db_url, accounts_path = seeded
+    result = _invoke(db_url, accounts_path, "positions", "--account", "main")
+    assert result.exit_code == 0
+    assert "No positions matched" in result.output
+
+
+def test_rebuild_positions_then_list(seeded):
+    db_url, accounts_path = seeded
+    result = _invoke(db_url, accounts_path, "rebuild-positions", "--account", "main")
+    assert result.exit_code == 0
+    assert "positions rebuilt: 1" in result.output
+
+    result = _invoke(db_url, accounts_path, "positions", "--account", "main")
+    assert result.exit_code == 0
+    assert "AAPL" in result.output
+
+
+def test_closed_positions_empty(seeded):
+    db_url, accounts_path = seeded
+    _invoke(db_url, accounts_path, "rebuild-positions", "--account", "main")
+
+    result = _invoke(db_url, accounts_path, "closed-positions", "--account", "main")
+    assert result.exit_code == 0
+    assert "No closed positions matched" in result.output
+
+
 def test_trades_regroup_rejects_both_to_and_new(seeded):
     db_url, accounts_path = seeded
     _invoke(db_url, accounts_path, "reconcile")

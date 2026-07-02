@@ -169,6 +169,57 @@ async def test_account_activity(client, broker):
     assert activity[0].origin is Origin.BROKER
 
 
+# --- positions ----------------------------------------------------------------------------
+
+
+async def test_position_returns_none_for_unknown_security(client):
+    assert await client.position("main", "AAPL") is None
+
+
+async def test_rebuild_positions_populates_positions_and_closed_positions(client, broker):
+    broker.fill(
+        account_number="ACCT1", order_id="O-1", symbol="AAPL", instrument_type="Equity",
+        action="Buy to Open", quantity=Decimal("10"), fill_price=Decimal("150"),
+        filled_at=datetime(2026, 1, 5, tzinfo=UTC), status="Filled",
+    )
+    broker.fill(
+        account_number="ACCT1", order_id="O-2", symbol="AAPL", instrument_type="Equity",
+        action="Sell to Close", quantity=Decimal("10"), fill_price=Decimal("170"),
+        filled_at=datetime(2026, 1, 8, tzinfo=UTC), status="Filled",
+    )
+    await client.sync("main")
+
+    result = await client.rebuild_positions("main")
+    assert result.positions == 1
+    assert result.errors == []
+
+    position = await client.position("main", "AAPL")
+    assert position.quantity == Decimal("0")
+
+    # open_only (default) filters the now-flat AAPL row out
+    assert await client.positions("main") == []
+    assert len(await client.positions("main", open_only=False)) == 1
+
+    closed = await client.closed_positions("main")
+    assert len(closed) == 1
+    assert closed[0].realized_pnl == Decimal("200")
+    assert await client.closed_positions("main", "MSFT") == []
+
+
+async def test_positions_open_only_excludes_flat_rows_but_not_open_ones(client, broker):
+    broker.fill(
+        account_number="ACCT1", order_id="O-1", symbol="AAPL", instrument_type="Equity",
+        action="Buy to Open", quantity=Decimal("10"), fill_price=Decimal("150"),
+        filled_at=datetime(2026, 1, 5, tzinfo=UTC), status="Filled",
+    )
+    await client.sync("main")
+    await client.rebuild_positions("main")
+
+    open_positions = await client.positions("main")
+    assert len(open_positions) == 1
+    assert open_positions[0].security_id == "AAPL"
+
+
 # --- reconcile (without a broker pull) ------------------------------------------------------
 
 

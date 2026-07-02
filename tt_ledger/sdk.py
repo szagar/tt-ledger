@@ -14,6 +14,7 @@ from .identity import PassthroughResolver
 from .ingest.pull import sync_all
 from .ingest.reconcile import reconcile
 from .ingest.remap import dismiss_trade_group, regroup_transactions, remap_trade_group
+from .ingest.replay import rebuild_positions_from_transactions
 from .repositories import apply_fill_event
 from .rows import ActivityFilter, OrderFilter, OrderRow, TradeFilter, trade_group_to_row
 from .store import make_store
@@ -21,7 +22,7 @@ from .store import make_store
 if TYPE_CHECKING:
     from .identity import AccountMapper, SecurityResolver
     from .ingest.broker import BrokerClient
-    from .rows import ActivityRow, FillEvent, OrderInput, SyncResult, TradeRow
+    from .rows import ActivityRow, ClosedPositionRow, FillEvent, OrderInput, PositionRow, SyncResult, TradeRow
     from .store import LedgerStore
 
 
@@ -130,11 +131,29 @@ class LedgerClient:
         transactions = [row for row in activity if row.trade_group_id == pk]
         return orders, transactions
 
+    async def position(self, account: str, security_id: str) -> "PositionRow | None":
+        return await self._store.get_position(account, security_id)
+
+    async def positions(self, account: str, *, open_only: bool = True) -> "list[PositionRow]":
+        """The account's positions -- ``positions`` never deletes a row once a security fully
+        closes (docs/ingestion.md → Replay), so ``open_only`` (default) filters those flat
+        (``quantity == 0``) rows out; pass ``open_only=False`` to see everything ever held."""
+        rows = await self._store.get_positions(account)
+        return [r for r in rows if not open_only or r.quantity != 0]
+
+    async def closed_positions(self, account: str, security_id: str | None = None) -> "list[ClosedPositionRow]":
+        return await self._store.get_closed_positions(account, security_id)
+
     # --- reconcile ---
 
     async def reconcile(self, account: str | None = None, *, since: date | None = None, dry_run: bool = False) -> "SyncResult":
         """Re-run reconcile without a broker pull (e.g. after backfilling data another way)."""
         return await reconcile(self._store, account, since=since, dry_run=dry_run)
+
+    async def rebuild_positions(self, account: str | None = None) -> "SyncResult":
+        """Rebuild ``positions``/``closed_positions`` from transaction history
+        (``ingest/replay.py``) -- no broker pull, safe to re-run any time after ``sync``."""
+        return await rebuild_positions_from_transactions(self._store, account)
 
     # --- remap ---
 

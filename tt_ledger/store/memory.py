@@ -199,6 +199,9 @@ class InMemoryStore:
     async def get_position_id(self, account: str, security_id: str) -> int | None:
         return self._positions.id_of((account, security_id))
 
+    async def get_positions(self, account: str) -> list[PositionRow]:
+        return [row for _, row in self._positions.all() if row.account == account]
+
     async def get_closed_positions(self, account: str, security_id: str | None = None) -> list[ClosedPositionRow]:
         return [
             row for _, row in self._closed_positions.all()

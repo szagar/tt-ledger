@@ -107,6 +107,44 @@ class ActivityDTO(BaseModel):
     review_status: ReviewStatus | None = None
 
 
+class PositionDTO(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    account: str
+    security_id: str
+    quantity: Decimal
+    quantity_direction: str
+    average_open_price: Decimal | None = None
+    mark_price: Decimal | None = None
+    close_price: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    realized_day_gain: Decimal | None = None
+    multiplier: int = 1
+    expires_at: datetime | None = None
+    strategy_id: int | None = None
+    opening_order_id: int | None = None
+    trade_group_id: int | None = None
+    position_opened_at: datetime | None = None
+
+
+class ClosedPositionDTO(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    account: str
+    security_id: str
+    quantity: Decimal
+    quantity_direction: str
+    average_open_price: Decimal | None = None
+    average_close_price: Decimal | None = None
+    realized_pnl: Decimal | None = None
+    opening_order_id: int | None = None
+    closing_order_id: int | None = None
+    trade_group_id: int | None = None
+    opened_at: datetime | None = None
+    closed_at: datetime | None = None
+    holding_period_days: int | None = None
+
+
 class TradeDetailDTO(TradeDTO):
     """``TradeDTO`` + its orders and transactions (legs/fills/events aren't included -- no
     query-by-order/query-by-group method exists for those yet)."""
@@ -135,5 +173,6 @@ class DismissRequest(BaseModel):
 
 __all__ = [
     "OrderDTO", "TradeDTO", "ActivityDTO", "TradeDetailDTO",
+    "PositionDTO", "ClosedPositionDTO",
     "RemapRequest", "RegroupRequest", "DismissRequest",
 ]

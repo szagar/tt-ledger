@@ -124,6 +124,54 @@ async def test_account_activity_unreconciled_only(api, ledger_client, broker):
     assert resp.json() == []  # already linked+grouped by sync()
 
 
+async def test_list_positions_open_only_by_default(api, ledger_client, broker):
+    broker.fill(account_number="ACCT1", order_id="O-1", symbol="AAPL", instrument_type="Equity", action="Buy to Open", quantity=Decimal("10"), fill_price=Decimal("150"), filled_at=datetime(2026, 1, 5, tzinfo=UTC), status="Filled")
+    broker.fill(account_number="ACCT1", order_id="O-2", symbol="AAPL", instrument_type="Equity", action="Sell to Close", quantity=Decimal("10"), fill_price=Decimal("170"), filled_at=datetime(2026, 1, 8, tzinfo=UTC), status="Filled")
+    await ledger_client.sync("main")
+    await ledger_client.rebuild_positions("main")
+
+    resp = api.get("/accounts/main/positions")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+    resp = api.get("/accounts/main/positions", params={"all": "true"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["security_id"] == "AAPL"
+    assert body[0]["quantity"] == "0"
+
+
+async def test_get_position(api, ledger_client, broker):
+    await _seed_single_leg_trade(ledger_client, broker)
+    await ledger_client.rebuild_positions("main")
+
+    resp = api.get("/accounts/main/positions/AAPL")
+    assert resp.status_code == 200
+    assert resp.json()["quantity"] == "10"
+
+
+def test_get_position_404_for_unknown(api):
+    resp = api.get("/accounts/main/positions/AAPL")
+    assert resp.status_code == 404
+
+
+async def test_list_closed_positions(api, ledger_client, broker):
+    broker.fill(account_number="ACCT1", order_id="O-1", symbol="AAPL", instrument_type="Equity", action="Buy to Open", quantity=Decimal("10"), fill_price=Decimal("150"), filled_at=datetime(2026, 1, 5, tzinfo=UTC), status="Filled")
+    broker.fill(account_number="ACCT1", order_id="O-2", symbol="AAPL", instrument_type="Equity", action="Sell to Close", quantity=Decimal("10"), fill_price=Decimal("170"), filled_at=datetime(2026, 1, 8, tzinfo=UTC), status="Filled")
+    await ledger_client.sync("main")
+    await ledger_client.rebuild_positions("main")
+
+    resp = api.get("/accounts/main/closed-positions")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["realized_pnl"] == "200"
+
+    resp = api.get("/accounts/main/closed-positions", params={"security_id": "MSFT"})
+    assert resp.json() == []
+
+
 async def test_remap_trade(api, ledger_client, broker):
     await _seed_single_leg_trade(ledger_client, broker)
     group_id = (await ledger_client.trades(account="main"))[0].group_id

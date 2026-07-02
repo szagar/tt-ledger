@@ -12,8 +12,10 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from .schemas import (
     ActivityDTO,
+    ClosedPositionDTO,
     DismissRequest,
     OrderDTO,
+    PositionDTO,
     RegroupRequest,
     RemapRequest,
     TradeDetailDTO,
@@ -85,6 +87,24 @@ async def account_activity(
 ):
     f = {"start": date_from, "end": date_to, "unreconciled_only": unreconciled_only}
     return await _client(request).account_activity(nickname, **{k: v for k, v in f.items() if v not in (None, False)})
+
+
+@router.get("/accounts/{nickname}/positions", response_model=list[PositionDTO])
+async def list_positions(request: Request, nickname: str, all: bool = False):  # noqa: A002 - "all" mirrors the CLI's --all flag
+    return await _client(request).positions(nickname, open_only=not all)
+
+
+@router.get("/accounts/{nickname}/positions/{security_id}", response_model=PositionDTO)
+async def get_position(request: Request, nickname: str, security_id: str):
+    position = await _client(request).position(nickname, security_id)
+    if position is None:
+        raise HTTPException(status_code=404, detail=f"no position for {nickname!r} / {security_id!r}")
+    return position
+
+
+@router.get("/accounts/{nickname}/closed-positions", response_model=list[ClosedPositionDTO])
+async def list_closed_positions(request: Request, nickname: str, security_id: str | None = None):
+    return await _client(request).closed_positions(nickname, security_id)
 
 
 # --- write / remap -------------------------------------------------------------------------

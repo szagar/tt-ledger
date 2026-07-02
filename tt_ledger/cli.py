@@ -1,8 +1,9 @@
 """``tt-ledger`` CLI (docs/api.md → CLI). Requires the ``[cli]`` extra.
 
 ``typer``/``rich`` are imported lazily inside ``build_app`` so ``import tt_ledger`` works
-without them. Commands: sync, trades list/show/remap/regroup/dismiss, reconcile — all thin
-wrappers over ``LedgerClient``, matching the API layer's own "thin wrapper" role.
+without them. Commands: sync, trades list/show/remap/regroup/dismiss, reconcile, positions,
+closed-positions, rebuild-positions — all thin wrappers over ``LedgerClient``, matching the API
+layer's own "thin wrapper" role.
 
 Two deviations from the docs' illustrative examples, both forced by the standalone schema:
   * ``trades remap --strategy`` takes an **int** (``strategy_id``, a soft ref — no strategy-name
@@ -116,6 +117,34 @@ def build_app():
         if not activity:
             console.print("[dim]No activity matched.[/dim]")
 
+    def _print_positions_table(positions) -> None:  # noqa: ANN001
+        table = Table(title="Positions")
+        for col in ("Security", "Qty", "Direction", "Avg open", "Mark", "Unrealized P&L"):
+            table.add_column(col, justify="right" if col not in ("Security", "Direction") else "left")
+        for p in positions:
+            table.add_row(
+                p.security_id, _money(p.quantity), p.quantity_direction,
+                _money(p.average_open_price), _money(p.mark_price), _money(p.unrealized_pnl),
+            )
+        console.print(table)
+        if not positions:
+            console.print("[dim]No positions matched.[/dim]")
+
+    def _print_closed_positions_table(closed) -> None:  # noqa: ANN001
+        table = Table(title="Closed positions")
+        for col in ("Security", "Qty", "Direction", "Avg open", "Avg close", "Realized P&L", "Closed at", "Held (days)"):
+            table.add_column(col, justify="right" if col not in ("Security", "Direction", "Closed at") else "left")
+        for c in closed:
+            table.add_row(
+                c.security_id, _money(c.quantity), c.quantity_direction, _money(c.average_open_price),
+                _money(c.average_close_price), _money(c.realized_pnl),
+                c.closed_at.isoformat() if c.closed_at else "-",
+                str(c.holding_period_days) if c.holding_period_days is not None else "-",
+            )
+        console.print(table)
+        if not closed:
+            console.print("[dim]No closed positions matched.[/dim]")
+
     app = typer.Typer(name="tt-ledger", help="Broker order/trade/transaction ledger.", no_args_is_help=True)
     trades_app = typer.Typer(help="Inspect, reconcile, and remap trades.")
     app.add_typer(trades_app, name="trades")
@@ -160,6 +189,61 @@ def build_app():
             try:
                 result = await client.reconcile(account, since=_parse_since(since), dry_run=dry_run)
                 console.print(f"trade_groups: {result.trade_groups}")
+                if result.errors:
+                    console.print("[red]Errors:[/red]")
+                    for err in result.errors:
+                        console.print(f"  - {err}")
+            finally:
+                await client.close()
+
+        _run(_do())
+
+    @app.command()
+    def positions(
+        ctx: typer.Context,
+        account: str = typer.Option(..., "--account", help="Account nickname."),
+        show_all: bool = typer.Option(False, "--all", help="Include flat (quantity 0) rows for securities once held."),
+    ) -> None:
+        """List positions (open only, unless --all)."""
+
+        async def _do():
+            client = _open_client(ctx)
+            try:
+                _print_positions_table(await client.positions(account, open_only=not show_all))
+            finally:
+                await client.close()
+
+        _run(_do())
+
+    @app.command("closed-positions")
+    def closed_positions(
+        ctx: typer.Context,
+        account: str = typer.Option(..., "--account", help="Account nickname."),
+        security_id: str | None = typer.Option(None, "--security-id"),
+    ) -> None:
+        """List completed open->close position lifecycles."""
+
+        async def _do():
+            client = _open_client(ctx)
+            try:
+                _print_closed_positions_table(await client.closed_positions(account, security_id))
+            finally:
+                await client.close()
+
+        _run(_do())
+
+    @app.command("rebuild-positions")
+    def rebuild_positions(
+        ctx: typer.Context,
+        account: str | None = typer.Option(None, "--account", help="Omit to rebuild every account with activity."),
+    ) -> None:
+        """Rebuild positions/closed-positions from transaction history (docs/ingestion.md → Replay)."""
+
+        async def _do():
+            client = _open_client(ctx)
+            try:
+                result = await client.rebuild_positions(account)
+                console.print(f"positions rebuilt: {result.positions}")
                 if result.errors:
                     console.print("[red]Errors:[/red]")
                     for err in result.errors:
