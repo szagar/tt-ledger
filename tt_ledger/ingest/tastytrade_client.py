@@ -31,7 +31,9 @@ if TYPE_CHECKING:
 PRODUCTION_URL = "https://api.tastyworks.com"
 SANDBOX_URL = "https://api.cert.tastyworks.com"  # aka "cert" -- use this for initial testing
 
-_DEFAULT_PER_PAGE = 250
+_DEFAULT_PER_PAGE = 250  # transactions'/positions' own per-page maximum is 2000, per their OpenAPI specs
+_ORDERS_PER_PAGE = 200   # orders' per-page maximum is only 200 (confirmed against its OpenAPI spec) --
+                          # a shared 250 gets "does not have a valid value" from the real API
 _TOKEN_LIFETIME_FALLBACK_SECONDS = 900  # 15 minutes, per docs, if expires_in is ever missing
 
 
@@ -103,9 +105,14 @@ class TastyTradeClient:
         return self._access_token
 
     async def _authenticate(self) -> None:
+        # JSON body, not form-encoded (data=) -- TastyTrade's whole API is JSON, including
+        # /oauth/token (unlike the RFC 6749 form-encoded convention most OAuth2 servers use).
+        # Confirmed against the real API: data= sent Content-Type: application/x-www-form-urlencoded
+        # while this client's default headers already claim application/json, and the server
+        # rejected the mismatched body with "malformed_json".
         resp = await self._http.post(
             "/oauth/token",
-            data={
+            json={
                 "grant_type": "refresh_token",
                 "refresh_token": self._refresh_token,
                 "client_id": self._client_id,
@@ -137,11 +144,11 @@ class TastyTradeClient:
         _raise_for_error(resp)
         return resp.json()
 
-    async def _get_all_pages(self, path: str, params: dict) -> list[dict]:
+    async def _get_all_pages(self, path: str, params: dict, *, per_page: int = _DEFAULT_PER_PAGE) -> list[dict]:
         items: list[dict] = []
         page_offset = 0
         while True:
-            body = await self._get(path, {**params, "page-offset": page_offset, "per-page": _DEFAULT_PER_PAGE})
+            body = await self._get(path, {**params, "page-offset": page_offset, "per-page": per_page})
             page_items = body.get("data", {}).get("items", [])
             items.extend(page_items)
             total_pages = body.get("pagination", {}).get("total-pages", 1)
@@ -155,6 +162,7 @@ class TastyTradeClient:
         items = await self._get_all_pages(
             f"/accounts/{account_number}/orders",
             {"start-date": start.isoformat(), "end-date": end.isoformat()},
+            per_page=_ORDERS_PER_PAGE,
         )
         return [order_from_json(item) for item in items]
 
@@ -194,8 +202,16 @@ def parse_decimal(value) -> Decimal | None:  # noqa: ANN001
     return None if value is None else Decimal(str(value))
 
 
-def parse_datetime(value: str | None) -> datetime | None:
-    return None if value is None else datetime.fromisoformat(value)
+def parse_datetime(value: str | int | float | None) -> datetime | None:
+    """Confirmed against the real API: most timestamp fields are ISO8601 strings (per the
+    OpenAPI spec's own declared type), but ``Order.updated-at`` arrives as a raw epoch-millis
+    integer despite being documented ``type: string`` -- handle both rather than trust the spec
+    for every field."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000, tz=UTC)
+    return datetime.fromisoformat(value)
 
 
 def parse_date(value: str | None) -> date | None:
@@ -295,6 +311,9 @@ def position_from_json(item: dict) -> BrokerPosition:
         close_price=parse_decimal(item.get("close-price")),
         realized_day_gain=parse_decimal(item.get("realized-day-gain")),
         realized_day_gain_effect=item.get("realized-day-gain-effect"),
-        multiplier=int(multiplier) if multiplier is not None else 1,
+        # confirmed against the real API: CurrentPosition.multiplier can arrive as a decimal-looking
+        # string ("50.0", not "50") -- int() directly on that raises ValueError, so go through
+        # float() first.
+        multiplier=int(float(multiplier)) if multiplier is not None else 1,
         expires_at=parse_datetime(item.get("expires-at")),
     )

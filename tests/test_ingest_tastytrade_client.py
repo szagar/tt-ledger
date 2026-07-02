@@ -8,6 +8,7 @@ response shapes TastyTrade documents, not shapes I invented.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, UTC
 from decimal import Decimal
 
@@ -15,7 +16,13 @@ import httpx
 import pytest
 
 from tt_ledger.ingest.broker import BrokerClient
-from tt_ledger.ingest.tastytrade_client import TastyTradeApiError, TastyTradeClient
+from tt_ledger.ingest.tastytrade_client import (
+    TastyTradeApiError,
+    TastyTradeClient,
+    order_from_json,
+    parse_datetime,
+    position_from_json,
+)
 
 TOKEN_RESPONSE = {"access_token": "abc123", "token_type": "Bearer", "expires_in": 900}
 
@@ -204,7 +211,8 @@ async def test_authenticates_and_fetches_transactions():
         calls.append((request.method, request.url.path))
         if request.url.path == "/oauth/token":
             assert request.headers["User-Agent"] == "tt-ledger/0.1.0"
-            body = dict(x.split("=") for x in request.content.decode().split("&"))
+            assert request.headers["Content-Type"] == "application/json"
+            body = json.loads(request.content)
             assert body["grant_type"] == "refresh_token"
             assert body["refresh_token"] == "refresh"
             return _json_response(200, TOKEN_RESPONSE)
@@ -300,6 +308,28 @@ async def test_fetches_positions_with_realized_day_gain_effect():
     assert p.multiplier == 1
 
 
+def test_parse_datetime_handles_epoch_millis_int():
+    """Confirmed against the real API: Order.updated-at arrives as a raw epoch-millis integer
+    despite being documented ``type: string``, unlike received-at/terminal-at/filled-at."""
+    assert parse_datetime(1782913535471) == datetime(2026, 7, 1, 13, 45, 35, 471000, tzinfo=UTC)
+
+
+def test_order_from_json_handles_an_epoch_millis_updated_at():
+    item = {
+        "id": "O-1", "account-number": "5WT0001", "received-at": "2026-07-01T13:45:33.128+00:00",
+        "updated-at": 1782913535471, "legs": [],
+    }
+    order = order_from_json(item)
+    assert order.updated_at == datetime(2026, 7, 1, 13, 45, 35, 471000, tzinfo=UTC)
+
+
+def test_position_from_json_handles_a_decimal_looking_multiplier_string():
+    """Confirmed against the real API: CurrentPosition.multiplier can arrive as ``"50.0"`` (a
+    decimal-looking string), not ``"50"`` -- a bare ``int(...)`` raises ValueError on that."""
+    item = {"account-number": "5WT0001", "symbol": "/ESZ6", "quantity": "1", "multiplier": "50.0"}
+    assert position_from_json(item).multiplier == 50
+
+
 async def test_paginates_across_multiple_pages():
     page_1 = {
         "data": {"items": [{"id": "O-1", "account-number": "5WT0001", "received-at": "2026-01-01T00:00:00.000+00:00", "legs": []}]},
@@ -310,12 +340,14 @@ async def test_paginates_across_multiple_pages():
         "pagination": {"total-pages": 2, "page-offset": 1},
     }
     seen_offsets = []
+    seen_per_page = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/oauth/token":
             return _json_response(200, TOKEN_RESPONSE)
         offset = int(request.url.params["page-offset"])
         seen_offsets.append(offset)
+        seen_per_page.append(int(request.url.params["per-page"]))
         return _json_response(200, page_1 if offset == 0 else page_2)
 
     client = _make_client(handler)
@@ -323,6 +355,9 @@ async def test_paginates_across_multiple_pages():
 
     assert seen_offsets == [0, 1]
     assert [o.id for o in orders] == ["O-1", "O-2"]
+    # confirmed against the real API: orders' per-page max is 200, unlike transactions'/
+    # positions' 2000 -- a shared higher default gets rejected with "does not have a valid value"
+    assert seen_per_page == [200, 200]
 
 
 async def test_retries_once_on_401_then_succeeds():

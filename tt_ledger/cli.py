@@ -29,6 +29,7 @@ def build_app():
     try:
         import typer
         from rich.console import Console
+        from rich.markup import escape
         from rich.table import Table
     except ModuleNotFoundError as exc:  # pragma: no cover
         raise RuntimeError("The CLI needs the [cli] extra: pip install tt-ledger[cli]") from exc
@@ -75,7 +76,10 @@ def build_app():
         try:
             return asyncio.run(coro)
         except (FileNotFoundError, ValueError, RuntimeError, KeyError) as exc:
-            console.print(f"[red]Error:[/red] {exc}")
+            # escape(): the exception text is untrusted (broker/API error bodies can contain
+            # literal "[...]" -- e.g. a TastyTrade error code -- which Rich would otherwise try
+            # to parse as markup and silently swallow).
+            console.print(f"[red]Error:[/red] {escape(str(exc))}")
             raise typer.Exit(code=1) from None
         except KeyboardInterrupt:
             console.print("\n[yellow]Stopped.[/yellow]")
@@ -100,7 +104,7 @@ def build_app():
         if result.errors:
             console.print("[red]Errors:[/red]")
             for err in result.errors:
-                console.print(f"  - {err}")
+                console.print(f"  - {escape(err)}")
 
     def _print_trades_table(trades) -> None:  # noqa: ANN001
         table = Table(title="Trades")
@@ -240,7 +244,7 @@ def build_app():
                 if result.errors:
                     console.print("[red]Errors:[/red]")
                     for err in result.errors:
-                        console.print(f"  - {err}")
+                        console.print(f"  - {escape(err)}")
             finally:
                 await client.close()
 
@@ -295,7 +299,7 @@ def build_app():
                 if result.errors:
                     console.print("[red]Errors:[/red]")
                     for err in result.errors:
-                        console.print(f"  - {err}")
+                        console.print(f"  - {escape(err)}")
             finally:
                 await client.close()
 

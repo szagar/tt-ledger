@@ -120,6 +120,16 @@ def test_sync_missing_accounts_toml_errors_clearly(db_url, tmp_path):
     assert "Error" in result.output
 
 
+def test_error_messages_render_literal_brackets_safely(db_url, tmp_path):
+    """Regression test: error text (broker/API error bodies, or -- as exercised here -- a file
+    path) can contain literal '[...]'. Without escaping, Rich interprets that as markup and
+    silently swallows it (this masked a real TastyTrade error code while debugging a live sync)."""
+    weird_path = tmp_path / "[weird].toml"
+    result = _invoke(db_url, weird_path, "sync", "--account", "main")
+    assert result.exit_code == 1
+    assert "[weird].toml" in result.output
+
+
 def test_listen_unknown_account_errors_clearly(db_url, accounts_path):
     """``listen`` reuses the same broker-wiring as ``sync`` -- same login-resolution error."""
     result = _invoke(db_url, accounts_path, "listen", "--account", "does-not-exist")
