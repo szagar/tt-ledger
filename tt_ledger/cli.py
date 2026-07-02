@@ -1,9 +1,9 @@
 """``tt-ledger`` CLI (docs/api.md → CLI). Requires the ``[cli]`` extra.
 
 ``typer``/``rich`` are imported lazily inside ``build_app`` so ``import tt_ledger`` works
-without them. Commands: sync, trades list/show/remap/regroup/dismiss, reconcile, positions,
-closed-positions, rebuild-positions — all thin wrappers over ``LedgerClient``, matching the API
-layer's own "thin wrapper" role.
+without them. Commands: sync, listen, trades list/show/remap/regroup/dismiss, reconcile,
+positions, closed-positions, rebuild-positions — all thin wrappers over ``LedgerClient``,
+matching the API layer's own "thin wrapper" role.
 
 Two deviations from the docs' illustrative examples, both forced by the standalone schema:
   * ``trades remap --strategy`` takes an **int** (``strategy_id``, a soft ref — no strategy-name
@@ -48,11 +48,14 @@ def build_app():
         accounts = AccountMapper.from_toml(ctx.obj["accounts_path"])
         return LedgerClient.open(ctx.obj["url"], accounts=accounts)
 
-    def _open_client_for_sync(ctx: "typer.Context", account: str) -> "LedgerClient":
-        """Like ``_open_client``, but also wires a real ``TastyTradeClient`` -- the only command
-        that needs a broker connection at all. ``TastyTradeClient`` needs the ``[tastytrade]``
-        extra; a paper account's ``env`` routes it to the sandbox/cert API (the same environment
-        TastyTrade itself uses for paper trading), not a separate global setting."""
+    def _open_client_with_broker(ctx: "typer.Context", account: str):
+        """Like ``_open_client``, but also wires a real ``TastyTradeClient`` -- needed by ``sync``
+        and ``listen``, the only commands that talk to the broker directly. ``TastyTradeClient``
+        needs the ``[tastytrade]`` extra; a paper account's ``env`` routes it to the sandbox/cert
+        API (the same environment TastyTrade itself uses for paper trading), not a separate
+        global setting. Returns ``(LedgerClient, TastyTradeClient)`` -- callers that also need the
+        raw broker object (``listen``, to build a ``TastyTradeMessageSource``) don't have to reach
+        into ``LedgerClient``'s private state for it."""
         accounts_path = ctx.obj["accounts_path"]
         accounts = AccountMapper.from_toml(accounts_path)
         login = accounts.login_for(account)
@@ -61,7 +64,12 @@ def build_app():
         login_config = LoginConfig.from_toml(login, accounts_path)
         base_url = SANDBOX_URL if accounts.env_for(account) == "paper" else PRODUCTION_URL
         broker = TastyTradeClient.from_login_config(login_config, base_url=base_url)
-        return LedgerClient.open(ctx.obj["url"], accounts=accounts, client=broker)
+        client = LedgerClient.open(ctx.obj["url"], accounts=accounts, client=broker)
+        return client, broker
+
+    def _open_client_for_sync(ctx: "typer.Context", account: str) -> "LedgerClient":
+        client, _broker = _open_client_with_broker(ctx, account)
+        return client
 
     def _run(coro):
         try:
@@ -69,6 +77,9 @@ def build_app():
         except (FileNotFoundError, ValueError, RuntimeError, KeyError) as exc:
             console.print(f"[red]Error:[/red] {exc}")
             raise typer.Exit(code=1) from None
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Stopped.[/yellow]")
+            raise typer.Exit(code=0) from None
 
     def _money(value) -> str:  # noqa: ANN001
         return "-" if value is None else str(value)
@@ -186,6 +197,27 @@ def build_app():
             try:
                 result = await client.sync(account, since=_parse_since(since))
                 _print_sync_result(result)
+            finally:
+                await client.close()
+
+        _run(_do())
+
+    @app.command()
+    def listen(
+        ctx: typer.Context,
+        account: str = typer.Option(..., "--account", help="Account nickname to stream."),
+    ) -> None:
+        """Run the real account-streamer live (orders/positions/balances) until interrupted."""
+        from .ingest.tastytrade_stream import TastyTradeMessageSource
+
+        async def _do():
+            client, broker = _open_client_with_broker(ctx, account)
+            try:
+                accounts = AccountMapper.from_toml(ctx.obj["accounts_path"])
+                source = TastyTradeMessageSource.from_client(broker, accounts.to_account_number(account))
+                consumer = client.stream_consumer(source)
+                console.print(f"Listening for {account!r} -- Ctrl+C to stop.")
+                await consumer.run()
             finally:
                 await client.close()
 

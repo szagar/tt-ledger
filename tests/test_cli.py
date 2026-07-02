@@ -95,6 +95,7 @@ def test_help():
     result = runner.invoke(build_app(), ["--help"])
     assert result.exit_code == 0
     assert "sync" in result.output
+    assert "listen" in result.output
     assert "trades" in result.output
     assert "reconcile" in result.output
 
@@ -117,6 +118,13 @@ def test_sync_missing_accounts_toml_errors_clearly(db_url, tmp_path):
     result = _invoke(db_url, tmp_path / "does-not-exist.toml", "sync", "--account", "main")
     assert result.exit_code == 1
     assert "Error" in result.output
+
+
+def test_listen_unknown_account_errors_clearly(db_url, accounts_path):
+    """``listen`` reuses the same broker-wiring as ``sync`` -- same login-resolution error."""
+    result = _invoke(db_url, accounts_path, "listen", "--account", "does-not-exist")
+    assert result.exit_code == 1
+    assert "no login section" in result.output
 
 
 def test_reconcile_groups_seeded_activity(seeded):

@@ -21,6 +21,7 @@ class LedgerClient:
     async def sync(self, account: str, since: date | None = None) -> SyncResult   # pull + reconcile
     async def record_order(self, order: OrderInput) -> OrderRow                    # oms_submit path
     async def apply_fill(self, evt: FillEvent) -> None                             # push path
+    def stream_consumer(self, source: MessageSource, *, on_balance=None) -> StreamConsumer  # push path
 
     # read (consolidated views)
     async def orders(self, **f) -> list[OrderRow]
@@ -74,6 +75,7 @@ DTOs mirror the `*Row` shapes returned by the SDK.
 
 ```
 tt-ledger sync --account main --since 2026-01-01      # pull + reconcile
+tt-ledger listen --account main                       # real account-streamer, live, until Ctrl+C
 tt-ledger trades list [--needs-review] [--origin broker]
 tt-ledger trades show <group_id>
 tt-ledger trades remap <group_id> --strategy spx_ic [--bot ...] [--signal ...]

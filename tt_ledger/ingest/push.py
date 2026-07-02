@@ -4,12 +4,11 @@
 broker-native shapes ``pull.py`` already uses (``FillEvent`` for order/fill updates,
 ``BrokerPosition`` for live position updates, ``BalanceMessage`` for balances, which have no
 schema home here and are only forwarded to an optional hook). This mirrors ``pull.py``'s
-``BrokerClient`` Protocol / ``MockTastyTradeClient`` pattern: the *transport* (a real broker
-WebSocket for standalone, the host platform's ``acct:*`` Redis pub/sub — see
-docs/integration-zts.md — for the host-platform deployment) isn't implemented here, same as the
-real REST client isn't; both are deferred ("port from host platform" per
-docs/implementation-notes.md). What *is* implemented is the consumer logic: dispatch, apply,
-and the documented "never creates order structure from the stream" rule.
+``BrokerClient`` Protocol / ``MockTastyTradeClient`` pattern: the *transport* is injected, not
+hardcoded here -- ``TastyTradeMessageSource`` (``tastytrade_stream.py``) is the real broker
+WebSocket, ``MockMessageSource`` is the test fake, and a host platform's ``acct:*`` Redis pub/sub
+(see docs/integration-zts.md) would be a third. ``LedgerClient.stream_consumer()``/``tt-ledger
+listen`` wire ``StreamConsumer`` to a real transport for standalone use.
 
 The stream does NOT create order structure: a broker fill with no local order is a no-op —
 the authoritative row (legs + fills) is created by ``pull.sync_orders``.

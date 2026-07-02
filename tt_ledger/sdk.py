@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from .enums import Ingest, Origin, ReviewStatus
 from .identity import PassthroughResolver
 from .ingest.pull import sync_all
+from .ingest.push import StreamConsumer
 from .ingest.reconcile import reconcile
 from .ingest.remap import dismiss_trade_group, regroup_transactions, remap_trade_group
 from .ingest.replay import rebuild_positions_from_transactions
@@ -20,8 +21,11 @@ from .rows import ActivityFilter, OrderFilter, OrderRow, TradeFilter, trade_grou
 from .store import make_store
 
 if TYPE_CHECKING:
+    from typing import Callable
+
     from .identity import AccountMapper, SecurityResolver
-    from .ingest.broker import BrokerClient
+    from .ingest.broker import BalanceMessage, BrokerClient
+    from .ingest.push import MessageSource
     from .rows import ActivityRow, ClosedPositionRow, FillEvent, OrderInput, PositionRow, SyncResult, TradeRow
     from .store import LedgerStore
 
@@ -96,6 +100,16 @@ class LedgerClient:
         ``tt_order_id`` only -- a fill for an unknown order is a no-op (docs/ingestion.md:
         sync_orders, not the stream, is authoritative for order structure)."""
         await apply_fill_event(self._store, evt)
+
+    def stream_consumer(
+        self, source: "MessageSource", *, on_balance: "Callable[[BalanceMessage], None] | None" = None,
+    ) -> "StreamConsumer":
+        """A ``StreamConsumer`` bound to this ledger's store/accounts/resolver, consuming an
+        already-built transport (``TastyTradeMessageSource`` for the real account-streamer,
+        ``MockMessageSource`` for tests, or any other ``MessageSource``). ``LedgerClient`` stays
+        transport-agnostic -- it never reads accounts.toml credentials itself, same as ``sync()``
+        takes an already-built ``BrokerClient`` rather than constructing one."""
+        return StreamConsumer(self._store, source, accounts=self._accounts, resolver=self._resolver, on_balance=on_balance)
 
     # --- read (consolidated views) ---
 

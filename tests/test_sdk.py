@@ -9,7 +9,8 @@ import pytest
 
 from tt_ledger.enums import Ingest, Origin, ReviewStatus
 from tt_ledger.identity import AccountMapper, PassthroughResolver
-from tt_ledger.ingest.mock_broker import MockTastyTradeClient
+from tt_ledger.ingest.broker import BalanceMessage, BrokerPosition
+from tt_ledger.ingest.mock_broker import MockMessageSource, MockTastyTradeClient
 from tt_ledger.rows import FillEvent, OrderInput, OrderRow
 from tt_ledger.sdk import LedgerClient
 from tt_ledger.store.memory import InMemoryStore
@@ -167,6 +168,36 @@ async def test_account_activity(client, broker):
     activity = await client.account_activity("main")
     assert len(activity) == 1
     assert activity[0].origin is Origin.BROKER
+
+
+# --- stream_consumer ------------------------------------------------------------------------
+
+
+async def test_stream_consumer_is_bound_to_this_clients_store_and_accounts(client):
+    source = MockMessageSource()
+    source.push(
+        BrokerPosition(
+            account_number="ACCT1", symbol="AAPL", instrument_type="Equity",
+            quantity=Decimal("100"), quantity_direction="Long", mark_price=Decimal("155.50"),
+        )
+    )
+    consumer = client.stream_consumer(source)
+    await consumer.run()
+
+    position = await client.position("main", "AAPL")
+    assert position is not None
+    assert position.quantity == Decimal("100")
+
+
+async def test_stream_consumer_forwards_balance_messages_to_the_hook(client):
+    received = []
+    source = MockMessageSource()
+    source.push(BalanceMessage(account_number="ACCT1", raw={"cash": "10000.00"}))
+    consumer = client.stream_consumer(source, on_balance=received.append)
+
+    await consumer.run()
+    assert len(received) == 1
+    assert received[0].raw == {"cash": "10000.00"}
 
 
 # --- positions ----------------------------------------------------------------------------

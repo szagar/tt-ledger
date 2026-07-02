@@ -7,7 +7,9 @@ stores opt-in), and exposes a Python SDK + optional HTTP API for integration and
 TastyTrade is the first (and only built) broker adapter; the schema and ingest contract are
 broker-neutral (a `source_system` dimension) so a second source is additive.
 
-> Status: **design / handoff documentation** (no implementation yet). Import package: `tt_ledger`.
+> Status: **implemented** — schema/store, identity, real TastyTrade pull (REST) + push
+> (WebSocket) adapters, reconcile/remap, position history rebuilt from transactions, and all
+> three surfaces (SDK, FastAPI, CLI). Import package: `tt_ledger`.
 
 ## Why
 
@@ -20,22 +22,42 @@ broker-neutral (a `source_system` dimension) so a second source is additive.
 - **Reconciles** broker-placed trades into structured, reviewable, remappable `trade_group`s, unifying
   automated (`origin=zts`) and directly-placed (`origin=broker`) activity in one ledger.
 
-## Quickstart (SQLite, zero infra)
+## Quickstart
+
+### CLI (`pip install tt-ledger[tastytrade,cli]`)
+
+```sh
+cp config/accounts.toml.example config/accounts.toml   # fill in real OAuth creds -- never commit it
+tt-ledger sync --account main --since 2026-01-01        # pull (orders+transactions+positions) + reconcile
+tt-ledger rebuild-positions --account main               # position/closed-position history from transactions
+tt-ledger trades list --needs-review
+tt-ledger positions --account main
+```
+
+SQLite is the default store (`./ledger.db`); point elsewhere with `--url` or `TT_LEDGER_DATABASE_URL`.
+
+### SDK
 
 ```python
 from datetime import date
 from tt_ledger import LedgerClient
-from tt_ledger.identity import AccountMapper
+from tt_ledger.identity import AccountMapper, LoginConfig
+from tt_ledger.ingest import TastyTradeClient
 
 # accounts.toml uses placeholder logins/accounts — never commit real ones
-client = LedgerClient.open(
-    "sqlite+aiosqlite:///ledger.db",
-    accounts=AccountMapper.from_toml("config/accounts.toml"),
-)
+accounts = AccountMapper.from_toml("config/accounts.toml")
+broker = TastyTradeClient.from_login_config(LoginConfig.from_toml("trader1", "config/accounts.toml"))
 
-await client.sync("main", since=date(2026, 1, 1))                 # pull + reconcile
-trades = await client.trades(origin="broker", review_status="needs_review")
+client = LedgerClient.open("sqlite+aiosqlite:///ledger.db", accounts=accounts, client=broker)
+try:
+    await client.sync("main", since=date(2026, 1, 1))              # pull + reconcile
+    trades = await client.trades(origin="broker", review_status="needs_review")
+finally:
+    await client.close()                                            # also closes the broker's httpx session
 ```
+
+Read-only work (`trades`, `orders`, `positions`, remap, …) needs no broker client at all —
+`LedgerClient.open(url, accounts=accounts)` is enough once data has been synced.
 
 Switch to Postgres by changing one URL: `postgresql+asyncpg://…`. No code change.
 
