@@ -17,6 +17,19 @@ from .enums import Ingest, Origin, ReviewStatus
 
 
 @dataclass
+class AccountRow:
+    """One accounts-dimension row (natural key: nickname). Seeded automatically by the SDK /
+    StreamConsumer from the injected AccountMapper before any fact write -- every fact table
+    FKs ``account -> accounts.nickname``."""
+
+    nickname: str
+    account_number: str
+    login: str | None = None
+    env: str = "live"
+    source_system: str = "tastytrade"
+
+
+@dataclass
 class SecurityRow:
     security_id: str  # resolver output (default: the raw vendor symbol)
     product_type: str

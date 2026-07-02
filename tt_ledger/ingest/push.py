@@ -23,7 +23,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, AsyncIterator, Callable, Protocol, runtime_checkable
 
 from ..identity import PassthroughResolver
-from ..repositories import BalanceRepository, PositionRepository, apply_fill_event
+from ..repositories import BalanceRepository, PositionRepository, apply_fill_event, ensure_account
 from ..rows import FillEvent
 from .broker import BalanceMessage, BrokerPosition
 
@@ -66,6 +66,7 @@ class StreamConsumer:
         self._balance_min_interval = timedelta(seconds=balance_min_interval_seconds)
         # per-account throttle state: (last persisted instant, last persisted NLV)
         self._balance_last: dict[str, tuple[datetime, Decimal | None]] = {}
+        self._ensured_accounts: set[str] = set()
         self._stopped: asyncio.Event | None = None
 
     def stop(self) -> None:
@@ -102,6 +103,7 @@ class StreamConsumer:
 
     async def _apply_position(self, pos: "BrokerPosition") -> None:
         account = self._accounts.to_nickname(pos.account_number)
+        await ensure_account(self._store, self._accounts, account, self._ensured_accounts)
         await PositionRepository(self._store, resolver=self._resolver).upsert([pos], account=account)
 
     async def _apply_balance(self, msg: "BalanceMessage") -> None:
@@ -112,6 +114,7 @@ class StreamConsumer:
         the last persisted row (a material update is never dropped)."""
         if self._persist_balances:
             account = self._accounts.to_nickname(msg.account_number)
+            await ensure_account(self._store, self._accounts, account, self._ensured_accounts)
             now = msg.captured_at or datetime.now(UTC)
             last = self._balance_last.get(account)
             due = last is None or (now - last[0]) >= self._balance_min_interval

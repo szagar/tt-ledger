@@ -14,13 +14,31 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from ..enums import Ingest, Origin, OrderStatus
-from ..rows import BalanceSnapshotRow, FillRow, LegRow, OrderRow, PositionRow, SecurityRow, TxnRow
+from ..rows import AccountRow, BalanceSnapshotRow, FillRow, LegRow, OrderRow, PositionRow, SecurityRow, TxnRow
 
 if TYPE_CHECKING:
     from ..identity import ResolvedSecurity, SecurityResolver
     from ..ingest.broker import BalanceMessage, BrokerPosition, BrokerTransaction, PlacedFill, PlacedOrder
     from ..rows import FillEvent, OrderFilter, TradeFilter, TradeGroupRow, TradeRow
     from ..store import LedgerStore
+
+
+async def ensure_account(store: "LedgerStore", accounts, nickname: str, cache: set[str]) -> None:  # noqa: ANN001
+    """Seed the accounts-dimension row for ``nickname`` (idempotent; ``cache`` skips repeats).
+
+    Every fact table FKs ``account -> accounts.nickname``, and nothing else populates the
+    dimension -- writers MUST call this before their first write for an account."""
+    if nickname in cache:
+        return
+    await store.upsert_account(
+        AccountRow(
+            nickname=nickname,
+            account_number=accounts.to_account_number(nickname),
+            login=accounts.login_for(nickname) or "",  # accounts.login is NOT NULL
+            env=accounts.env_for(nickname),
+        )
+    )
+    cache.add(nickname)
 
 
 class _Repo:
@@ -381,7 +399,7 @@ class BalanceRepository(_Repo):
 
 
 __all__ = [
-    "SecurityRepository", "OrderRepository", "TransactionRepository",
+    "ensure_account", "SecurityRepository", "OrderRepository", "TransactionRepository",
     "PositionRepository", "TradeGroupRepository", "BalanceRepository", "map_order_status",
     "apply_fill_event", "order_level_fill_fields",
 ]

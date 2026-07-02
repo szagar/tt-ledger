@@ -15,6 +15,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Callable, Generic, TypeVar
 
 from ..rows import (
+    AccountRow,
     ActivityFilter,
     ActivityRow,
     BalanceSnapshotRow,
@@ -101,6 +102,7 @@ def _in_range(value: datetime | None, start, end) -> bool:
 
 class InMemoryStore:
     def __init__(self) -> None:
+        self._accounts: _Table[AccountRow] = _Table(key=lambda r: r.nickname)
         self._orders: _Table[OrderRow] = _Table(key=lambda r: r.tt_order_id)
         self._legs: _Table[LegRow] = _Table(key=lambda r: (r.order_id, r.leg_index))
         self._fills: _Table[FillRow] = _Table(key=lambda r: r.fill_id)
@@ -117,6 +119,9 @@ class InMemoryStore:
         )
 
     # --- writes ------------------------------------------------------------------
+
+    async def upsert_account(self, row: AccountRow) -> None:
+        self._accounts.upsert(row)
 
     async def upsert_orders(self, rows: list[OrderRow]) -> list[int]:
         return [self._orders.upsert(row) for row in rows]

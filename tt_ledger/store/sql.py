@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from ..enums import Ingest, Origin, ReviewStatus
 from ..rows import (
+    AccountRow,
     ActivityFilter,
     ActivityRow,
     BalanceSnapshotRow,
@@ -153,6 +154,11 @@ class SqlLedgerStore:
         return [row.id for row in result]
 
     # --- writes --------------------------------------------------------------------
+
+    async def upsert_account(self, row: AccountRow) -> None:
+        table = models.Account.__table__
+        async with self._sessionmaker() as session, session.begin():
+            await self._upsert(session, table, [_row_dict(row)], ["nickname"])
 
     async def upsert_orders(self, rows: list[OrderRow]) -> list[int]:
         if not rows:

@@ -18,7 +18,7 @@ from .ingest.push import StreamConsumer
 from .ingest.reconcile import reconcile
 from .ingest.remap import dismiss_trade_group, regroup_transactions, remap_trade_group
 from .ingest.replay import rebuild_positions_from_transactions
-from .repositories import apply_fill_event
+from .repositories import apply_fill_event, ensure_account
 from .rows import (
     ActivityFilter,
     EventRow,
@@ -66,6 +66,7 @@ class LedgerClient:
         # ingest.tastytrade_client.TastyTradeClient (the real REST client, [tastytrade] extra)
         # or MockTastyTradeClient for tests.
         self._client = client
+        self._ensured_accounts: set[str] = set()
 
     @classmethod
     def open(
@@ -94,6 +95,7 @@ class LedgerClient:
                 "LedgerClient.open()/__init__ (a real TastyTrade REST client, or "
                 "MockTastyTradeClient for testing)."
             )
+        await ensure_account(self._store, self._accounts, account, self._ensured_accounts)
         return await sync_all(
             self._store, account, client=self._client, accounts=self._accounts,
             resolver=self._resolver, since=since,
@@ -105,6 +107,7 @@ class LedgerClient:
         creating a broker-origin duplicate); pass ``trade_group`` (from ``open_trade_group``) to
         pre-attribute the order -- reconcile attaches its transactions to that group instead of
         clustering them into a new needs-review one."""
+        await ensure_account(self._store, self._accounts, order.account, self._ensured_accounts)
         trade_group_id = None
         if order.trade_group is not None:
             trade_group_id = await self._store.get_trade_group_id(order.trade_group)
@@ -148,6 +151,7 @@ class LedgerClient:
         ``manually_attributed`` (intent beats reconcile's clustering heuristics); pass its
         ``group_id`` to ``record_order(trade_group=...)`` so fills attach to it. Financials
         (premium/fees/quantity) are refined from actual fills by reconcile."""
+        await ensure_account(self._store, self._accounts, account, self._ensured_accounts)
         now = datetime.now(UTC)
         row = TradeGroupRow(
             group_id=str(uuid.uuid4()), account=account, origin=Origin.ZTS,
@@ -188,6 +192,7 @@ class LedgerClient:
         machinery."""
         from .repositories import TransactionRepository
 
+        await ensure_account(self._store, self._accounts, account, self._ensured_accounts)
         result = SyncResult()
         result.transactions = await TransactionRepository(self._store, resolver=self._resolver).upsert(
             txns, account=account, source_system=source_system,

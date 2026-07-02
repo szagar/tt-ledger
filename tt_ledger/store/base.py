@@ -10,6 +10,7 @@ from datetime import date
 from typing import Protocol, runtime_checkable
 
 from ..rows import (
+    AccountRow,
     ActivityFilter,
     ActivityRow,
     BalanceSnapshotRow,
@@ -31,6 +32,7 @@ from ..rows import (
 @runtime_checkable
 class LedgerStore(Protocol):
     # --- idempotent writes (conflict key in comments) ---
+    async def upsert_account(self, row: AccountRow) -> None: ...      # nickname
     async def upsert_orders(self, rows: list[OrderRow]) -> list[int]: ...     # tt_order_id; returns surrogate ids, input order
     async def upsert_legs(self, rows: list[LegRow]) -> list[int]: ...         # (order_id, leg_index); returns surrogate ids, input order
     async def upsert_fills(self, rows: list[FillRow]) -> None: ...            # fill_id

@@ -190,3 +190,34 @@ async def test_sql_store_balance_roundtrip(store_url):
         assert [r.net_liquidating_value for r in windowed] == [Decimal("50100")]
     finally:
         await store.dispose()
+
+
+async def test_writes_seed_the_accounts_dimension_automatically(store_url, accounts):
+    """Regression: fact tables FK account -> accounts.nickname, and nothing else populates
+    the dimension — the SDK/StreamConsumer must seed it before their first write. On Postgres
+    this is a REAL FK; the original bug only appeared against a live backfill."""
+    from tt_ledger.sdk import LedgerClient
+    from tt_ledger.schema import metadata
+
+    store = SqlLedgerStore(store_url)
+    async with store._engine.begin() as conn:
+        await conn.run_sync(metadata.drop_all)
+    await store.create_all()
+    try:
+        client = MockTastyTradeClient()
+        client.set_balance("ACCT1", _msg("61000", captured_at=T0))
+        ledger = LedgerClient(store, accounts=accounts, client=client)
+
+        # NO manual accounts seed -- sync must create the dimension row itself.
+        result = await ledger.sync("main")
+
+        assert not result.errors
+        latest = await store.get_latest_balance("main")
+        assert latest is not None and latest.net_liquidating_value == Decimal("61000")
+
+        # intent + import paths seed too (fresh client, fresh cache)
+        ledger2 = LedgerClient(store, accounts=AccountMapper({"second": "ACCT9"}))
+        trade = await ledger2.open_trade_group("second", strategy_type="single")
+        assert trade.group_id
+    finally:
+        await store.dispose()
