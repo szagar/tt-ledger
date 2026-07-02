@@ -20,3 +20,6 @@ venv/
 config/accounts.toml
 config/securities.toml
 .env
+*.pem
+*.key
+*.p12
