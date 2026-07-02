@@ -122,6 +122,38 @@ class _Lot:
     fees: Decimal = Decimal("0")  # accumulates every member transaction's fees for THIS lifecycle
 
 
+# Receive Deliver sub-types that terminate a lot without a trade. They carry no action and
+# usually no price -- the delta must OFFSET the open lot toward zero, settling at price 0
+# (or the row's price when the feed provides one, e.g. cash-settled exercise).
+_SETTLEMENT_SUBTYPES = {
+    "Expiration",
+    "Assignment",
+    "Cash Settled Assignment",
+    "Exercise",
+    "Cash Settled Exercise",
+}
+
+
+def _is_settlement(row) -> bool:  # noqa: ANN001 -- ActivityRow (duck-typed)
+    return row.transaction_type == "Receive Deliver" and row.transaction_sub_type in _SETTLEMENT_SUBTYPES
+
+
+def _effective_delta_price(row, lot: "_Lot") -> "tuple[Decimal, Decimal | None]":  # noqa: ANN001
+    """(signed delta, effective price) for one row against the current lot.
+
+    Trades use the action-signed quantity + trade price. Settlements offset the open lot
+    (long -> negative delta, short -> positive) at price 0 when the feed omits one -- an
+    expired long realizes -cost, an expired short keeps its credit. A settlement against a
+    flat lot is a no-op (history window didn't reach the opening)."""
+    if _is_settlement(row):
+        if lot.signed_quantity == 0:
+            return Decimal("0"), None
+        qty = min(abs(row.quantity), abs(lot.signed_quantity))
+        delta = -qty if lot.signed_quantity > 0 else qty
+        return delta, (row.price if row.price is not None else Decimal("0"))
+    return _signed_delta(row.action, row.quantity), row.price
+
+
 def _signed_delta(action: str | None, quantity: Decimal) -> Decimal:
     if action is not None and action.strip().lower().startswith("sell"):
         return -quantity
@@ -166,8 +198,8 @@ def _replay_security(
     plan: list[tuple[str, bool, ClosedPositionRow | None]] = []
 
     for row in rows:
-        delta = _signed_delta(row.action, row.quantity)
-        if delta == 0 or row.price is None:
+        delta, price = _effective_delta_price(row, lot)
+        if delta == 0 or price is None:
             plan.append((row.tt_transaction_id, False, None))
             continue
 
@@ -176,7 +208,7 @@ def _replay_security(
 
         if old_signed == 0:
             lot = _Lot(
-                signed_quantity=new_signed, average_open_price=row.price, opened_at=row.executed_at,
+                signed_quantity=new_signed, average_open_price=price, opened_at=row.executed_at,
                 opening_order_id=row.order_id, fees=_fees_of(row),
             )
             plan.append((row.tt_transaction_id, True, None))
@@ -185,7 +217,7 @@ def _replay_security(
         if old_signed * delta > 0:
             # adding to the existing lot, same direction -- recompute the weighted-average cost
             total_qty = abs(old_signed) + abs(delta)
-            lot.average_open_price = (abs(old_signed) * lot.average_open_price + abs(delta) * row.price) / total_qty
+            lot.average_open_price = (abs(old_signed) * lot.average_open_price + abs(delta) * price) / total_qty
             lot.signed_quantity = new_signed
             lot.fees += _fees_of(row)
             plan.append((row.tt_transaction_id, True, None))
@@ -194,18 +226,18 @@ def _replay_security(
         # reducing -- partial close, full close, or a flip through zero
         closing_qty = min(abs(delta), abs(old_signed))
         sign = Decimal(1) if old_signed > 0 else Decimal(-1)
-        lot.realized_pnl += (row.price - lot.average_open_price) * closing_qty * multiplier * sign
+        lot.realized_pnl += (price - lot.average_open_price) * closing_qty * multiplier * sign
         lot.fees += _fees_of(row)  # a flip's fees stay with the lifecycle it closes (module docstring)
 
         if new_signed == 0:
-            closed = _closed_row(account, security_id, lot, close_price=row.price, closing_order_id=row.order_id, closed_at=row.executed_at)
+            closed = _closed_row(account, security_id, lot, close_price=price, closing_order_id=row.order_id, closed_at=row.executed_at)
             last_direction = closed.quantity_direction
             plan.append((row.tt_transaction_id, False, closed))
             lot = _Lot()
         elif (new_signed > 0) != (old_signed > 0):
-            closed = _closed_row(account, security_id, lot, close_price=row.price, closing_order_id=row.order_id, closed_at=row.executed_at)
+            closed = _closed_row(account, security_id, lot, close_price=price, closing_order_id=row.order_id, closed_at=row.executed_at)
             last_direction = closed.quantity_direction
-            lot = _Lot(signed_quantity=new_signed, average_open_price=row.price, opened_at=row.executed_at, opening_order_id=row.order_id)
+            lot = _Lot(signed_quantity=new_signed, average_open_price=price, opened_at=row.executed_at, opening_order_id=row.order_id)
             plan.append((row.tt_transaction_id, True, closed))
         else:
             lot.signed_quantity = new_signed

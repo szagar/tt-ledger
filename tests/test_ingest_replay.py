@@ -445,3 +445,62 @@ def test_flip_fees_attach_to_the_closing_lifecycle_not_the_new_lot():
     assert second_closed.realized_pnl == Decimal("25")    # short 5 @110 covered @105
     assert second_closed.fees == Decimal("1.15")          # T3 only -- T2's went to the first lifecycle
     assert second_closed.pnl_net == Decimal("23.85")
+
+
+# --- Receive Deliver settlements (expiration / assignment / exercise) ---------------------------
+
+
+def _settlement_row(tt_transaction_id, *, quantity, sub_type="Expiration", price=None,
+                    executed_at=T0 + timedelta(days=30), security_id="AAPL"):
+    return ActivityRow(
+        tt_transaction_id=tt_transaction_id, account="main", security_id=security_id,
+        quantity=quantity, action=None, price=price, executed_at=executed_at,
+        transaction_type="Receive Deliver", transaction_sub_type=sub_type,
+    )
+
+
+def test_expiration_closes_a_long_lot_at_zero():
+    """Regression: settlement rows carry no action and no price, so replay used to skip them
+    entirely -- expired lots stayed open forever (196 phantom open positions in the first live
+    backfill rehearsal)."""
+    rows = [
+        _row("T1", quantity=Decimal("2"), action="Buy to Open", price=Decimal("1.50")),
+        _settlement_row("RD1", quantity=Decimal("2")),
+    ]
+    position, plan = _replay_security("main", "AAPL", rows, 100, None)
+
+    assert position.quantity == Decimal("0")
+    closed = plan[-1][2]
+    assert closed is not None
+    assert closed.average_close_price == Decimal("0")
+    assert closed.realized_pnl == Decimal("-300")  # paid 1.50 x 2 x 100, expired worthless
+
+
+def test_expiration_closes_a_short_lot_keeping_the_credit():
+    rows = [
+        _row("T1", quantity=Decimal("1"), action="Sell to Open", price=Decimal("2.50")),
+        _settlement_row("RD1", quantity=Decimal("1")),
+    ]
+    position, plan = _replay_security("main", "AAPL", rows, 100, None)
+
+    assert position.quantity == Decimal("0")
+    closed = plan[-1][2]
+    assert closed.realized_pnl == Decimal("250")  # sold 2.50, expired worthless
+
+
+def test_cash_settled_exercise_uses_the_rows_price_when_present():
+    rows = [
+        _row("T1", quantity=Decimal("1"), action="Buy to Open", price=Decimal("3.00")),
+        _settlement_row("RD1", quantity=Decimal("1"), sub_type="Cash Settled Exercise", price=Decimal("8.00")),
+    ]
+    _, plan = _replay_security("main", "AAPL", rows, 100, None)
+
+    closed = plan[-1][2]
+    assert closed.realized_pnl == Decimal("500")  # (8 - 3) x 1 x 100
+
+
+def test_settlement_against_a_flat_lot_is_a_noop():
+    rows = [_settlement_row("RD1", quantity=Decimal("1"))]
+    position, plan = _replay_security("main", "AAPL", rows, 100, None)
+    assert position.quantity == Decimal("0")
+    assert plan == [("RD1", False, None)]
