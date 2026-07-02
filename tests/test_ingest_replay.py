@@ -504,3 +504,76 @@ def test_settlement_against_a_flat_lot_is_a_noop():
     position, plan = _replay_security("main", "AAPL", rows, 100, None)
     assert position.quantity == Decimal("0")
     assert plan == [("RD1", False, None)]
+
+
+def test_mark_to_market_money_movements_do_not_change_quantity():
+    """Regression: futures daily Mark to Market rows carry quantity + price but are cash-only —
+    counting them as fills inflated futures lots by a contract per settlement day."""
+    rows = [
+        _row("T1", quantity=Decimal("1"), action="Buy", price=Decimal("6900")),
+        ActivityRow(
+            tt_transaction_id="MM1", account="main", security_id="AAPL",
+            quantity=Decimal("1"), action=None, price=Decimal("6963.25"),
+            executed_at=T0 + timedelta(days=1),
+            transaction_type="Money Movement", transaction_sub_type="Mark to Market",
+        ),
+        _row("T2", quantity=Decimal("1"), action="Sell", price=Decimal("7000"), executed_at=T0 + timedelta(days=2)),
+    ]
+    position, plan = _replay_security("main", "AAPL", rows, 50, None)
+
+    assert position.quantity == Decimal("0")
+    assert plan[1] == ("MM1", False, None)
+    closed = plan[-1][2]
+    assert closed.realized_pnl == Decimal("5000")  # (7000-6900) x 1 x 50, MTM untouched
+
+
+def test_close_against_a_flat_lot_is_a_window_artifact_noop():
+    """Regression: a '* to Close' whose open predates the sync window fabricated a phantom
+    fresh lot (196 phantom open positions in the first live rehearsal)."""
+    rows = [_row("T1", quantity=Decimal("1"), action="Buy to Close", price=Decimal("5.00"))]
+    position, plan = _replay_security("main", "AAPL", rows, 100, None)
+    assert position.quantity == Decimal("0")
+    assert plan == [("T1", False, None)]
+
+
+async def test_same_timestamp_delivery_batch_applies_opens_before_closes(store_url):
+    """An option-exercise delivery books the delivered future's open and its offsetting close
+    at the same instant; close-first would hit the close-on-flat no-op and strand the open."""
+    from tt_ledger.identity import AccountMapper, PassthroughResolver
+    from tt_ledger.ingest.mock_broker import MockTastyTradeClient
+    from tt_ledger.ingest.broker import BrokerTransaction
+    from tt_ledger.ingest.pull import sync_transactions
+    from tt_ledger.ingest.replay import rebuild_positions_from_transactions
+    from tt_ledger.rows import AccountRow
+    from tt_ledger.schema import metadata
+    from tt_ledger.store.sql import SqlLedgerStore
+
+    store = SqlLedgerStore(store_url)
+    async with store._engine.begin() as conn:
+        await conn.run_sync(metadata.drop_all)
+    await store.create_all()
+    try:
+        await store.upsert_account(AccountRow(nickname="main", account_number="ACCT1", login="u"))
+        accounts = AccountMapper({"main": "ACCT1"})
+        client = MockTastyTradeClient()
+        ts = T0
+        # deliberately add the close FIRST -- ordering must not matter
+        client.add_transaction(BrokerTransaction(
+            id="RD-close", account_number="ACCT1", symbol="/ESH6", instrument_type="Future",
+            transaction_type="Receive Deliver", transaction_sub_type="Sell to Close",
+            action="Sell to Close", quantity=Decimal("1"), price=Decimal("6650"),
+            executed_at=ts, transaction_date=ts.date(),
+        ))
+        client.add_transaction(BrokerTransaction(
+            id="RD-open", account_number="ACCT1", symbol="/ESH6", instrument_type="Future",
+            transaction_type="Receive Deliver", transaction_sub_type="Buy to Open",
+            action="Buy to Open", quantity=Decimal("1"), price=Decimal("6700"),
+            executed_at=ts, transaction_date=ts.date(),
+        ))
+        await sync_transactions(store, "main", client=client, accounts=accounts, resolver=PassthroughResolver())
+        await rebuild_positions_from_transactions(store, "main")
+
+        pos = await store.get_position("main", "/ESH6")
+        assert pos is not None and pos.quantity == Decimal("0")
+    finally:
+        await store.dispose()

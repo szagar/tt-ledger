@@ -87,7 +87,7 @@ async def _rebuild_for_account(store: "LedgerStore", account: str) -> int:
         by_security.setdefault(row.security_id, []).append(row)
 
     for security_id, rows in by_security.items():
-        rows.sort(key=lambda r: r.executed_at)
+        rows.sort(key=lambda r: (r.executed_at, _closes_last(r)))
         multiplier = await _multiplier_of(store, security_id)
         existing = await store.get_position(account, security_id)
         position_row, plan = _replay_security(account, security_id, rows, multiplier, existing)
@@ -144,14 +144,35 @@ def _effective_delta_price(row, lot: "_Lot") -> "tuple[Decimal, Decimal | None]"
     Trades use the action-signed quantity + trade price. Settlements offset the open lot
     (long -> negative delta, short -> positive) at price 0 when the feed omits one -- an
     expired long realizes -cost, an expired short keeps its credit. A settlement against a
-    flat lot is a no-op (history window didn't reach the opening)."""
+    flat lot is a no-op (history window didn't reach the opening).
+
+    Excluded from position quantity entirely:
+    * ``Money Movement`` rows -- cash-only; futures daily Mark to Market carries a
+      quantity + price but is NOT a fill (counting it inflated futures lots by one
+      contract per settlement day in the first live rehearsal).
+    * an explicit ``* to Close`` against a FLAT lot -- the matching open predates the
+      sync window; fabricating a fresh lot from it produced phantom "open" positions.
+    """
+    if row.transaction_type == "Money Movement":
+        return Decimal("0"), None
     if _is_settlement(row):
         if lot.signed_quantity == 0:
             return Decimal("0"), None
         qty = min(abs(row.quantity), abs(lot.signed_quantity))
         delta = -qty if lot.signed_quantity > 0 else qty
         return delta, (row.price if row.price is not None else Decimal("0"))
+    if lot.signed_quantity == 0 and (row.action or "").strip().endswith("to Close"):
+        return Decimal("0"), None
     return _signed_delta(row.action, row.quantity), row.price
+
+
+def _closes_last(row) -> int:  # noqa: ANN001
+    """Within one timestamp, apply opens before closes/settlements -- option-exercise
+    delivery batches book the delivered future's open and its offsetting close at the
+    same instant, and close-first would hit the close-on-flat no-op."""
+    if _is_settlement(row):
+        return 1
+    return 1 if (row.action or "").strip().endswith("to Close") else 0
 
 
 def _signed_delta(action: str | None, quantity: Decimal) -> Decimal:
