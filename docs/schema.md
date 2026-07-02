@@ -76,8 +76,9 @@ Composite indexes: `(account, executed_at)`, `(account, transaction_date)`.
 
 ### closed_positions
 `id` PK · `account` · `security_id` FK · `quantity` / `quantity_direction` · `average_open_price` /
-`average_close_price` / `realized_pnl` (Money) · `opening_order_id` / `closing_order_id` /
-`trade_group_id` (FK) · `opened_at` / `closed_at` · `holding_period_days`.
+`average_close_price` / `realized_pnl` (gross) / `fees` / `pnl_net` (= realized_pnl − fees; use for
+R-multiples) (Money) · `opening_order_id` / `closing_order_id` / `trade_group_id` (FK) ·
+`opened_at` / `closed_at` · `holding_period_days`.
 
 ### trade_groups
 `id` PK · `group_id` UNIQUE · `account` · `origin` (zts|broker) · `source_system` · `review_status`
@@ -91,6 +92,15 @@ Composite indexes: `(account, executed_at)`, `(account, transaction_date)`.
 ### trade_group_events
 `id` PK · `trade_group_id` FK · `event_type` · `quantity_change` / `premium_change` / `realized_pnl`
 (Money) · `event_at` · `notes` · `rolled_to_group_id` FK · `transaction_id` / `order_id` FK.
+
+### balance_snapshots
+`id` PK · `account` FK · `captured_at` · `source` (stream|rest_sync) · `net_liquidating_value` /
+`cash_balance` / `equity_buying_power` / `derivative_buying_power` / `maintenance_requirement` /
+`pending_cash` / `day_trading_buying_power` (Money) · `raw` JSON · `created_at`.
+UNIQUE `(account, captured_at, source)`. Append-only time series (NLV history for sizing /
+equity-curve analysis); the latest row per account is the live view. Written throttled by
+`StreamConsumer` (one row per account per interval, NLV changes always persist) and once per REST
+`sync()`.
 
 ## Enums
 

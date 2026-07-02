@@ -199,7 +199,9 @@ class ClosedPosition(Base):
     quantity_direction: Mapped[str] = mapped_column(String(8))
     average_open_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     average_close_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
-    realized_pnl: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    realized_pnl: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)  # gross (no fees)
+    fees: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    pnl_net: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)  # realized_pnl - fees
     opening_order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
     closing_order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
     trade_group_id: Mapped[int | None] = mapped_column(ForeignKey("trade_groups.id"), nullable=True, index=True)
@@ -302,7 +304,35 @@ class Transaction(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class BalanceSnapshot(Base):
+    """An account-balance time series — one row per (throttled) stream update or REST sync.
+
+    Append-only history, not current-state: the latest row per account is the live view; the
+    series is NLV history for sizing/equity-curve analysis. ``raw`` keeps the source payload
+    (broker-dasherized or host-snake_case, per ``source``) for fields not typed out here.
+    """
+
+    __tablename__ = "balance_snapshots"
+    __table_args__ = (
+        Index("uq_balance_snapshots_account_time_source", "account", "captured_at", "source", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account: Mapped[str] = mapped_column(ForeignKey("accounts.nickname"), index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(16), default="stream")  # stream | rest_sync
+    net_liquidating_value: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    cash_balance: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    equity_buying_power: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    derivative_buying_power: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    maintenance_requirement: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    pending_cash: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    day_trading_buying_power: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 __all__ = [
     "Account", "Security", "Order", "OrderLeg", "OrderFill", "Transaction",
-    "Position", "ClosedPosition", "TradeGroup", "TradeGroupEvent",
+    "Position", "ClosedPosition", "TradeGroup", "TradeGroupEvent", "BalanceSnapshot",
 ]

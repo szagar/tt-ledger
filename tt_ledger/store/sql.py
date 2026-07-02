@@ -15,7 +15,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import bindparam, select, update
+from sqlalchemy import bindparam, func, select, text, update
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -23,6 +23,7 @@ from ..enums import Ingest, Origin, ReviewStatus
 from ..rows import (
     ActivityFilter,
     ActivityRow,
+    BalanceSnapshotRow,
     ClosedPositionRow,
     EventRow,
     FillRow,
@@ -37,6 +38,12 @@ from ..rows import (
     TxnRow,
 )
 from ..schema import metadata, models
+from ..schema.namespace import pg_schema, translate_map_for
+
+
+# Linkage columns importers never know but reconcile/replay fill in -- preserved across
+# re-upserts of the same tt_transaction_id (see _upsert's preserve_if_null).
+_TXN_LINKAGE_COLS = {"order_id", "order_leg_id", "position_id", "closed_position_id", "trade_group_id"}
 
 
 def _insert(dialect: str):
@@ -83,6 +90,10 @@ class SqlLedgerStore:
             from sqlalchemy.pool import StaticPool
 
             engine_kwargs = {"poolclass": StaticPool, "connect_args": {"check_same_thread": False}}
+        translate_map = translate_map_for(url)
+        if translate_map is not None:
+            # Postgres: ledger tables live in a dedicated schema (schema/namespace.py).
+            engine_kwargs["execution_options"] = {"schema_translate_map": translate_map}
         self._engine = create_async_engine(url, **engine_kwargs)
         self._sessionmaker = async_sessionmaker(self._engine, expire_on_commit=False)
         self._dialect = self._engine.dialect.name
@@ -90,6 +101,8 @@ class SqlLedgerStore:
     async def create_all(self) -> None:
         """Dev/standalone convenience (prod uses Alembic)."""
         async with self._engine.begin() as conn:
+            if self._dialect == "postgresql":
+                await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{pg_schema()}"'))
             await conn.run_sync(metadata.create_all)
 
     async def dispose(self) -> None:
@@ -105,8 +118,15 @@ class SqlLedgerStore:
         conflict_cols: list[str],
         *,
         index_where=None,
+        preserve_if_null: set[str] | None = None,
     ) -> list[int]:
         """Upsert ``rows`` and return their surrogate ids, in the same order as ``rows``.
+
+        ``preserve_if_null`` names columns whose EXISTING value survives when the incoming row
+        carries None — for linkage columns (e.g. ``transactions.trade_group_id``) that an
+        importer never knows but a later pass (reconcile/replay) fills in; without this, every
+        overlapping re-sync would wipe the linkage and reconcile would re-group already-grouped
+        activity into duplicates.
 
         Relies on both dialects preserving VALUES-list order in a single-statement multi-row
         INSERT (with or without an ON CONFLICT branch) for RETURNING — observed behavior on
@@ -117,11 +137,15 @@ class SqlLedgerStore:
         insert = _insert(self._dialect)
         stmt = insert(table)
         immutable = {"id", "created_at", "first_seen_at"}
-        update_cols = {
-            c.name: getattr(stmt.excluded, c.name)
-            for c in table.columns
-            if c.name not in conflict_cols and c.name not in immutable
-        }
+        update_cols = {}
+        for c in table.columns:
+            if c.name in conflict_cols or c.name in immutable:
+                continue
+            excluded_col = getattr(stmt.excluded, c.name)
+            if preserve_if_null and c.name in preserve_if_null:
+                update_cols[c.name] = func.coalesce(excluded_col, c)
+            else:
+                update_cols[c.name] = excluded_col
         stmt = stmt.values(rows).on_conflict_do_update(
             index_elements=conflict_cols, index_where=index_where, set_=update_cols,
         ).returning(table.c.id)
@@ -159,7 +183,10 @@ class SqlLedgerStore:
             return
         table = models.Transaction.__table__
         async with self._sessionmaker() as session, session.begin():
-            await self._upsert(session, table, [_row_dict(r) for r in rows], ["tt_transaction_id"])
+            await self._upsert(
+                session, table, [_row_dict(r) for r in rows], ["tt_transaction_id"],
+                preserve_if_null=_TXN_LINKAGE_COLS,
+            )
 
     async def upsert_security(self, sec: SecurityRow) -> None:
         table = models.Security.__table__
@@ -172,6 +199,11 @@ class SqlLedgerStore:
         table = models.Position.__table__
         async with self._sessionmaker() as session, session.begin():
             await self._upsert(session, table, [_row_dict(r) for r in rows], ["account", "security_id"])
+
+    async def upsert_balance_snapshot(self, row: BalanceSnapshotRow) -> None:
+        table = models.BalanceSnapshot.__table__
+        async with self._sessionmaker() as session, session.begin():
+            await self._upsert(session, table, [_row_dict(row)], ["account", "captured_at", "source"])
 
     async def upsert_closed_position(self, row: ClosedPositionRow) -> int:
         """App-level upsert on ``(account, security_id, opened_at, closed_at)`` -- there's no DB
@@ -334,6 +366,27 @@ class SqlLedgerStore:
             rows = (await session.execute(stmt)).all()
         return [_mapping_to(ClosedPositionRow, r) for r in rows]
 
+    async def get_latest_balance(self, account: str) -> BalanceSnapshotRow | None:
+        table = models.BalanceSnapshot.__table__
+        stmt = select(table).where(table.c.account == account).order_by(table.c.captured_at.desc()).limit(1)
+        async with self._sessionmaker() as session:
+            row = (await session.execute(stmt)).first()
+        return _mapping_to(BalanceSnapshotRow, row) if row is not None else None
+
+    async def get_balances(
+        self, account: str, start: date | None = None, end: date | None = None,
+    ) -> list[BalanceSnapshotRow]:
+        table = models.BalanceSnapshot.__table__
+        stmt = select(table).where(table.c.account == account)
+        if start is not None:
+            stmt = stmt.where(table.c.captured_at >= _day_start(start))
+        if end is not None:
+            stmt = stmt.where(table.c.captured_at < _day_start(end) + timedelta(days=1))
+        stmt = stmt.order_by(table.c.captured_at.asc())
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return [_mapping_to(BalanceSnapshotRow, r) for r in rows]
+
     async def get_security(self, security_id: str) -> SecurityRow | None:
         table = models.Security.__table__
         async with self._sessionmaker() as session:
@@ -368,6 +421,13 @@ class SqlLedgerStore:
         table = models.Transaction.__table__
         async with self._sessionmaker() as session:
             rows = (await session.execute(select(table).where(table.c.id.in_(txn_ids)))).all()
+        return [_mapping_to(TxnRow, r) for r in rows]
+
+    async def get_group_transactions(self, trade_group_id: int) -> list[TxnRow]:
+        table = models.Transaction.__table__
+        stmt = select(table).where(table.c.trade_group_id == trade_group_id).order_by(table.c.executed_at.asc())
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
         return [_mapping_to(TxnRow, r) for r in rows]
 
     async def query_orders(self, f: OrderFilter) -> list[OrderRow]:
@@ -419,6 +479,7 @@ class SqlLedgerStore:
         cols = [
             *[c for c in txns.columns if c.name not in ("id", "created_at", "updated_at")],
             orders.c.origin.label("origin"),
+            orders.c.trade_group_id.label("order_trade_group_id"),
             groups.c.review_status.label("review_status"),
         ]
         stmt = (

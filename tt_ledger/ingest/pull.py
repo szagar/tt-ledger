@@ -8,12 +8,17 @@ boundary (Rule 1/Rule 2, docs/identity.md) before anything reaches the store.
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from typing import TYPE_CHECKING
 
-from ..repositories import OrderRepository, PositionRepository, TransactionRepository
+from ..repositories import BalanceRepository, OrderRepository, PositionRepository, TransactionRepository
 from ..rows import SyncResult
 from .reconcile import reconcile
+
+# Standard library-logger seam: tt-ledger never configures handlers; a host platform's logging
+# setup (formatters, levels, structured JSON) applies to the ``tt_ledger.*`` hierarchy as-is.
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..identity import AccountMapper, SecurityResolver
@@ -72,6 +77,21 @@ async def sync_positions(
     return await PositionRepository(store, resolver=resolver).upsert(positions, account=account)
 
 
+async def sync_balances(
+    store: "LedgerStore",
+    account: str,
+    *,
+    client: "BrokerClient",
+    accounts: "AccountMapper",
+) -> int:
+    """Record one ``source='rest_sync'`` balance snapshot — NLV history accrues on every sync
+    even when the stream consumer isn't running."""
+    account_number = accounts.to_account_number(account)
+    balance = await client.get_balances(account_number)
+    await BalanceRepository(store).record(balance, account=account, source="rest_sync")
+    return 1
+
+
 async def sync_all(
     store: "LedgerStore",
     account: str,
@@ -94,16 +114,25 @@ async def sync_all(
         result.orders = await sync_orders(store, account, client=client, accounts=accounts, resolver=resolver, since=since)
     except Exception as exc:  # noqa: BLE001 - a broker/store failure here must not abort the other feeds
         result.errors.append(f"sync_orders: {exc}")
+        logger.warning("sync_orders failed for %s: %s", account, exc)
 
     try:
         result.transactions = await sync_transactions(store, account, client=client, accounts=accounts, resolver=resolver, since=since)
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"sync_transactions: {exc}")
+        logger.warning("sync_transactions failed for %s: %s", account, exc)
 
     try:
         result.positions = await sync_positions(store, account, client=client, accounts=accounts, resolver=resolver)
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"sync_positions: {exc}")
+        logger.warning("sync_positions failed for %s: %s", account, exc)
+
+    try:
+        result.balances = await sync_balances(store, account, client=client, accounts=accounts)
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"sync_balances: {exc}")
+        logger.warning("sync_balances failed for %s: %s", account, exc)
 
     try:
         reconcile_result = await reconcile(store, account, since=since)
@@ -111,5 +140,11 @@ async def sync_all(
         result.errors.extend(reconcile_result.errors)
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"reconcile: {exc}")
+        logger.warning("reconcile failed for %s: %s", account, exc)
 
+    logger.info(
+        "sync complete for %s: orders=%d transactions=%d positions=%d balances=%d trade_groups=%d errors=%d",
+        account, result.orders, result.transactions, result.positions, result.balances,
+        result.trade_groups, len(result.errors),
+    )
     return result

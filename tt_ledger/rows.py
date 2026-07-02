@@ -162,13 +162,34 @@ class ClosedPositionRow:
     quantity_direction: str
     average_open_price: Decimal | None = None
     average_close_price: Decimal | None = None
-    realized_pnl: Decimal | None = None
+    realized_pnl: Decimal | None = None  # gross: price moves × qty × multiplier, no fees
+    fees: Decimal | None = None  # commissions + clearing + regulatory + index-option fees, whole lifecycle
+    pnl_net: Decimal | None = None  # realized_pnl - fees (use this for R-multiples)
     opening_order_id: int | None = None
     closing_order_id: int | None = None
     trade_group_id: int | None = None
     opened_at: datetime | None = None
     closed_at: datetime | None = None
     holding_period_days: int | None = None
+
+
+@dataclass
+class BalanceSnapshotRow:
+    """One point in an account's balance time series (``balance_snapshots``) — written throttled
+    from the stream and once per REST ``sync()``. Append-only; the natural key is
+    ``(account, captured_at, source)``."""
+
+    account: str
+    captured_at: datetime
+    source: str = "stream"  # stream | rest_sync
+    net_liquidating_value: Decimal | None = None
+    cash_balance: Decimal | None = None
+    equity_buying_power: Decimal | None = None
+    derivative_buying_power: Decimal | None = None
+    maintenance_requirement: Decimal | None = None
+    pending_cash: Decimal | None = None
+    day_trading_buying_power: Decimal | None = None
+    raw: dict | None = None
 
 
 @dataclass
@@ -271,15 +292,18 @@ class ActivityRow:
     quantity: Decimal | None = None
     price: Decimal | None = None
     net_value: Decimal | None = None
+    net_value_effect: str | None = None  # "Credit" | "Debit" | "None" -- net_value is a magnitude
     commission: Decimal | None = None
     clearing_fees: Decimal | None = None
     regulatory_fees: Decimal | None = None
+    proprietary_index_option_fees: Decimal | None = None
     executed_at: datetime | None = None
     order_id: int | None = None
     tt_order_id: str | None = None
     trade_group_id: int | None = None
     origin: Origin | None = None  # from the joined order; None when unreconciled
     review_status: ReviewStatus | None = None  # from the joined trade_group
+    order_trade_group_id: int | None = None  # the joined ORDER's group -- submit-time intent
 
 
 # --- inputs / filters / results ---------------------------------------------------
@@ -287,10 +311,14 @@ class ActivityRow:
 
 @dataclass
 class OrderInput:
-    """An order recorded at submission (oms_submit path) — before any broker confirmation, so
-    no ``tt_order_id`` yet; that arrives later via push/pull enrichment (docs/ingestion.md)."""
+    """An order recorded at submission (oms_submit path). ``tt_order_id`` may be set when the
+    host records right after the broker's submit response (the id is known synchronously there);
+    left None, it arrives later via push/pull enrichment (docs/ingestion.md). ``trade_group``
+    (the public UUID from ``open_trade_group``) pre-attributes the order — its fills/transactions
+    then attach to that group in reconcile instead of clustering into a new one."""
 
     account: str
+    tt_order_id: str | None = None
     security_id: str | None = None
     underlying: str | None = None
     order_type: str | None = None
@@ -303,6 +331,7 @@ class OrderInput:
     trace_id: str | None = None
     strategy_id: int | None = None
     market_context_id: int | None = None
+    trade_group: str | None = None  # trade_groups.group_id (UUID), not the surrogate pk
 
 
 @dataclass
@@ -354,6 +383,7 @@ class SyncResult:
     orders: int = 0
     transactions: int = 0
     positions: int = 0
+    balances: int = 0
     fills: int = 0
     trade_groups: int = 0
     errors: list[str] = field(default_factory=list)

@@ -179,6 +179,18 @@ def build_app():
     app = typer.Typer(name="tt-ledger", help="Broker order/trade/transaction ledger.", no_args_is_help=True)
     trades_app = typer.Typer(help="Inspect, reconcile, and remap trades.")
     app.add_typer(trades_app, name="trades")
+    db_app = typer.Typer(help="Manage the ledger database schema.")
+    app.add_typer(db_app, name="db")
+
+    @db_app.command("upgrade")
+    def db_upgrade(ctx: typer.Context) -> None:
+        """Apply all pending migrations (idempotent). Works from an installed package —
+        no repo checkout / alembic.ini needed."""
+        from .schema.migrate import upgrade_to_head
+
+        url = ctx.obj["url"]
+        upgrade_to_head(url)
+        console.print(f"Migrations applied: [bold]head[/bold] on {url}")
 
     @app.callback()
     def main_callback(

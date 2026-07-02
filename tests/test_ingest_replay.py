@@ -399,3 +399,49 @@ async def test_rebuild_open_and_close_against_sql_store(sql_store, accounts, res
     result2 = await rebuild_positions_from_transactions(sql_store, "main")
     assert result2.positions == 1
     assert len(await sql_store.get_closed_positions("main")) == 1
+
+
+# --- net P&L (fees + pnl_net) ------------------------------------------------------------------
+
+
+def _fee_row(tt_transaction_id, *, quantity, action, price, executed_at=T0,
+             commission="1", clearing="0.1", regulatory="0.05"):
+    return ActivityRow(
+        tt_transaction_id=tt_transaction_id, account="main", security_id="AAPL",
+        quantity=quantity, action=action, price=price, executed_at=executed_at,
+        commission=Decimal(commission), clearing_fees=Decimal(clearing),
+        regulatory_fees=Decimal(regulatory),
+    )
+
+
+def test_closed_row_nets_fees_across_the_whole_lifecycle():
+    rows = [
+        _fee_row("T1", quantity=Decimal("10"), action="Buy to Open", price=Decimal("100")),
+        _fee_row("T2", quantity=Decimal("10"), action="Sell to Close", price=Decimal("110"),
+                 executed_at=T0 + timedelta(days=1)),
+    ]
+    _, plan = _replay_security("main", "AAPL", rows, 1, None)
+
+    closed = plan[-1][2]
+    assert closed.realized_pnl == Decimal("100")          # gross: (110-100) * 10
+    assert closed.fees == Decimal("2.30")                 # both legs: 2 * (1 + 0.1 + 0.05)
+    assert closed.pnl_net == Decimal("97.70")
+
+
+def test_flip_fees_attach_to_the_closing_lifecycle_not_the_new_lot():
+    rows = [
+        _fee_row("T1", quantity=Decimal("10"), action="Buy to Open", price=Decimal("100")),
+        # sell 15: closes the 10-lot AND opens a short 5 -- its fees belong to the closed lifecycle
+        _fee_row("T2", quantity=Decimal("15"), action="Sell to Open", price=Decimal("110"),
+                 executed_at=T0 + timedelta(days=1)),
+        _fee_row("T3", quantity=Decimal("5"), action="Buy to Close", price=Decimal("105"),
+                 executed_at=T0 + timedelta(days=2)),
+    ]
+    _, plan = _replay_security("main", "AAPL", rows, 1, None)
+
+    first_closed = plan[1][2]
+    assert first_closed.fees == Decimal("2.30")           # T1 + T2 fees
+    second_closed = plan[2][2]
+    assert second_closed.realized_pnl == Decimal("25")    # short 5 @110 covered @105
+    assert second_closed.fees == Decimal("1.15")          # T3 only -- T2's went to the first lifecycle
+    assert second_closed.pnl_net == Decimal("23.85")

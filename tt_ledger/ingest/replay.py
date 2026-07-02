@@ -23,9 +23,13 @@ transaction can end up pointing at a row that's since been overwritten by a late
 the durable, frozen record of a closed lifecycle lives in ``closed_positions``, not through
 ``position_id``.
 
+P&L convention: ``realized_pnl`` is GROSS (price moves × quantity × multiplier — matches
+``_derive_unrealized_pnl``); ``fees`` accumulates every member transaction's commissions +
+clearing/regulatory/index-option fees across the lifecycle; ``pnl_net = realized_pnl - fees`` is
+what R-multiple / expectancy analysis should read. A direction-flip transaction's fees are
+attributed entirely to the lifecycle it CLOSES (not split with the lot it opens).
+
 Known limitations:
-  - Gross P&L only (matches ``_derive_unrealized_pnl``'s existing convention) -- commissions/fees
-    are not netted out of ``realized_pnl``.
   - If transaction history doesn't reach back to when a still-open position was first opened (a
     transfer from another broker, or a sync window starting after inception), replay treats the
     earliest visible activity as the opening trade -- cost basis/opening date for such a position
@@ -37,12 +41,15 @@ Known limitations:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from ..rows import ActivityFilter, ClosedPositionRow, PositionRow, SyncResult
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..rows import ActivityRow
@@ -60,6 +67,7 @@ async def rebuild_positions_from_transactions(store: "LedgerStore", account: str
             result.positions += await _rebuild_for_account(store, acct)
         except Exception as exc:  # noqa: BLE001 - one account's failure must not abort the rest
             result.errors.append(f"{acct}: {exc}")
+            logger.warning("replay failed for %s: %s", acct, exc)
 
     return result
 
@@ -110,7 +118,8 @@ class _Lot:
     average_open_price: Decimal | None = None
     opened_at: datetime | None = None
     opening_order_id: int | None = None
-    realized_pnl: Decimal = Decimal("0")  # accumulates across partial closes of THIS lifecycle
+    realized_pnl: Decimal = Decimal("0")  # gross; accumulates across partial closes of THIS lifecycle
+    fees: Decimal = Decimal("0")  # accumulates every member transaction's fees for THIS lifecycle
 
 
 def _signed_delta(action: str | None, quantity: Decimal) -> Decimal:
@@ -119,11 +128,24 @@ def _signed_delta(action: str | None, quantity: Decimal) -> Decimal:
     return quantity
 
 
+def _fees_of(row) -> Decimal:  # noqa: ANN001 -- ActivityRow (duck-typed)
+    return sum(
+        (
+            row.commission or Decimal("0"),
+            row.clearing_fees or Decimal("0"),
+            row.regulatory_fees or Decimal("0"),
+            getattr(row, "proprietary_index_option_fees", None) or Decimal("0"),
+        ),
+        Decimal("0"),
+    )
+
+
 def _closed_row(account: str, security_id: str, lot: "_Lot", *, close_price: Decimal, closing_order_id: int | None, closed_at: datetime | None) -> ClosedPositionRow:
     return ClosedPositionRow(
         account=account, security_id=security_id,
         quantity=abs(lot.signed_quantity), quantity_direction=("Long" if lot.signed_quantity > 0 else "Short"),
         average_open_price=lot.average_open_price, average_close_price=close_price, realized_pnl=lot.realized_pnl,
+        fees=lot.fees, pnl_net=lot.realized_pnl - lot.fees,
         opening_order_id=lot.opening_order_id, closing_order_id=closing_order_id,
         opened_at=lot.opened_at, closed_at=closed_at,
         holding_period_days=_holding_period(lot.opened_at, closed_at),
@@ -153,7 +175,10 @@ def _replay_security(
         new_signed = old_signed + delta
 
         if old_signed == 0:
-            lot = _Lot(signed_quantity=new_signed, average_open_price=row.price, opened_at=row.executed_at, opening_order_id=row.order_id)
+            lot = _Lot(
+                signed_quantity=new_signed, average_open_price=row.price, opened_at=row.executed_at,
+                opening_order_id=row.order_id, fees=_fees_of(row),
+            )
             plan.append((row.tt_transaction_id, True, None))
             continue
 
@@ -162,6 +187,7 @@ def _replay_security(
             total_qty = abs(old_signed) + abs(delta)
             lot.average_open_price = (abs(old_signed) * lot.average_open_price + abs(delta) * row.price) / total_qty
             lot.signed_quantity = new_signed
+            lot.fees += _fees_of(row)
             plan.append((row.tt_transaction_id, True, None))
             continue
 
@@ -169,6 +195,7 @@ def _replay_security(
         closing_qty = min(abs(delta), abs(old_signed))
         sign = Decimal(1) if old_signed > 0 else Decimal(-1)
         lot.realized_pnl += (row.price - lot.average_open_price) * closing_qty * multiplier * sign
+        lot.fees += _fees_of(row)  # a flip's fees stay with the lifecycle it closes (module docstring)
 
         if new_signed == 0:
             closed = _closed_row(account, security_id, lot, close_price=row.price, closing_order_id=row.order_id, closed_at=row.executed_at)

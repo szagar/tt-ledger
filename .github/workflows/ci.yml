@@ -60,14 +60,22 @@ jobs:
           TT_LEDGER_DATABASE_URL: sqlite+aiosqlite:///./ci_sqlite.db
         run: alembic upgrade head
 
+      - name: Migrations — installed-package entry point (tt-ledger db upgrade, idempotent)
+        # No alembic.ini / repo checkout needed — the path a host platform uses when it
+        # installs tt-ledger as a wheel/git dependency (schema/migrate.py).
+        run: |
+          tt-ledger --url sqlite+aiosqlite:///./ci_cli.db db upgrade
+          tt-ledger --url sqlite+aiosqlite:///./ci_cli.db db upgrade
+
       - name: Reset the Postgres schema
         # The pytest step's fixtures create/drop tables directly via SQLAlchemy metadata (not
         # alembic) against this same throwaway database, leaving tables behind with no
-        # alembic_version row -- `alembic upgrade head` below needs a genuinely clean schema to
+        # version-table row -- `alembic upgrade head` below needs a genuinely clean schema to
         # prove it can build one from scratch (the actual point of this dual-dialect guarantee).
+        # On Postgres every ledger table lives in the dedicated "ledger" schema (schema/namespace.py).
         env:
           PGPASSWORD: ledger
-        run: psql -h localhost -U ledger -d ledger_test -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+        run: psql -h localhost -U ledger -d ledger_test -c 'DROP SCHEMA IF EXISTS "ledger" CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
 
       - name: Migrations — Postgres (upgrade head)   # the dual-dialect guarantee
         env:
@@ -89,6 +97,22 @@ jobs:
           # money column came through as integer/bigint.
           got=$(psql -h localhost -U ledger -d ledger_test -tAc \
             "select data_type from information_schema.columns
-             where table_name='securities' and column_name='strike'")
-          echo "securities.strike data_type = '$got'"
+             where table_schema='ledger' and table_name='securities' and column_name='strike'")
+          echo "ledger.securities.strike data_type = '$got'"
           test "$got" = "numeric"
+
+      - name: Assert ledger tables + version table live in the "ledger" schema
+        env:
+          PGPASSWORD: ledger
+        run: |
+          # The namespace guarantee (schema/namespace.py): nothing from tt-ledger lands in
+          # public, and the version table is tt_ledger_alembic_version inside the schema.
+          leaked=$(psql -h localhost -U ledger -d ledger_test -tAc \
+            "select count(*) from information_schema.tables
+             where table_schema='public'")
+          echo "tables in public = $leaked"
+          test "$leaked" = "0"
+          vt=$(psql -h localhost -U ledger -d ledger_test -tAc \
+            "select count(*) from information_schema.tables
+             where table_schema='ledger' and table_name='tt_ledger_alembic_version'")
+          test "$vt" = "1"

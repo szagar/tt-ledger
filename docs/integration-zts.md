@@ -20,6 +20,21 @@ host platform:
 - The TastyTrade REST/stream client (incl. the new `get_order_history`).
 - Trade-grouping, strategy detection, and trade-group P&L logic — the reconciliation core.
 
+## Logging
+
+tt-ledger logs through the standard-library ``tt_ledger.*`` logger hierarchy and never
+configures handlers — the host's logging setup (e.g. a structured-JSON root handler) applies
+as-is. Sync step failures and stream lifecycle/reconnect events log at WARNING/INFO;
+``SyncResult.errors`` still carries the same strings programmatically.
+
+## Database coexistence
+
+The ledger shares the host's Postgres database: all ledger tables live in the dedicated **`ledger`**
+schema (see `docs/storage.md` — Postgres schema namespace), and the Alembic version table is
+`ledger.tt_ledger_alembic_version`, so the host's own Alembic chain (default `alembic_version`, its
+tables in `public`) is never touched. The host applies ledger migrations via `tt-ledger db upgrade`
+or `tt_ledger.schema.migrate.upgrade_to_head(url)` from its own migrate flow.
+
 ## Migration steps (stageable)
 
 1. **Stand up** `tt-ledger` on the platform Postgres alongside the existing schema (mirror mode).
@@ -50,5 +65,13 @@ cut writers over, then drop the old tables.
 
 In the platform, the push consumer reads the existing `acct:order` / `acct:position` / `acct:balance`
 Redis pub/sub (published by the account-stream service) rather than connecting the broker WebSocket
-directly. The `[redis]` extra enables this path. Everything else (idempotent pull, reconcile, SDK,
-views) is identical to the standalone deployment.
+directly — `RedisMessageSource` (`ingest/redis_source.py`, `[redis]` extra):
+
+```python
+source = RedisMessageSource(redis_url, accounts=mapper, nicknames={"individual", "roth"})
+await client.stream_consumer(source).run()
+```
+
+The host publishes nicknames; the source restores broker account numbers via the injected
+`AccountMapper` so the `MessageSource` contract (broker-native shapes) holds. Everything else
+(idempotent pull, reconcile, SDK, views) is identical to the standalone deployment.

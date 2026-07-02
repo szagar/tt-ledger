@@ -684,6 +684,9 @@ class _FlakyPositionsClient:
     async def get_positions(self, account_number):  # noqa: ANN001
         raise RuntimeError("broker positions endpoint is down")
 
+    async def get_balances(self, account_number):  # noqa: ANN001
+        return await self._inner.get_balances(account_number)
+
 
 async def test_sync_all_runs_orders_transactions_and_positions(store, accounts, resolver):
     client = MockTastyTradeClient()

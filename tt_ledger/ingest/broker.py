@@ -138,13 +138,24 @@ class BrokerPosition:
 
 @dataclass
 class BalanceMessage:
-    """A live account-balance update from the broker account-stream (docs/ingestion.md -> Push).
-    No schema home in tt-ledger — it's an order/txn/fill/position ledger, not a full account/margin
-    snapshot store — so this is never persisted; ``StreamConsumer`` only forwards it to an
-    optional caller-supplied hook."""
+    """An account-balance snapshot — from the broker account-stream, the host platform's pub/sub,
+    or a REST pull (``get_balances``).
+
+    The typed fields are parsed by whichever source produced the message (each source owns its own
+    wire format: dasherized broker JSON vs the host's snake_case envelope); ``raw`` keeps the
+    source's original payload for audit. ``StreamConsumer`` persists these to ``balance_snapshots``
+    (throttled) and still forwards to the optional ``on_balance`` hook."""
 
     account_number: str
     raw: dict
+    net_liquidating_value: Decimal | None = None
+    cash_balance: Decimal | None = None
+    equity_buying_power: Decimal | None = None
+    derivative_buying_power: Decimal | None = None
+    maintenance_requirement: Decimal | None = None
+    pending_cash: Decimal | None = None
+    day_trading_buying_power: Decimal | None = None
+    captured_at: datetime | None = None
 
 
 @runtime_checkable
@@ -167,4 +178,8 @@ class BrokerClient(Protocol):
 
     async def get_positions(self, account_number: str) -> list[BrokerPosition]:
         """GET /accounts/{account}/positions — the current snapshot."""
+        ...
+
+    async def get_balances(self, account_number: str) -> BalanceMessage:
+        """GET /accounts/{account}/balances — the current balance snapshot."""
         ...

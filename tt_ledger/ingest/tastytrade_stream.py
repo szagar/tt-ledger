@@ -34,7 +34,7 @@ from ..enums import OrderStatus
 from ..repositories import map_order_status, order_level_fill_fields
 from ..rows import FillEvent
 from .broker import BalanceMessage, BrokerPosition
-from .tastytrade_client import order_from_json, position_from_json
+from .tastytrade_client import balance_from_json, order_from_json, position_from_json
 
 if TYPE_CHECKING:
     from .tastytrade_client import TastyTradeClient
@@ -139,7 +139,7 @@ def _parse_notification(msg: dict) -> "FillEvent | BrokerPosition | BalanceMessa
     if msg_type == "CurrentPosition":
         return position_from_json(data)
     if msg_type == "AccountBalance":
-        return BalanceMessage(account_number=str(data.get("account-number", "")), raw=data)
+        return balance_from_json(data)
     return None
 
 

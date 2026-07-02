@@ -22,6 +22,7 @@ class MockTastyTradeClient:
         self._orders: dict[str, list[PlacedOrder]] = {}
         self._transactions: dict[str, list[BrokerTransaction]] = {}
         self._positions: dict[str, list[BrokerPosition]] = {}
+        self._balances: dict[str, BalanceMessage] = {}
         self.calls: list[tuple[str, str, date | None, date | None]] = []
         self.last_page_count = 0
 
@@ -35,6 +36,9 @@ class MockTastyTradeClient:
 
     def set_positions(self, account_number: str, positions: list[BrokerPosition]) -> None:
         self._positions[account_number] = list(positions)
+
+    def set_balance(self, account_number: str, balance: BalanceMessage) -> None:
+        self._balances[account_number] = balance
 
     def fill(
         self,
@@ -99,6 +103,10 @@ class MockTastyTradeClient:
     async def get_positions(self, account_number: str) -> list[BrokerPosition]:
         self.calls.append(("get_positions", account_number, None, None))
         return list(self._positions.get(account_number, []))
+
+    async def get_balances(self, account_number: str) -> BalanceMessage:
+        self.calls.append(("get_balances", account_number, None, None))
+        return self._balances.get(account_number, BalanceMessage(account_number=account_number, raw={}))
 
     def _paginate(self, items: list) -> list:
         """Walk ``items`` in ``page_size`` chunks and reassemble — mirrors the real page-offset

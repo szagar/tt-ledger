@@ -34,9 +34,14 @@ only (Rule 1/Rule 2 enforced at this boundary).
 
 A consumer of the broker's account-stream (order / position / balance messages).
 
-- **Standalone deployment:** connect the broker WebSocket directly.
-- **Host-platform deployment:** consume the platform's existing `acct:*` Redis pub/sub (see
-  `integration-zts.md`).
+- **Standalone deployment:** connect the broker WebSocket directly
+  (`TastyTradeMessageSource`, `[tastytrade]` extra).
+- **Host-platform deployment:** consume the platform's existing `acct:*` Redis pub/sub via
+  `RedisMessageSource` (`ingest/redis_source.py`, `[redis]` extra; see `integration-zts.md`).
+  It subscribes `acct:order` / `acct:position` / `acct:balance`, translates the host's
+  nickname-keyed snake_case envelopes into the same `FillEvent` / `BrokerPosition` /
+  `BalanceMessage` shapes (account numbers restored via the injected `AccountMapper`),
+  optionally filters to one login's nicknames, and reconnects with capped exponential backoff.
 
 The stream provides **real-time visibility** and live order-status updates. It is **not** the source of
 order structure: a broker fill whose `tt_order_id` has no local order does **not** create a row from the
@@ -51,12 +56,23 @@ Turns ungrouped broker activity into reviewable trades.
    sets `order_id` (then leg linkage by `security_id`). No fuzzy/heuristic matching.
 2. **Group** ungrouped transactions by `(account, executed_at)` (tolerance window joins multi-order
    strategies executed together).
-3. **Classify** `strategy_type` from the legs.
-4. **Create** the `trade_group` with `origin=broker`, `review_status=NEEDS_REVIEW`, an `ENTRY` event,
-   premium / max-profit-loss, and realized P&L; set `orders.trade_group_id` + `transactions.trade_group_id`.
+3. **Route** each cluster against the account's OPEN groups:
+   - **closing** rows (`* to Close` trades, `Receive Deliver` expiration/assignment/exercise —
+     the latter carry no order-id and are admitted on sub-type) that offset an open group's legs
+     **attach to that group** with the matching lifecycle event (`partial_exit` / `full_exit` /
+     `expiration` / `assignment` / `exercise`). A fully-offset group's `status` flips
+     (closed/expired/assigned/exercised; `mixed` when causes differ), `closed_at` is stamped, and
+     cash-basis `realized_pnl` (signed net across all member transactions) is written.
+   - **rolls**: closes + opens in one cluster on the same underlying, or a close-cluster and an
+     open-cluster within 60s (same underlying/option type/quantity), add a `roll` event with
+     `rolled_to_group_id` on the old group.
+4. **Classify** `strategy_type` from the remaining (opening) legs.
+5. **Create** the `trade_group` with `origin=broker`, `review_status=NEEDS_REVIEW`, an `ENTRY` event,
+   premium / max-profit-loss; set `orders.trade_group_id` + `transactions.trade_group_id`.
 
-**Idempotent**, and it **never touches a `manually_attributed` group** — so re-running after every sync
-is safe and never clobbers an operator's edits.
+**Idempotent**, and it **never re-attributes a `manually_attributed` group's membership** — so
+re-running after every sync is safe and never clobbers an operator's edits. (Closing activity may
+attach to a manually-attributed group: that records the group's own lifecycle.)
 
 ### Remap (operator-driven)
 

@@ -11,12 +11,13 @@ same way the SQL test suite queries the underlying tables directly.
 from __future__ import annotations
 
 from dataclasses import fields as dc_fields
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Callable, Generic, TypeVar
 
 from ..rows import (
     ActivityFilter,
     ActivityRow,
+    BalanceSnapshotRow,
     ClosedPositionRow,
     EventRow,
     FillRow,
@@ -111,6 +112,9 @@ class InMemoryStore:
         )
         self._trade_groups: _Table[TradeGroupRow] = _Table(key=lambda r: r.group_id)
         self._events: _Table[EventRow] = _Table()
+        self._balance_snapshots: _Table[BalanceSnapshotRow] = _Table(
+            key=lambda r: (r.account, r.captured_at, r.source)
+        )
 
     # --- writes ------------------------------------------------------------------
 
@@ -126,6 +130,13 @@ class InMemoryStore:
 
     async def upsert_transactions(self, rows: list[TxnRow]) -> None:
         for row in rows:
+            # mirror the SQL store's preserve-if-null on linkage columns: a re-synced/re-imported
+            # transaction must not wipe the order/position/trade-group linkage reconcile+replay set.
+            existing = self._transactions.get_by_key(row.tt_transaction_id)
+            if existing is not None:
+                for f in ("order_id", "order_leg_id", "position_id", "closed_position_id", "trade_group_id"):
+                    if getattr(row, f, None) is None:
+                        setattr(row, f, getattr(existing, f, None))
             self._transactions.upsert(row)
 
     async def upsert_security(self, sec: SecurityRow) -> None:
@@ -137,6 +148,9 @@ class InMemoryStore:
 
     async def upsert_closed_position(self, row: ClosedPositionRow) -> int:
         return self._closed_positions.upsert(row)
+
+    async def upsert_balance_snapshot(self, row: BalanceSnapshotRow) -> None:
+        self._balance_snapshots.upsert(row)
 
     # --- linking + grouping --------------------------------------------------------
 
@@ -208,6 +222,23 @@ class InMemoryStore:
             if row.account == account and (security_id is None or row.security_id == security_id)
         ]
 
+    async def get_latest_balance(self, account: str) -> BalanceSnapshotRow | None:
+        rows = [row for _, row in self._balance_snapshots.all() if row.account == account]
+        return max(rows, key=lambda r: r.captured_at) if rows else None
+
+    async def get_balances(
+        self, account: str, start: date | None = None, end: date | None = None,
+    ) -> list[BalanceSnapshotRow]:
+        def _in_range(row: BalanceSnapshotRow) -> bool:
+            if start is not None and row.captured_at < datetime.combine(start, time.min, tzinfo=UTC):
+                return False
+            if end is not None and row.captured_at >= datetime.combine(end, time.min, tzinfo=UTC) + timedelta(days=1):
+                return False
+            return True
+
+        rows = [row for _, row in self._balance_snapshots.all() if row.account == account and _in_range(row)]
+        return sorted(rows, key=lambda r: r.captured_at)
+
     async def get_security(self, security_id: str) -> SecurityRow | None:
         return self._securities.get_by_key(security_id)
 
@@ -223,6 +254,10 @@ class InMemoryStore:
     async def get_transactions_by_id(self, txn_ids: list[int]) -> list[TxnRow]:
         ids = set(txn_ids)
         return [txn for row_id, txn in self._transactions.all() if row_id in ids]
+
+    async def get_group_transactions(self, trade_group_id: int) -> list[TxnRow]:
+        rows = [txn for _, txn in self._transactions.all() if txn.trade_group_id == trade_group_id]
+        return sorted(rows, key=lambda t: (t.executed_at is None, t.executed_at))
 
     async def query_orders(self, f: OrderFilter) -> list[OrderRow]:
         out = []
@@ -275,6 +310,7 @@ class InMemoryStore:
                 _project(
                     txn, ActivityRow,
                     origin=order.origin if order is not None else None,
+                    order_trade_group_id=order.trade_group_id if order is not None else None,
                     review_status=group.review_status if group is not None else None,
                 )
             )

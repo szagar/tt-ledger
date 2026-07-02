@@ -15,18 +15,24 @@ import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 
 from tt_ledger.money import Money
 from tt_ledger.schema import metadata as target_metadata
+from tt_ledger.schema.namespace import pg_schema, translate_map_for
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-DB_URL = os.getenv("TT_LEDGER_DATABASE_URL", "sqlite+aiosqlite:///ledger.db")
+# Programmatic callers (tt_ledger.schema.migrate) set sqlalchemy.url on the Config;
+# CLI/alembic.ini runs fall back to the env var.
+DB_URL = config.get_main_option("sqlalchemy.url") or os.getenv(
+    "TT_LEDGER_DATABASE_URL", "sqlite+aiosqlite:///ledger.db"
+)
 config.set_main_option("sqlalchemy.url", DB_URL)
 
 
@@ -43,17 +49,43 @@ _OPTS = dict(
     render_as_batch=True,
     render_item=render_item,
     compare_type=True,
+    # Namespaced so a host platform's own Alembic chain (default table name
+    # ``alembic_version``) can share the database.
+    version_table="tt_ledger_alembic_version",
 )
 
 
 def run_migrations_offline() -> None:
+    # NOTE: offline (--sql) rendering does not apply the Postgres schema_translate_map;
+    # online mode is the supported path for Postgres (schema/namespace.py).
     context.configure(url=DB_URL, literal_binds=True, dialect_opts={"paramstyle": "named"}, **_OPTS)
     with context.begin_transaction():
         context.run_migrations()
 
 
 def _do_run_migrations(connection) -> None:  # noqa: ANN001
-    context.configure(connection=connection, **_OPTS)
+    opts = dict(_OPTS)
+    translate_map = translate_map_for(DB_URL)
+    if translate_map is not None:
+        # Postgres: route every schema-less table into the dedicated ledger schema
+        # (schema/namespace.py).
+        connection.execute(sa_text(f'CREATE SCHEMA IF NOT EXISTS "{pg_schema()}"'))
+        # Commit now: the execute() above autobegins a transaction, and Alembic treats a
+        # connection with an open transaction as caller-owned — it would then never commit,
+        # and the migration DDL would silently roll back when the connection closes.
+        connection.commit()
+        # Belt and suspenders with the translate map: Alembic renders SOME DDL (e.g.
+        # batch_alter_table's ALTER TABLE ... ADD COLUMN) as literal strings that schema
+        # translation never sees — the session search_path routes those into the schema too.
+        connection.execute(sa_text(f'SET search_path TO "{pg_schema()}"'))
+        connection.commit()
+        connection = connection.execution_options(schema_translate_map=translate_map)
+        # The version table needs its schema EXPLICIT (not via the translate map): Alembic
+        # probes for it with reflection, which the translate map does not affect — left
+        # implicit, every run would look in the search_path, find nothing, and re-run all
+        # migrations from base.
+        opts["version_table_schema"] = pg_schema()
+    context.configure(connection=connection, **opts)
     with context.begin_transaction():
         context.run_migrations()
 

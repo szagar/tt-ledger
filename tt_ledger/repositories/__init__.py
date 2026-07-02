@@ -9,15 +9,16 @@ layer is where that translation happens, not the store.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from ..enums import Ingest, Origin, OrderStatus
-from ..rows import FillRow, LegRow, OrderRow, PositionRow, SecurityRow, TxnRow
+from ..rows import BalanceSnapshotRow, FillRow, LegRow, OrderRow, PositionRow, SecurityRow, TxnRow
 
 if TYPE_CHECKING:
     from ..identity import ResolvedSecurity, SecurityResolver
-    from ..ingest.broker import BrokerPosition, BrokerTransaction, PlacedFill, PlacedOrder
+    from ..ingest.broker import BalanceMessage, BrokerPosition, BrokerTransaction, PlacedFill, PlacedOrder
     from ..rows import FillEvent, OrderFilter, TradeFilter, TradeGroupRow, TradeRow
     from ..store import LedgerStore
 
@@ -236,10 +237,13 @@ class TransactionRepository(_Repo):
         self._resolver = resolver
         self._securities = SecurityRepository(store)
 
-    async def upsert(self, txns: "list[BrokerTransaction]", *, account: str) -> int:
+    async def upsert(self, txns: "list[BrokerTransaction]", *, account: str, source_system: str = "tastytrade") -> int:
         """sync_transactions core: upsert on tt_transaction_id, capturing the broker's order-id
         into tt_order_id (the deterministic txn->order link key — actually linking to the
-        order's surrogate id is the reconcile pass's job, not this importer's)."""
+        order's surrogate id is the reconcile pass's job, not this importer's).
+
+        ``source_system`` distinguishes real broker feeds from host-injected synthetic records
+        (e.g. paper-account settlements imported via ``LedgerClient.import_transactions``)."""
         if not txns:
             return 0
 
@@ -257,7 +261,8 @@ class TransactionRepository(_Repo):
             rows.append(
                 TxnRow(
                     tt_transaction_id=t.id, tt_order_id=t.order_id, account=account,
-                    account_number=t.account_number, transaction_type=t.transaction_type,
+                    account_number=t.account_number, source_system=source_system,
+                    transaction_type=t.transaction_type,
                     transaction_sub_type=t.transaction_sub_type, action=t.action,
                     security_id=security_id, underlying=t.underlying_symbol,
                     quantity=t.quantity, price=t.price, value=t.value, value_effect=t.value_effect,
@@ -354,8 +359,29 @@ class TradeGroupRepository(_Repo):
         raise NotImplementedError
 
 
+class BalanceRepository(_Repo):
+    async def record(self, msg: "BalanceMessage", *, account: str, source: str = "stream") -> None:
+        """Persist one balance snapshot (idempotent on ``(account, captured_at, source)``).
+        ``captured_at`` falls back to now for messages that carry no timestamp."""
+        await self._store.upsert_balance_snapshot(
+            BalanceSnapshotRow(
+                account=account,
+                captured_at=msg.captured_at or datetime.now(UTC),
+                source=source,
+                net_liquidating_value=msg.net_liquidating_value,
+                cash_balance=msg.cash_balance,
+                equity_buying_power=msg.equity_buying_power,
+                derivative_buying_power=msg.derivative_buying_power,
+                maintenance_requirement=msg.maintenance_requirement,
+                pending_cash=msg.pending_cash,
+                day_trading_buying_power=msg.day_trading_buying_power,
+                raw=msg.raw,
+            )
+        )
+
+
 __all__ = [
     "SecurityRepository", "OrderRepository", "TransactionRepository",
-    "PositionRepository", "TradeGroupRepository", "map_order_status", "apply_fill_event",
-    "order_level_fill_fields",
+    "PositionRepository", "TradeGroupRepository", "BalanceRepository", "map_order_status",
+    "apply_fill_event", "order_level_fill_fields",
 ]

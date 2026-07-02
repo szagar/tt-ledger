@@ -6,10 +6,12 @@ server (tt_ledger.api) and CLI (tt_ledger.cli) are thin wrappers over this.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from .enums import Ingest, Origin, ReviewStatus
+from .enums import Ingest, Origin, ReviewStatus, TradeGroupEventType
 from .identity import PassthroughResolver
 from .ingest.pull import sync_all
 from .ingest.push import StreamConsumer
@@ -17,16 +19,33 @@ from .ingest.reconcile import reconcile
 from .ingest.remap import dismiss_trade_group, regroup_transactions, remap_trade_group
 from .ingest.replay import rebuild_positions_from_transactions
 from .repositories import apply_fill_event
-from .rows import ActivityFilter, OrderFilter, OrderRow, TradeFilter, trade_group_to_row
+from .rows import (
+    ActivityFilter,
+    EventRow,
+    OrderFilter,
+    OrderRow,
+    SyncResult,
+    TradeFilter,
+    TradeGroupRow,
+    trade_group_to_row,
+)
 from .store import make_store
 
 if TYPE_CHECKING:
     from typing import Callable
 
     from .identity import AccountMapper, SecurityResolver
-    from .ingest.broker import BalanceMessage, BrokerClient
+    from .ingest.broker import BalanceMessage, BrokerClient, BrokerTransaction
     from .ingest.push import MessageSource
-    from .rows import ActivityRow, ClosedPositionRow, FillEvent, OrderInput, PositionRow, SyncResult, TradeRow
+    from .rows import (
+        ActivityRow,
+        BalanceSnapshotRow,
+        ClosedPositionRow,
+        FillEvent,
+        OrderInput,
+        PositionRow,
+        TradeRow,
+    )
     from .store import LedgerStore
 
 
@@ -43,9 +62,9 @@ class LedgerClient:
         self._accounts = accounts
         # Injectable symbology. Default: canonical security_id == the raw vendor symbol.
         self._resolver: SecurityResolver = resolver or PassthroughResolver()
-        # No default: no real TastyTrade REST client ships in this package yet (see
-        # docs/implementation-notes.md). Required only by sync(); every other method works
-        # without one. Pass MockTastyTradeClient for tests, or a real client once you have one.
+        # No default: required only by sync(); every other method works without one. Pass
+        # ingest.tastytrade_client.TastyTradeClient (the real REST client, [tastytrade] extra)
+        # or MockTastyTradeClient for tests.
         self._client = client
 
     @classmethod
@@ -81,19 +100,102 @@ class LedgerClient:
         )
 
     async def record_order(self, order: "OrderInput") -> "OrderRow":
-        """Record an order at submission (oms_submit path) -- before any broker confirmation,
-        so ``tt_order_id`` is unset; it arrives later via push/pull enrichment."""
+        """Record an order at submission (oms_submit path). Pass ``tt_order_id`` when the broker's
+        submit response already supplied it (the pull/push paths then enrich this row instead of
+        creating a broker-origin duplicate); pass ``trade_group`` (from ``open_trade_group``) to
+        pre-attribute the order -- reconcile attaches its transactions to that group instead of
+        clustering them into a new needs-review one."""
+        trade_group_id = None
+        if order.trade_group is not None:
+            trade_group_id = await self._store.get_trade_group_id(order.trade_group)
+            if trade_group_id is None:
+                raise ValueError(f"unknown trade_group {order.trade_group!r} -- open_trade_group() first")
         row = OrderRow(
-            tt_order_id=None, account=order.account, origin=Origin.ZTS, ingest=Ingest.OMS_SUBMIT,
+            tt_order_id=order.tt_order_id, account=order.account, origin=Origin.ZTS, ingest=Ingest.OMS_SUBMIT,
             security_id=order.security_id, underlying=order.underlying,
             order_type=order.order_type, time_in_force=order.time_in_force,
             price=order.price, price_effect=order.price_effect,
             is_complex=order.is_complex, complex_order_type=order.complex_order_type,
             signal_id=order.signal_id, trace_id=order.trace_id, strategy_id=order.strategy_id,
+            trade_group_id=trade_group_id,
             market_context_id=order.market_context_id, received_at=datetime.now(UTC),
         )
         await self._store.upsert_orders([row])
         return row
+
+    async def open_trade_group(
+        self,
+        account: str,
+        *,
+        strategy_type: str | None = None,
+        underlying: str | None = None,
+        security_id: str | None = None,
+        quantity: "Decimal | None" = None,
+        total_premium: "Decimal | None" = None,
+        max_profit: "Decimal | None" = None,
+        max_loss: "Decimal | None" = None,
+        profit_target: str | None = None,
+        stop_loss: str | None = None,
+        exit_strategy: str | None = None,
+        strategy_id: int | None = None,
+        bot: str | None = None,
+        signal: str | None = None,
+        reviewed_by: str | None = None,
+    ) -> "TradeRow":
+        """Open a trade_group at submit time -- the moment strategy intent (bot, signal,
+        strategy type, planned risk) exists. The group is ``origin=zts``, ``confirmed``, and
+        ``manually_attributed`` (intent beats reconcile's clustering heuristics); pass its
+        ``group_id`` to ``record_order(trade_group=...)`` so fills attach to it. Financials
+        (premium/fees/quantity) are refined from actual fills by reconcile."""
+        now = datetime.now(UTC)
+        row = TradeGroupRow(
+            group_id=str(uuid.uuid4()), account=account, origin=Origin.ZTS,
+            review_status=ReviewStatus.CONFIRMED, manually_attributed=True,
+            reviewed_at=now, reviewed_by=reviewed_by,
+            underlying=underlying, security_id=security_id, strategy_type=strategy_type,
+            total_premium=total_premium, quantity=quantity,
+            max_profit=max_profit, max_loss=max_loss,
+            profit_target=profit_target, stop_loss=stop_loss, exit_strategy=exit_strategy,
+            strategy_id=strategy_id, bot_name=bot, signal_id=signal,
+            executed_at=now,
+        )
+        group_pk = await self._store.upsert_trade_group(row)
+        await self._store.add_trade_group_event(
+            EventRow(
+                trade_group_id=group_pk, event_type=TradeGroupEventType.ENTRY.value,
+                quantity_change=quantity or Decimal("0"), premium_change=total_premium or Decimal("0"),
+                event_at=now,
+            )
+        )
+        return trade_group_to_row(row)
+
+    async def import_transactions(
+        self,
+        account: str,
+        txns: "list[BrokerTransaction]",
+        *,
+        source_system: str = "synthetic",
+        reconcile_after: bool = True,
+    ) -> "SyncResult":
+        """Inject host-generated transactions — e.g. a paper account's synthetic settlements
+        (expiration / cash-settled exercise), which have no broker feed behind them.
+
+        Idempotent on each record's ``id`` (-> ``tt_transaction_id``): give synthetic records a
+        stable deterministic id (e.g. ``paper-exp-<security>-<date>``) so re-imports are no-ops.
+        ``reconcile_after`` (default) immediately routes the new rows — an expiration row lands
+        on its open trade_group with the proper lifecycle event/status via the normal reconcile
+        machinery."""
+        from .repositories import TransactionRepository
+
+        result = SyncResult()
+        result.transactions = await TransactionRepository(self._store, resolver=self._resolver).upsert(
+            txns, account=account, source_system=source_system,
+        )
+        if reconcile_after:
+            rec = await reconcile(self._store, account)
+            result.trade_groups = rec.trade_groups
+            result.errors.extend(rec.errors)
+        return result
 
     async def apply_fill(self, evt: "FillEvent") -> None:
         """A fill/status update from the push (stream) path. Enriches an existing order by
@@ -102,14 +204,26 @@ class LedgerClient:
         await apply_fill_event(self._store, evt)
 
     def stream_consumer(
-        self, source: "MessageSource", *, on_balance: "Callable[[BalanceMessage], None] | None" = None,
+        self,
+        source: "MessageSource",
+        *,
+        on_balance: "Callable[[BalanceMessage], None] | None" = None,
+        persist_balances: bool = True,
+        balance_min_interval_seconds: float = 60.0,
     ) -> "StreamConsumer":
         """A ``StreamConsumer`` bound to this ledger's store/accounts/resolver, consuming an
         already-built transport (``TastyTradeMessageSource`` for the real account-streamer,
-        ``MockMessageSource`` for tests, or any other ``MessageSource``). ``LedgerClient`` stays
-        transport-agnostic -- it never reads accounts.toml credentials itself, same as ``sync()``
-        takes an already-built ``BrokerClient`` rather than constructing one."""
-        return StreamConsumer(self._store, source, accounts=self._accounts, resolver=self._resolver, on_balance=on_balance)
+        ``RedisMessageSource`` for a host platform's pub/sub, ``MockMessageSource`` for tests).
+        ``LedgerClient`` stays transport-agnostic -- it never reads accounts.toml credentials
+        itself, same as ``sync()`` takes an already-built ``BrokerClient`` rather than
+        constructing one. Balance messages are persisted to ``balance_snapshots`` (throttled per
+        ``balance_min_interval_seconds``; NLV changes always persist) unless
+        ``persist_balances=False``."""
+        return StreamConsumer(
+            self._store, source, accounts=self._accounts, resolver=self._resolver,
+            on_balance=on_balance, persist_balances=persist_balances,
+            balance_min_interval_seconds=balance_min_interval_seconds,
+        )
 
     # --- read (consolidated views) ---
 
@@ -157,6 +271,16 @@ class LedgerClient:
 
     async def closed_positions(self, account: str, security_id: str | None = None) -> "list[ClosedPositionRow]":
         return await self._store.get_closed_positions(account, security_id)
+
+    async def latest_balance(self, account: str) -> "BalanceSnapshotRow | None":
+        """The most recent balance snapshot (stream- or sync-written) for ``account``."""
+        return await self._store.get_latest_balance(account)
+
+    async def balances(
+        self, account: str, *, since: date | None = None, until: date | None = None,
+    ) -> "list[BalanceSnapshotRow]":
+        """The account's balance time series (NLV history), oldest first."""
+        return await self._store.get_balances(account, start=since, end=until)
 
     # --- reconcile ---
 

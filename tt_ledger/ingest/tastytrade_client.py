@@ -21,7 +21,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from .broker import BrokerPosition, BrokerTransaction, PlacedFill, PlacedLeg, PlacedOrder
+from .broker import BalanceMessage, BrokerPosition, BrokerTransaction, PlacedFill, PlacedLeg, PlacedOrder
 
 if TYPE_CHECKING:
     import httpx
@@ -178,6 +178,13 @@ class TastyTradeClient:
         items = body.get("data", {}).get("items", [])
         return [position_from_json(item) for item in items]
 
+    async def get_balances(self, account_number: str) -> BalanceMessage:
+        """GET /accounts/{account}/balances — the current AccountBalance snapshot (verified
+        against the balances-and-positions OpenAPI spec; a ``/balances/{currency}`` variant
+        exists too, but the currency-less form is the canonical current snapshot)."""
+        body = await self._get(f"/accounts/{account_number}/balances", {})
+        return balance_from_json(body.get("data", {}))
+
 
 def now_with_margin(expires_in_seconds: int) -> datetime:
     """"expires in N seconds" -> the wall-clock instant we should treat the token as expired,
@@ -316,4 +323,24 @@ def position_from_json(item: dict) -> BrokerPosition:
         # float() first.
         multiplier=int(float(multiplier)) if multiplier is not None else 1,
         expires_at=parse_datetime(item.get("expires-at")),
+    )
+
+
+def balance_from_json(item: dict) -> BalanceMessage:
+    """A TastyTrade AccountBalance JSON object -> ``BalanceMessage``. Shared by the REST client
+    (``get_balances``) and ``TastyTradeMessageSource`` (account-streamer AccountBalance
+    notifications — same object shape). Field names verified against the balances-and-positions
+    OpenAPI spec; only the fields the ledger persists are parsed, the full object rides in
+    ``raw``."""
+    return BalanceMessage(
+        account_number=str(item.get("account-number", "")),
+        raw=item,
+        net_liquidating_value=parse_decimal(item.get("net-liquidating-value")),
+        cash_balance=parse_decimal(item.get("cash-balance")),
+        equity_buying_power=parse_decimal(item.get("equity-buying-power")),
+        derivative_buying_power=parse_decimal(item.get("derivative-buying-power")),
+        maintenance_requirement=parse_decimal(item.get("maintenance-requirement")),
+        pending_cash=parse_decimal(item.get("pending-cash")),
+        day_trading_buying_power=parse_decimal(item.get("day-trading-buying-power")),
+        captured_at=parse_datetime(item.get("updated-at")),
     )

@@ -18,10 +18,17 @@ class LedgerClient:
              ) -> "LedgerClient": ...
 
     # capture
-    async def sync(self, account: str, since: date | None = None) -> SyncResult   # pull + reconcile
-    async def record_order(self, order: OrderInput) -> OrderRow                    # oms_submit path
+    async def sync(self, account: str, since: date | None = None) -> SyncResult   # pull + reconcile (+ a rest_sync balance snapshot)
+    async def record_order(self, order: OrderInput) -> OrderRow                    # oms_submit path; tt_order_id + trade_group pre-attribution
+    async def open_trade_group(self, account: str, *, strategy_type=None, bot=None, signal=None,
+                               max_loss=None, ...) -> TradeRow                     # submit-time intent: confirmed + manually_attributed
+    async def import_transactions(self, account: str, txns: list[BrokerTransaction], *,
+                                  source_system: str = "synthetic", reconcile_after: bool = True) -> SyncResult
+                                                                                   # host-injected records (e.g. paper settlements)
     async def apply_fill(self, evt: FillEvent) -> None                             # push path
-    def stream_consumer(self, source: MessageSource, *, on_balance=None) -> StreamConsumer  # push path
+    def stream_consumer(self, source: MessageSource, *, on_balance=None,
+                        persist_balances: bool = True,
+                        balance_min_interval_seconds: float = 60.0) -> StreamConsumer  # push path
 
     # read (consolidated views)
     async def orders(self, **f) -> list[OrderRow]
@@ -31,6 +38,8 @@ class LedgerClient:
     async def position(self, account: str, security_id: str) -> PositionRow | None
     async def positions(self, account: str, *, open_only: bool = True) -> list[PositionRow]
     async def closed_positions(self, account: str, security_id: str | None = None) -> list[ClosedPositionRow]
+    async def latest_balance(self, account: str) -> BalanceSnapshotRow | None
+    async def balances(self, account: str, *, since: date | None = None, until: date | None = None) -> list[BalanceSnapshotRow]
 
     # remap
     async def remap_trade(self, group_id: str, *, strategy=None, bot=None, signal=None,

@@ -92,3 +92,22 @@ class Money(TypeDecorator):
   rebuilds the table). The *same* revisions apply to Postgres.
 - `alembic upgrade head` runs against whichever URL is configured — no per-dialect migration sets.
 - Write each migration mindful of batch mode (avoid operations batch mode can't express).
+- **Installed-package path**: `tt-ledger db upgrade` (or `tt_ledger.schema.migrate.upgrade_to_head(url)`
+  programmatically) applies migrations without a repo checkout / `alembic.ini` — the path a host
+  platform uses when it consumes tt-ledger as a wheel/git dependency. `upgrade_to_head` is synchronous
+  (the Alembic env runs its own event loop); call it via `asyncio.to_thread` from async code.
+
+## Postgres schema namespace
+
+On Postgres every ledger table lives in a dedicated schema — default **`ledger`**, overridable via
+`TT_LEDGER_PG_SCHEMA` (`tt_ledger/schema/namespace.py`) — so a host platform can share one database
+without name collisions (`accounts`, `orders`, `positions`, `transactions` are generic names). The
+models stay schema-less; the namespace is applied per-connection with SQLAlchemy's
+`schema_translate_map` (`{None: <schema>}`), which keeps SQLite — no schemas there — untouched.
+
+Coexistence with a host's own Alembic chain on the same database:
+- version table is **`<schema>.tt_ledger_alembic_version`** (never the default `alembic_version`).
+  Its schema is set *explicitly* (`version_table_schema`), not via the translate map — Alembic probes
+  for the version table with reflection, which the translate map does not affect.
+- migrations `CREATE SCHEMA IF NOT EXISTS` on their own committed transaction before running.
+- disaster recovery: `DROP SCHEMA ledger CASCADE` → `tt-ledger db upgrade` → re-sync from the broker.
