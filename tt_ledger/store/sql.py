@@ -46,6 +46,9 @@ from ..schema.namespace import pg_schema, translate_map_for
 # re-upserts of the same tt_transaction_id (see _upsert's preserve_if_null).
 _TXN_LINKAGE_COLS = {"order_id", "order_leg_id", "position_id", "closed_position_id", "trade_group_id"}
 
+# Comfortably under asyncpg's 32767-bind-parameter statement cap (SQLite's modern cap is higher).
+_MAX_BIND_PARAMS = 30000
+
 
 def _insert(dialect: str):
     """Return the dialect-specific ``insert`` (the one place we branch)."""
@@ -147,11 +150,21 @@ class SqlLedgerStore:
                 update_cols[c.name] = func.coalesce(excluded_col, c)
             else:
                 update_cols[c.name] = excluded_col
-        stmt = stmt.values(rows).on_conflict_do_update(
-            index_elements=conflict_cols, index_where=index_where, set_=update_cols,
-        ).returning(table.c.id)
-        result = await session.execute(stmt)
-        return [row.id for row in result]
+
+        # Chunk the VALUES list: asyncpg hard-caps a statement at 32767 bind parameters, so a
+        # full-history backfill (thousands of rows x ~35 columns) must split. Sequential chunks
+        # keep the returned surrogate ids in input order.
+        params_per_row = max(len(rows[0]), 1)
+        chunk_size = max(1, _MAX_BIND_PARAMS // params_per_row)
+        ids: list[int] = []
+        for start in range(0, len(rows), chunk_size):
+            chunk = rows[start:start + chunk_size]
+            chunk_stmt = stmt.values(chunk).on_conflict_do_update(
+                index_elements=conflict_cols, index_where=index_where, set_=update_cols,
+            ).returning(table.c.id)
+            result = await session.execute(chunk_stmt)
+            ids.extend(row.id for row in result)
+        return ids
 
     # --- writes --------------------------------------------------------------------
 

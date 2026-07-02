@@ -457,3 +457,24 @@ async def test_get_security(seeded):
     assert found is not None
     assert found.product_type == "F"
     assert await store.get_security("does-not-exist") is None
+
+
+async def test_bulk_upsert_chunks_past_the_bind_parameter_cap(store):
+    """Regression: a full-history backfill inserts thousands of rows in one upsert call;
+    asyncpg caps a statement at 32767 bind parameters, so _upsert must chunk (found live —
+    ~940 orders x 35 columns already exceeds the cap)."""
+    from tt_ledger.enums import Ingest, Origin
+    from tt_ledger.rows import AccountRow
+
+    await store.upsert_account(AccountRow(nickname="main", account_number="ACCT1", login="u"))
+    rows = [
+        OrderRow(tt_order_id=f"O-{i}", account="main", origin=Origin.BROKER, ingest=Ingest.ORDER_HISTORY)
+        for i in range(2000)
+    ]
+    ids = await store.upsert_orders(rows)
+    assert len(ids) == 2000
+    assert len(set(ids)) == 2000
+    # input order preserved across chunks
+    first = await store.get_order("O-0")
+    last = await store.get_order("O-1999")
+    assert first is not None and last is not None
