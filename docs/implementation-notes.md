@@ -69,11 +69,15 @@ tests/
 6. **`security-universe` is sync** — the `SecurityUniverseResolver` resolves at ingest and stores the
    string; never call it inside hot async paths.
 
-## Reference implementations to port
+## Reference implementations (status)
 
-These exist as mature code in the original host platform and should be ported (not reinvented):
-`AccountMapper` + TOML loader (`shared/accounts/`), the TastyTrade REST/stream client, and the
-trade-grouping / strategy-detection / P&L logic. A structured canonical symbology (`CanonicalSymbol` +
-OCC parsing from `shared/symbol/`) is **optional** here — port it only if you want a
-`CanonicalSymbolResolver` instead of the default vendor passthrough. See `integration-zts.md` for
-provenance.
+These originally existed only as mature code in the host platform and needed porting; all of them
+are now implemented directly in this repo (not ported — built fresh against the verified
+TastyTrade docs, see `tt_ledger/ingest/tastytrade_client.py`/`tastytrade_stream.py`'s own
+docstrings for what was confirmed vs. inferred):
+`AccountMapper` + TOML loader (`identity/accounts.py`), the TastyTrade REST + WebSocket clients
+(`ingest/tastytrade_client.py`, `ingest/tastytrade_stream.py`), and the trade-grouping /
+strategy-detection / P&L logic (`ingest/reconcile.py`, `ingest/replay.py`). A structured canonical
+symbology (`CanonicalSymbol` + OCC parsing) is also implemented (`identity/canonical.py`) as an
+**optional** `CanonicalSymbolResolver` alternative to the default vendor passthrough. See
+`integration-zts.md` for provenance.
