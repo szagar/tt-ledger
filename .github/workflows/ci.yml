@@ -42,9 +42,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package (dev + postgres + securities extras)
-        # [securities] pulls security-universe from GitHub (not yet on PyPI)
-        run: uv pip install --system -e ".[dev,postgres,securities]"
+      - name: Install package (dev + postgres + securities + tastytrade + api + cli extras)
+        # [securities] pulls security-universe from GitHub (not yet on PyPI). No --system: setup-uv
+        # already provisions and activates a venv (VIRTUAL_ENV), and --system fights that under
+        # PEP 668 ("externally managed environment"). tastytrade/api/cli are required too -- their
+        # optional deps (websockets/fastapi/typer/rich) are imported at module load by
+        # test_ingest_tastytrade_stream.py / test_api.py / test_cli.py.
+        run: uv pip install -e ".[dev,postgres,securities,tastytrade,api,cli]"
 
       - name: Unit + smoke tests (SQLite and Postgres)
         env:
