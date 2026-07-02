@@ -478,3 +478,14 @@ async def test_bulk_upsert_chunks_past_the_bind_parameter_cap(store):
     first = await store.get_order("O-0")
     last = await store.get_order("O-1999")
     assert first is not None and last is not None
+
+    # legs are the sharp edge: a small row dict (9 fields) on a table whose compiled INSERT
+    # adds default-column binds (created_at/updated_at) -- chunking must size on the TABLE's
+    # columns or a 3333-row chunk lands at 36k+ params.
+    await store.upsert_security(SecurityRow(security_id="AAPL", product_type="S"))
+    legs = [
+        LegRow(order_id=ids[i % 2000], leg_index=i // 2000, security_id="AAPL", quantity=Decimal("1"))
+        for i in range(4000)
+    ]
+    leg_ids = await store.upsert_legs(legs)
+    assert len(leg_ids) == 4000

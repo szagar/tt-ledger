@@ -153,8 +153,10 @@ class SqlLedgerStore:
 
         # Chunk the VALUES list: asyncpg hard-caps a statement at 32767 bind parameters, so a
         # full-history backfill (thousands of rows x ~35 columns) must split. Sequential chunks
-        # keep the returned surrogate ids in input order.
-        params_per_row = max(len(rows[0]), 1)
+        # keep the returned surrogate ids in input order. Size on the TABLE's column count, not
+        # the row dict: compilation adds Python-side column defaults (created_at/updated_at) as
+        # extra binds per row.
+        params_per_row = max(len(table.columns), 1)
         chunk_size = max(1, _MAX_BIND_PARAMS // params_per_row)
         ids: list[int] = []
         for start in range(0, len(rows), chunk_size):
