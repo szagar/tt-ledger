@@ -44,6 +44,7 @@ class LedgerStore(Protocol):
 
     # --- linking + grouping ---
     async def link_transactions_to_orders(self, account: str) -> int: ...    # by tt_order_id
+    async def link_orders_to_groups(self, account: str) -> int: ...          # orders.trade_group_id from member txns
     async def link_transactions_to_positions(
         self, links: list[tuple[str, int | None, int | None]],
     ) -> int: ...                                                            # (tt_transaction_id, position_id, closed_position_id); returns count updated

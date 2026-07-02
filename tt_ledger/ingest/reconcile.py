@@ -116,6 +116,10 @@ async def reconcile(
     for acct in accounts:
         try:
             await store.link_transactions_to_orders(acct)
+            # self-heal the reverse edge: orders whose member transactions were grouped in an
+            # earlier pass but whose own trade_group_id is unset (e.g. rows re-synced before
+            # the preserve-on-resync fix, or created after their transactions were grouped)
+            await store.link_orders_to_groups(acct)
 
             activity = await store.account_activity(ActivityFilter(account=acct, start=since))
             candidates = [

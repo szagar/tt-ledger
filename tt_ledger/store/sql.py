@@ -249,6 +249,34 @@ class SqlLedgerStore:
 
     # --- linking + grouping ----------------------------------------------------------
 
+    async def link_orders_to_groups(self, account: str) -> int:
+        """Self-heal: stamp ``orders.trade_group_id`` from member transactions for orders whose
+        transactions all agree on ONE group (skips ambiguous multi-group orders)."""
+        orders = models.Order.__table__
+        txns = models.Transaction.__table__
+        sub = (
+            select(txns.c.tt_order_id, func.min(txns.c.trade_group_id).label("tg"))
+            .where(
+                txns.c.account == account,
+                txns.c.tt_order_id.isnot(None),
+                txns.c.trade_group_id.isnot(None),
+            )
+            .group_by(txns.c.tt_order_id)
+            .having(func.count(func.distinct(txns.c.trade_group_id)) == 1)
+            .subquery()
+        )
+        async with self._sessionmaker() as session, session.begin():
+            result = await session.execute(
+                update(orders)
+                .where(
+                    orders.c.account == account,
+                    orders.c.trade_group_id.is_(None),
+                    orders.c.tt_order_id == sub.c.tt_order_id,
+                )
+                .values(trade_group_id=sub.c.tg)
+            )
+            return result.rowcount or 0
+
     async def link_transactions_to_positions(self, links: list[tuple[str, int | None, int | None]]) -> int:
         if not links:
             return 0

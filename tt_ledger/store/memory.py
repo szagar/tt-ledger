@@ -171,6 +171,21 @@ class InMemoryStore:
             linked += 1
         return linked
 
+    async def link_orders_to_groups(self, account: str) -> int:
+        by_order: dict[str, set[int]] = {}
+        for _, txn in self._transactions.all():
+            if txn.account == account and txn.tt_order_id and txn.trade_group_id is not None:
+                by_order.setdefault(txn.tt_order_id, set()).add(txn.trade_group_id)
+        linked = 0
+        for _, order in self._orders.all():
+            if order.account != account or order.trade_group_id is not None or not order.tt_order_id:
+                continue
+            groups = by_order.get(order.tt_order_id)
+            if groups is not None and len(groups) == 1:
+                order.trade_group_id = next(iter(groups))
+                linked += 1
+        return linked
+
     async def link_transactions_to_positions(self, links: list[tuple[str, int | None, int | None]]) -> int:
         by_tt_transaction_id = {tt_transaction_id: (position_id, closed_position_id) for tt_transaction_id, position_id, closed_position_id in links}
         linked = 0
