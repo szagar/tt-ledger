@@ -24,17 +24,28 @@ broker-neutral (a `source_system` dimension) so a second source is additive.
 
 ## Quickstart
 
-### CLI (`pip install tt-ledger[tastytrade,cli]`)
+### Setup (once)
 
 ```sh
-cp config/accounts.toml.example config/accounts.toml   # fill in real OAuth creds -- never commit it
+pip install -e ".[tastytrade,cli]"                     # or [postgres]/[api] as needed
+cp config/accounts.toml.example config/accounts.toml    # fill in real OAuth creds -- never commit it
+alembic upgrade head                                     # create the schema (reads TT_LEDGER_DATABASE_URL, default ./ledger.db)
+```
+
+`LedgerClient.open()`/the CLI never auto-create tables -- migrations are the one source of schema
+truth on both SQLite and Postgres (docs/storage.md), so this step is required before the first sync.
+
+### CLI
+
+```sh
 tt-ledger sync --account main --since 2026-01-01        # pull (orders+transactions+positions) + reconcile
 tt-ledger rebuild-positions --account main               # position/closed-position history from transactions
 tt-ledger trades list --needs-review
 tt-ledger positions --account main
 ```
 
-SQLite is the default store (`./ledger.db`); point elsewhere with `--url` or `TT_LEDGER_DATABASE_URL`.
+SQLite is the default store (`./ledger.db`); point elsewhere with `--url` or `TT_LEDGER_DATABASE_URL`
+(the same env var both `alembic upgrade head` and the CLI read).
 
 ### SDK
 
