@@ -782,3 +782,27 @@ def test_map_order_status_has_no_partially_filled_entry():
     # TastyTrade's real order-status vocabulary has no "Partially Filled" status at all --
     # partial-fill information lives on the leg's quantity/remaining-quantity, not order status.
     assert map_order_status("Partially Filled") is None
+
+
+async def test_resync_preserves_broker_order_group_linkage(store, accounts, resolver):
+    """Regression: reconcile stamps trade_group_id onto broker-origin orders, but a later
+    re-sync of the same order rebuilt the row from the feed and wiped it (surfaced when a
+    rehearsal group's orders came back empty)."""
+    from dataclasses import replace as dc_replace
+
+    client = MockTastyTradeClient()
+    client.fill(
+        account_number="ACCT1", order_id="O-G", symbol="AAPL", instrument_type="Equity",
+        action="Buy to Open", quantity=Decimal("1"), fill_price=Decimal("100"),
+        filled_at=datetime(2026, 1, 5, tzinfo=UTC), status="Filled",
+    )
+    await sync_orders(store, "main", client=client, accounts=accounts, resolver=resolver)
+
+    order = await store.get_order("O-G")
+    await store.upsert_orders([dc_replace(order, trade_group_id=42, signal_id="sig-x")])
+
+    await sync_orders(store, "main", client=client, accounts=accounts, resolver=resolver)  # re-sync
+
+    refreshed = await store.get_order("O-G")
+    assert refreshed.trade_group_id == 42
+    assert refreshed.signal_id == "sig-x"

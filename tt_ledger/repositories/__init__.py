@@ -235,6 +235,14 @@ class OrderRepository(_Repo):
 
         return OrderRow(
             tt_order_id=po.id, account=account, origin=Origin.BROKER, ingest=Ingest.ORDER_HISTORY,
+            # a re-synced broker row refreshes broker facts but must not wipe what reconcile /
+            # the host stamped on it (group linkage, correlation) -- mirrors the transactions
+            # table's preserve-if-null linkage columns
+            oms_order_id=(existing.oms_order_id if existing else None),
+            trade_group_id=(existing.trade_group_id if existing else None),
+            signal_id=(existing.signal_id if existing else None),
+            trace_id=(existing.trace_id if existing else None),
+            strategy_id=(existing.strategy_id if existing else None),
             security_id=security_id, underlying=po.underlying_symbol,
             order_type=po.order_type, time_in_force=po.time_in_force, gtc_date=po.gtc_date,
             price=po.price, stop_trigger=po.stop_trigger, price_effect=po.price_effect,
