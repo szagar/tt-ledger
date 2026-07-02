@@ -319,6 +319,7 @@ class OrderInput:
 
     account: str
     tt_order_id: str | None = None
+    oms_order_id: str | None = None  # the host OMS's own order id, for cross-referencing
     security_id: str | None = None
     underlying: str | None = None
     order_type: str | None = None

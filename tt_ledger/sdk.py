@@ -112,6 +112,7 @@ class LedgerClient:
                 raise ValueError(f"unknown trade_group {order.trade_group!r} -- open_trade_group() first")
         row = OrderRow(
             tt_order_id=order.tt_order_id, account=order.account, origin=Origin.ZTS, ingest=Ingest.OMS_SUBMIT,
+            oms_order_id=order.oms_order_id,
             security_id=order.security_id, underlying=order.underlying,
             order_type=order.order_type, time_in_force=order.time_in_force,
             price=order.price, price_effect=order.price_effect,
