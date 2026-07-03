@@ -110,6 +110,31 @@ async def test_entry_fills_attach_to_the_intent_group_not_a_new_one(client, stor
     assert refreshed.strategy_type == "single"        # submit-time intent preserved
 
 
+async def test_structure_descriptor_round_trips_and_survives_reconcile(client, store, accounts):
+    structure = {
+        "legs": [{"action": "Sell to Open", "security_id": "option:SPY:2026-01-16:put:580"}],
+        "expiry": "2026-01-16",
+        "dte": 11,
+    }
+    trade = await client.open_trade_group(
+        "main", strategy_type="single", underlying="SPY", structure=structure,
+    )
+    assert trade.structure == structure
+
+    await client.record_order(
+        OrderInput(account="main", tt_order_id="O-1", underlying="SPY", trade_group=trade.group_id)
+    )
+    broker = MockTastyTradeClient()
+    _fill(broker, order_id="O-1", action="Sell to Open", net_value="250", executed_at=T0)
+    await _sync(store, accounts, broker)
+
+    await reconcile(store, "main")  # financial refresh must not clobber the descriptor
+
+    trades = await store.unified_trades(TradeFilter(account="main"))
+    assert len(trades) == 1
+    assert trades[0].structure == structure
+
+
 async def test_exit_fills_close_the_intent_group_with_events(client, store, accounts):
     trade = await client.open_trade_group("main", strategy_type="single", underlying="SPY")
     await client.record_order(

@@ -279,6 +279,28 @@ async def test_trade_group_lifecycle_and_events(seeded):
     assert await store.get_trade_group("does-not-exist") is None
 
 
+async def test_trade_group_structure_json_round_trips(seeded):
+    store = seeded
+    structure = {
+        "legs": [
+            {"action": "Sell to Open", "security_id": "option:SPXW:2026-02-03:put:6830", "strike": "6830"},
+            {"action": "Buy to Open", "security_id": "option:SPXW:2026-02-03:put:6810", "strike": "6810"},
+        ],
+        "expiry": "2026-02-03",
+        "dte": 1,
+    }
+    await store.upsert_trade_group(
+        TradeGroupRow(group_id="GRP-S", account="main", origin=Origin.ZTS, structure=structure)
+    )
+    fetched = await store.get_trade_group("GRP-S")
+    assert fetched.structure == structure
+
+    # an upsert that doesn't carry structure=None-away: replace() keeps the loaded value
+    await store.upsert_trade_group(replace(fetched, realized_pnl=Decimal("10")))
+    fetched = await store.get_trade_group("GRP-S")
+    assert fetched.structure == structure
+
+
 async def test_unified_trades_filters_by_origin_and_review_status(seeded):
     store = seeded
     await store.upsert_trade_group(TradeGroupRow(group_id="GRP-A", account="main", origin=Origin.BROKER, underlying="/ES"))

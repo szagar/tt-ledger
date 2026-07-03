@@ -237,6 +237,10 @@ class TradeGroup(Base):
     profit_target: Mapped[str | None] = mapped_column(String(32), nullable=True)
     stop_loss: Mapped[str | None] = mapped_column(String(32), nullable=True)
     exit_strategy: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Submit-time structure descriptor (host-written, e.g. legs/strikes/expiry/dte/width) —
+    # opaque to the ledger; reconcile never touches it (intent groups are updated via
+    # dataclasses.replace on the loaded row, so it survives financial refreshes).
+    structure: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
     strategy_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)  # soft ref
     bot_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

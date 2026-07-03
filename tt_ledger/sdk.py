@@ -141,6 +141,7 @@ class LedgerClient:
         profit_target: str | None = None,
         stop_loss: str | None = None,
         exit_strategy: str | None = None,
+        structure: dict | None = None,
         strategy_id: int | None = None,
         bot: str | None = None,
         signal: str | None = None,
@@ -150,7 +151,9 @@ class LedgerClient:
         strategy type, planned risk) exists. The group is ``origin=zts``, ``confirmed``, and
         ``manually_attributed`` (intent beats reconcile's clustering heuristics); pass its
         ``group_id`` to ``record_order(trade_group=...)`` so fills attach to it. Financials
-        (premium/fees/quantity) are refined from actual fills by reconcile."""
+        (premium/fees/quantity) are refined from actual fills by reconcile. ``structure`` is
+        an opaque host-written descriptor of the traded structure (legs/strikes/expiry/...);
+        the ledger stores it verbatim and never derives from or mutates it."""
         await ensure_account(self._store, self._accounts, account, self._ensured_accounts)
         now = datetime.now(UTC)
         row = TradeGroupRow(
@@ -161,6 +164,7 @@ class LedgerClient:
             total_premium=total_premium, quantity=quantity,
             max_profit=max_profit, max_loss=max_loss,
             profit_target=profit_target, stop_loss=stop_loss, exit_strategy=exit_strategy,
+            structure=structure,
             strategy_id=strategy_id, bot_name=bot, signal_id=signal,
             executed_at=now,
         )

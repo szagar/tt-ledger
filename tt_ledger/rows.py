@@ -230,6 +230,7 @@ class TradeGroupRow:
     profit_target: str | None = None
     stop_loss: str | None = None
     exit_strategy: str | None = None
+    structure: dict | None = None  # host-written submit-time structure descriptor (opaque JSON)
     order_id: int | None = None
     strategy_id: int | None = None
     bot_name: str | None = None
@@ -277,6 +278,7 @@ class TradeRow:
     unrealized_pnl: Decimal | None = None
     max_profit: Decimal | None = None
     max_loss: Decimal | None = None
+    structure: dict | None = None  # host-written submit-time structure descriptor (opaque JSON)
     order_id: int | None = None
     strategy_id: int | None = None
     bot_name: str | None = None

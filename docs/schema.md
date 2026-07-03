@@ -86,8 +86,9 @@ R-multiples) (Money) · `opening_order_id` / `closing_order_id` / `trade_group_i
 `underlying` / `security_id` · `strategy_type` · `leg_count` · `total_premium` / `quantity` /
 `total_fees` (Money) · `status` (open|closed|expired|assigned|exercised|mixed) · `realized_pnl` /
 `unrealized_pnl` / `max_profit` / `max_loss` (Money) · `profit_target` / `stop_loss` / `exit_strategy`
-· `order_id` / `strategy_id` (FK) · `bot_name` / `signal_id` · `executed_at` / `closed_at` /
-`created_at` / `updated_at`.
+· `structure` (JSON — opaque host-written submit-time structure descriptor: legs/strikes/expiry/…;
+never derived from or mutated by the ledger) · `order_id` / `strategy_id` (FK) · `bot_name` /
+`signal_id` · `executed_at` / `closed_at` / `created_at` / `updated_at`.
 
 ### trade_group_events
 `id` PK · `trade_group_id` FK · `event_type` · `quantity_change` / `premium_change` / `realized_pnl`
