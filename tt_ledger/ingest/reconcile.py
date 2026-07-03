@@ -77,12 +77,54 @@ _STATUS_BY_EVENT = {
 }
 
 
+_BARE_ACTIONS = {"Buy", "Sell"}  # futures trade without open/close intent -- direction from context
+
+
 def _is_nontrade_close(row) -> bool:  # noqa: ANN001 -- ActivityRow | TxnRow (duck-typed)
     return row.transaction_type == "Receive Deliver" and row.transaction_sub_type in _RD_EVENT_BY_SUBTYPE
 
 
+def _is_delivery(row) -> bool:  # noqa: ANN001
+    """A Receive Deliver row with a trade-like action: the position leg of an option
+    assignment/exercise (the delivered future/shares), or an ACAT-style transfer. Carries no
+    order-id, so it must be admitted as a candidate on its own shape."""
+    return (
+        row.transaction_type == "Receive Deliver"
+        and row.action in (_OPENING_ACTIONS | _CLOSING_ACTIONS | _BARE_ACTIONS)
+    )
+
+
 def _is_closing(row) -> bool:  # noqa: ANN001
     return row.action in _CLOSING_ACTIONS or _is_nontrade_close(row)
+
+
+def _action_delta(row) -> Decimal:  # noqa: ANN001
+    """Signed position delta of a trade-like row (buys +, sells -)."""
+    qty = abs(row.quantity or Decimal("0"))
+    return -qty if (row.action or "").strip().lower().startswith("sell") else qty
+
+
+def _net_quantities(rows: list) -> dict[str, Decimal]:
+    """Net signed position per security from a group's member rows, walked in time order:
+    trade-like rows apply their action-signed delta; settlement rows (no action) offset the
+    running net toward zero; cash-only rows are ignored."""
+    ordered = sorted(
+        (r for r in rows if r.security_id and r.quantity is not None),
+        key=lambda r: (r.executed_at is None, r.executed_at),
+    )
+    net: dict[str, Decimal] = {}
+    for r in ordered:
+        if getattr(r, "transaction_type", None) == "Money Movement":
+            continue
+        current = net.get(r.security_id, Decimal("0"))
+        if _is_nontrade_close(r):
+            if current == 0:
+                continue
+            qty = min(abs(r.quantity), abs(current))
+            net[r.security_id] = current - qty if current > 0 else current + qty
+        elif r.action:
+            net[r.security_id] = current + _action_delta(r)
+    return net
 
 
 def _is_opening(row) -> bool:  # noqa: ANN001
@@ -124,7 +166,8 @@ async def reconcile(
             activity = await store.account_activity(ActivityFilter(account=acct, start=since))
             candidates = [
                 a for a in activity
-                if a.trade_group_id is None and (a.order_id is not None or _is_nontrade_close(a))
+                if a.trade_group_id is None
+                and (a.order_id is not None or _is_nontrade_close(a) or _is_delivery(a))
             ]
 
             open_groups = await _load_open_groups(store, acct)
@@ -149,7 +192,16 @@ async def reconcile(
                     for group, rows in buckets:
                         # closes + opens in ONE cluster against the same underlying = a roll
                         rolled_to = new_pk if new_pk is not None and _same_underlying(rows, rest) else None
-                        applied = await _apply_exit(store, group, rows, rolled_to_pk=rolled_to)
+                        # an assignment/exercise whose delivered position (the option's
+                        # underlying) landed in the rest-created group gets a continuation link
+                        delivery = (
+                            new_pk
+                            if new_pk is not None and await _delivers_underlying(store, rows, rest)
+                            else None
+                        )
+                        applied = await _apply_exit(
+                            store, group, rows, rolled_to_pk=rolled_to, delivery_pk=delivery,
+                        )
                         exits.append(applied)
                         if applied.fully_closed:
                             open_groups.remove(group)
@@ -307,8 +359,21 @@ def _route_cluster(
     rest: list["ActivityRow"] = []
     for row in cluster:
         group = None
-        if _is_closing(row) and row.security_id is not None:
-            group = next((g for g in open_groups if row.security_id in g.security_ids()), None)
+        if row.security_id is not None:
+            if _is_closing(row):
+                group = next((g for g in open_groups if row.security_id in g.security_ids()), None)
+            elif row.action in _BARE_ACTIONS:
+                # a bare futures Buy/Sell closes when an open group holds the OPPOSITE
+                # position in that security (e.g. covering an assignment-delivered short);
+                # same-sign or no holder -> it opens/extends nothing here, falls to rest.
+                delta = _action_delta(row)
+                group = next(
+                    (
+                        g for g in open_groups
+                        if (net := _net_quantities(g.rows).get(row.security_id)) and net * delta < 0
+                    ),
+                    None,
+                )
         if group is None:
             rest.append(row)
             continue
@@ -321,29 +386,83 @@ def _route_cluster(
 
 
 def _fully_closed(rows: list) -> bool:
-    """Every security the group opened has been offset by at least as much closing quantity."""
-    opened: dict[str, Decimal] = {}
-    closed: dict[str, Decimal] = {}
-    for r in rows:
-        if r.security_id is None or r.quantity is None:
-            continue
-        if _is_opening(r):
-            opened[r.security_id] = opened.get(r.security_id, Decimal("0")) + abs(r.quantity)
-        elif _is_closing(r):
-            closed[r.security_id] = closed.get(r.security_id, Decimal("0")) + abs(r.quantity)
-    if not opened:
+    """Every security the group traded has netted back to zero (signed walk -- so bare futures
+    Buy/Sell round-trips and assignment deliveries count, not just ``* to Open/Close`` pairs).
+    A group whose only activity is unmatched closes (window artifacts) is NOT "fully closed" --
+    it never opened."""
+    net = _net_quantities(rows)
+    if not net:
         return False
-    return all(closed.get(sec, Decimal("0")) >= qty for sec, qty in opened.items())
+    opened_something = any(_is_opening(r) or r.action in _BARE_ACTIONS for r in rows)
+    return opened_something and all(qty == 0 for qty in net.values())
 
 
 def _close_causes(rows: list) -> "set[TradeGroupStatus]":
     causes: set[TradeGroupStatus] = set()
+    net = _net_quantities(rows)
     for r in rows:
         if r.action in _CLOSING_ACTIONS:
             causes.add(TradeGroupStatus.CLOSED)
         elif _is_nontrade_close(r):
             causes.add(_STATUS_BY_EVENT[_RD_EVENT_BY_SUBTYPE[r.transaction_sub_type]])
+        elif r.action in _BARE_ACTIONS and r.security_id and net.get(r.security_id) == 0:
+            # a bare Buy/Sell that participated in a flattened security acted as a close
+            causes.add(TradeGroupStatus.CLOSED)
     return causes
+
+
+def _norm_underlying(value: str | None) -> str | None:
+    """TT underlying-symbol variants -> a comparable root: "/ESM6" and "/ES" both -> "ES..."
+    prefixes; comparison is prefix-based within one execution cluster, where a same-instant
+    delivery is essentially always the assignment's consequence."""
+    if not value:
+        return None
+    return value.lstrip("/").strip().upper() or None
+
+
+def _roots_relate(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
+async def _delivers_underlying(store: "LedgerStore", close_rows: list, rest_rows: list) -> bool:
+    """True when an assignment/exercise in ``close_rows`` delivered a position now sitting in
+    ``rest_rows``. Matched through the securities dimension when the resolver decomposed
+    underlyings; falls back to the transactions' own (normalized) underlying symbols --
+    TT writes the option's as the dated contract ("/ESM6") and the delivery's as the product
+    root ("/ES")."""
+    assigned = [
+        r for r in close_rows
+        if _is_nontrade_close(r)
+        and _RD_EVENT_BY_SUBTYPE.get(r.transaction_sub_type)
+        in (TradeGroupEventType.ASSIGNMENT, TradeGroupEventType.EXERCISE)
+    ]
+    deliveries = [r for r in rest_rows if _is_delivery(r)]
+    if not assigned or not deliveries:
+        return False
+
+    async def sec_underlying(security_id: str | None) -> str | None:
+        if not security_id:
+            return None
+        sec = await store.get_security(security_id)
+        return sec.underlying if sec is not None else None
+
+    assigned_sec_unders = {u for r in assigned if (u := await sec_underlying(r.security_id))}
+    assigned_txn_unders = {u for r in assigned if (u := _norm_underlying(r.underlying))}
+    for r in deliveries:
+        delivered = await store.get_security(r.security_id) if r.security_id else None
+        if delivered is not None and assigned_sec_unders and (
+            delivered.underlying in assigned_sec_unders
+            or delivered.security_id in assigned_sec_unders
+        ):
+            return True
+        delivered_under = _norm_underlying(r.underlying) or _norm_underlying(
+            delivered.underlying if delivered is not None else None
+        )
+        if any(_roots_relate(delivered_under, a) for a in assigned_txn_unders):
+            return True
+    return False
 
 
 def _same_underlying(close_rows: list, open_rows: list) -> bool:
@@ -353,10 +472,13 @@ def _same_underlying(close_rows: list, open_rows: list) -> bool:
 
 
 async def _apply_exit(
-    store: "LedgerStore", group: "_OpenGroup", rows: "list[ActivityRow]", *, rolled_to_pk: int | None,
+    store: "LedgerStore", group: "_OpenGroup", rows: "list[ActivityRow]", *,
+    rolled_to_pk: int | None, delivery_pk: int | None = None,
 ) -> "_AppliedExit":
     """Attach closing rows to their open group, emit lifecycle events, and flip the group's
-    status (+ cash-basis realized_pnl) once fully offset."""
+    status (+ cash-basis realized_pnl) once fully offset. ``delivery_pk`` links an
+    assignment/exercise event to the group holding the position it delivered (the option's
+    underlying future/shares) -- the same continuation edge rolls use."""
     await store.attach_transactions_to_trade_group([r.tt_transaction_id for r in rows], group.pk)
     group.rows.extend(rows)
 
@@ -364,7 +486,8 @@ async def _apply_exit(
     event_ats = [r.executed_at for r in rows if r.executed_at is not None]
     event_at = max(event_ats) if event_ats else None
 
-    trade_rows = [r for r in rows if r.action in _CLOSING_ACTIONS]
+    # every routed-as-close trade row: explicit "* to Close" plus bare futures Buy/Sell
+    trade_rows = [r for r in rows if r.action in _CLOSING_ACTIONS or r.action in _BARE_ACTIONS]
     if trade_rows:
         event_type = TradeGroupEventType.FULL_EXIT if fully_closed else TradeGroupEventType.PARTIAL_EXIT
         await store.add_trade_group_event(
@@ -382,12 +505,17 @@ async def _apply_exit(
             rd_rows_by_event.setdefault(_RD_EVENT_BY_SUBTYPE[r.transaction_sub_type], []).append(r)
     for event_type, rd_rows in rd_rows_by_event.items():
         rd_ats = [r.executed_at for r in rd_rows if r.executed_at is not None]
+        links_delivery = (
+            delivery_pk is not None
+            and event_type in (TradeGroupEventType.ASSIGNMENT, TradeGroupEventType.EXERCISE)
+        )
         await store.add_trade_group_event(
             EventRow(
                 trade_group_id=group.pk, event_type=event_type.value,
                 quantity_change=-sum(abs(r.quantity) for r in rd_rows if r.quantity is not None),
                 premium_change=sum((_signed_net(r) for r in rd_rows), Decimal("0")),
                 event_at=max(rd_ats) if rd_ats else event_at,
+                rolled_to_group_id=(delivery_pk if links_delivery else None),
             )
         )
 

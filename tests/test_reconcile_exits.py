@@ -15,7 +15,7 @@ import pytest
 
 from tt_ledger.enums import TradeGroupEventType, TradeGroupStatus
 from tt_ledger.identity import AccountMapper, PassthroughResolver
-from tt_ledger.ingest.broker import BrokerTransaction
+from tt_ledger.ingest.broker import BrokerTransaction, PlacedLeg, PlacedOrder
 from tt_ledger.ingest.mock_broker import MockTastyTradeClient
 from tt_ledger.ingest.pull import sync_orders, sync_transactions
 from tt_ledger.ingest.reconcile import reconcile
@@ -253,3 +253,59 @@ async def test_reconcile_is_idempotent_over_exits(store, accounts, resolver):
     assert len(trades) == 1
     events = await _events(store, trades[0].group_id)
     assert len(events) == 2  # ENTRY + FULL_EXIT, not duplicated
+
+
+# --------------------------------------------------------------------- assignment deliveries
+
+
+async def test_assignment_delivery_forms_linked_group_and_bare_cover_closes_it(store, accounts, resolver):
+    """The trade-550 shape from the live rehearsal: a short call is assigned, delivering a
+    short future (Receive Deliver / Sell to Open, no order id); the next day a bare
+    Trade/Buy covers it. The delivery must form its own group, CONTINUATION-LINKED from the
+    option group's assignment event (rolled_to_group_id), and the bare cover must close the
+    delivery group with real P&L -- not open a third phantom group."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="500", executed_at=T0)
+    # assignment settles the option and delivers the underlying at the same instant
+    _receive_deliver(client, txn_id="RD-A", symbol=PUT_A, sub_type="Assignment", quantity="1",
+                     net_value="-0.44", executed_at=T0 + timedelta(days=6), underlying="/ESM6")
+    client.add_transaction(BrokerTransaction(
+        id="RD-DLV", account_number="ACCT1", symbol="/ESM6", instrument_type="Future",
+        underlying_symbol="/ES", transaction_type="Receive Deliver", transaction_sub_type="Sell to Open",
+        action="Sell to Open", quantity=Decimal("1"), price=Decimal("7350"),
+        executed_at=T0 + timedelta(days=6), transaction_date=(T0 + timedelta(days=6)).date(),
+    ))
+    # bare futures Buy covers the delivered short the next day
+    client.add_transaction(BrokerTransaction(
+        id="TXN-COVER", account_number="ACCT1", order_id="O-2", symbol="/ESM6",
+        instrument_type="Future", underlying_symbol="/ES", transaction_type="Trade",
+        transaction_sub_type="Buy", action="Buy", quantity=Decimal("1"), price=Decimal("7421.25"),
+        net_value=Decimal("-3562.50"), net_value_effect=None,
+        executed_at=T0 + timedelta(days=7), transaction_date=(T0 + timedelta(days=7)).date(),
+    ))
+    client.add_order(PlacedOrder(
+        id="O-2", account_number="ACCT1", received_at=T0 + timedelta(days=7),
+        underlying_symbol="/ES", status="Filled", terminal_at=T0 + timedelta(days=7),
+        legs=[PlacedLeg(instrument_type="Future", symbol="/ESM6", action="Buy",
+                        quantity=Decimal("1"), remaining_quantity=Decimal("0"))],
+    ))
+
+    await _sync_and_reconcile(store, accounts, resolver, client)
+
+    trades = sorted(await _trades(store), key=lambda t: t.executed_at)
+    assert len(trades) == 2, [t.underlying for t in trades]
+    option_group, future_group = trades
+
+    # option group: assigned, with the continuation link on its assignment event
+    assert option_group.status == TradeGroupStatus.ASSIGNED.value
+    option_events = await _events(store, option_group.group_id)
+    assignment = next(e for e in option_events if e.event_type == TradeGroupEventType.ASSIGNMENT.value)
+    future_pk = await store.get_trade_group_id(future_group.group_id)
+    assert assignment.rolled_to_group_id == future_pk
+
+    # delivery group: closed by the bare cover, cash-basis P&L booked
+    assert future_group.status == TradeGroupStatus.CLOSED.value
+    assert future_group.realized_pnl == Decimal("-3562.50")
+    future_events = await _events(store, future_group.group_id)
+    assert TradeGroupEventType.FULL_EXIT.value in [e.event_type for e in future_events]
