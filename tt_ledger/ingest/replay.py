@@ -43,7 +43,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import replace as replace_dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -86,11 +87,20 @@ async def _rebuild_for_account(store: "LedgerStore", account: str) -> int:
             continue  # cash-only movement (fee, transfer, dividend paid in cash) -- no position effect
         by_security.setdefault(row.security_id, []).append(row)
 
+    # deterministic "now" for lapse detection: the account's own latest activity, never wall-clock
+    last_activity = max((r.executed_at for rows in by_security.values() for r in rows), default=None)
+
     for security_id, rows in by_security.items():
         rows.sort(key=lambda r: (r.executed_at, _closes_last(r)))
         multiplier = await _multiplier_of(store, security_id)
+        sec = await store.get_security(security_id)
         existing = await store.get_position(account, security_id)
         position_row, plan = _replay_security(account, security_id, rows, multiplier, existing)
+        position_row, plan = _lapse_expired_lot(
+            account, security_id, position_row, plan,
+            expiry=(sec.expiry if sec is not None else None),
+            multiplier=multiplier, last_activity=last_activity,
+        )
 
         await store.upsert_positions([position_row])
         position_id = await store.get_position_id(account, security_id)
@@ -102,6 +112,55 @@ async def _rebuild_for_account(store: "LedgerStore", account: str) -> int:
         await store.link_transactions_to_positions(links)
 
     return len(by_security)
+
+
+def _lapse_expired_lot(
+    account: str, security_id: str, position_row: "PositionRow",
+    plan: "list[tuple[str, bool, ClosedPositionRow | None]]", *,
+    expiry, multiplier: int, last_activity,
+):  # noqa: ANN001, ANN201
+    """Close a still-open option lot whose contract expired without a matching settlement row.
+
+    Corporate actions (OCC strike adjustments -- e.g. QQQ's 2024 $0.22 special distribution)
+    re-symbol a contract, so its Receive Deliver settlement arrives under a DIFFERENT
+    security_id and never offsets the original lot; the phantom stays "open" forever. Once
+    the account has activity a full day past the contract's expiry, the lot definitionally
+    lapsed: close it at 0 (the cash effect, if any, lives under the adjusted symbol's own
+    rows). Determinism: measured against the account's latest transaction, never wall-clock.
+    """
+    if (
+        expiry is None
+        or last_activity is None
+        or position_row.quantity == 0
+        or last_activity.date() <= expiry + timedelta(days=1)
+    ):
+        return position_row, plan
+
+    lapsed_at = datetime.combine(expiry, datetime.min.time(), tzinfo=UTC).replace(hour=21, minute=15)
+    opened_at = position_row.position_opened_at
+    if opened_at is not None and opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=UTC)  # SQLite round-trips DateTime(timezone=True) naive
+    sign = Decimal(1) if position_row.quantity_direction == "Long" else Decimal(-1)
+    gross = (Decimal("0") - (position_row.average_open_price or Decimal("0"))) \
+        * position_row.quantity * multiplier * sign
+    closed = ClosedPositionRow(
+        account=account, security_id=security_id,
+        quantity=position_row.quantity, quantity_direction=position_row.quantity_direction,
+        average_open_price=position_row.average_open_price, average_close_price=Decimal("0"),
+        realized_pnl=gross, fees=Decimal("0"), pnl_net=gross,
+        opening_order_id=position_row.opening_order_id,
+        opened_at=opened_at, closed_at=lapsed_at,
+        holding_period_days=_holding_period(opened_at, lapsed_at),
+    )
+    logger.info(
+        "lapsed expired option lot with no settlement row: %s %s x%s (expiry %s)",
+        account, security_id, position_row.quantity, expiry,
+    )
+    flattened = replace_dataclass(
+        position_row, quantity=Decimal("0"),
+        average_open_price=None, opening_order_id=None, position_opened_at=None,
+    )
+    return flattened, [*plan, (f"__lapsed__{security_id}", False, closed)]
 
 
 async def _multiplier_of(store: "LedgerStore", security_id: str) -> int:

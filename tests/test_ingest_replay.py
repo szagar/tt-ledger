@@ -623,3 +623,105 @@ async def test_resolver_multiplier_reaches_replay_pnl(store_url):
         assert closed[0].realized_pnl == Decimal("-3562.50")  # (7350 - 7421.25) x 1 x 50
     finally:
         await store.dispose()
+
+
+async def test_expired_option_lot_with_no_settlement_row_lapses(store_url):
+    """Regression: OCC strike adjustments (QQQ 2024 special distribution) re-symbol a contract,
+    so its settlement arrives under a DIFFERENT security_id and the original lot stayed 'open'
+    forever. Once account activity moves a day past expiry, the lot lapses closed at 0."""
+    from datetime import date as date_cls
+
+    from tt_ledger.identity import AccountMapper
+    from tt_ledger.identity.securities import ResolvedSecurity
+    from tt_ledger.ingest.broker import BrokerTransaction
+    from tt_ledger.ingest.mock_broker import MockTastyTradeClient
+    from tt_ledger.ingest.pull import sync_transactions
+    from tt_ledger.ingest.replay import rebuild_positions_from_transactions
+    from tt_ledger.rows import AccountRow
+    from tt_ledger.schema import metadata
+    from tt_ledger.store.sql import SqlLedgerStore
+
+    class OptionResolver:
+        def resolve(self, vendor_symbol, instrument_type=None):
+            expiry = date_cls(2024, 1, 5) if "OPT" in vendor_symbol else None
+            return ResolvedSecurity(
+                security_id=vendor_symbol, product_type="OS" if expiry else "S",
+                expiry=expiry, multiplier=100 if expiry else 1,
+            )
+
+    store = SqlLedgerStore(store_url)
+    async with store._engine.begin() as conn:
+        await conn.run_sync(metadata.drop_all)
+    await store.create_all()
+    try:
+        await store.upsert_account(AccountRow(nickname="main", account_number="ACCT1", login="u"))
+        accounts = AccountMapper({"main": "ACCT1"})
+        client = MockTastyTradeClient()
+        client.add_transaction(BrokerTransaction(
+            id="T-OPEN", account_number="ACCT1", symbol="OPT-QQQ-411", instrument_type="Equity Option",
+            transaction_type="Trade", action="Buy to Open", quantity=Decimal("1"),
+            price=Decimal("2.50"), executed_at=datetime(2024, 1, 2, tzinfo=UTC),
+            transaction_date=date_cls(2024, 1, 2),
+        ))
+        # unrelated later activity establishes the account's clock PAST the option's expiry
+        client.add_transaction(BrokerTransaction(
+            id="T-LATER", account_number="ACCT1", symbol="AAPL", instrument_type="Equity",
+            transaction_type="Trade", action="Buy", quantity=Decimal("1"),
+            price=Decimal("190"), executed_at=datetime(2024, 2, 1, tzinfo=UTC),
+            transaction_date=date_cls(2024, 2, 1),
+        ))
+        await sync_transactions(store, "main", client=client, accounts=accounts, resolver=OptionResolver())
+        await rebuild_positions_from_transactions(store, "main")
+
+        pos = await store.get_position("main", "OPT-QQQ-411")
+        assert pos is not None and pos.quantity == Decimal("0")
+        closed = await store.get_closed_positions("main", "OPT-QQQ-411")
+        assert len(closed) == 1
+        assert closed[0].average_close_price == Decimal("0")
+        assert closed[0].realized_pnl == Decimal("-250")  # paid 2.50 x 100, lapsed worthless
+        assert closed[0].closed_at.date() == date_cls(2024, 1, 5)
+    finally:
+        await store.dispose()
+
+
+async def test_open_option_lot_before_expiry_does_not_lapse(store_url):
+    from datetime import date as date_cls
+
+    from tt_ledger.identity import AccountMapper
+    from tt_ledger.identity.securities import ResolvedSecurity
+    from tt_ledger.ingest.broker import BrokerTransaction
+    from tt_ledger.ingest.mock_broker import MockTastyTradeClient
+    from tt_ledger.ingest.pull import sync_transactions
+    from tt_ledger.ingest.replay import rebuild_positions_from_transactions
+    from tt_ledger.rows import AccountRow
+    from tt_ledger.schema import metadata
+    from tt_ledger.store.sql import SqlLedgerStore
+
+    class OptionResolver:
+        def resolve(self, vendor_symbol, instrument_type=None):
+            return ResolvedSecurity(
+                security_id=vendor_symbol, product_type="OS",
+                expiry=date_cls(2024, 3, 15), multiplier=100,
+            )
+
+    store = SqlLedgerStore(store_url)
+    async with store._engine.begin() as conn:
+        await conn.run_sync(metadata.drop_all)
+    await store.create_all()
+    try:
+        await store.upsert_account(AccountRow(nickname="main", account_number="ACCT1", login="u"))
+        accounts = AccountMapper({"main": "ACCT1"})
+        client = MockTastyTradeClient()
+        client.add_transaction(BrokerTransaction(
+            id="T-OPEN", account_number="ACCT1", symbol="OPT-LIVE", instrument_type="Equity Option",
+            transaction_type="Trade", action="Buy to Open", quantity=Decimal("1"),
+            price=Decimal("2.50"), executed_at=datetime(2024, 1, 2, tzinfo=UTC),
+            transaction_date=date_cls(2024, 1, 2),
+        ))
+        await sync_transactions(store, "main", client=client, accounts=accounts, resolver=OptionResolver())
+        await rebuild_positions_from_transactions(store, "main")
+
+        pos = await store.get_position("main", "OPT-LIVE")
+        assert pos is not None and pos.quantity == Decimal("1")  # still open, expiry not lapsed
+    finally:
+        await store.dispose()
