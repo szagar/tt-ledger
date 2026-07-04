@@ -294,6 +294,61 @@ def trade_group_to_row(tg: TradeGroupRow) -> TradeRow:
 
 
 @dataclass
+class LegDetailRow:
+    """A stored order_legs row WITH its surrogate id (fills join on ``order_leg_id``) — the read
+    twin of the write-side ``LegRow``, which deliberately omits ``id`` (the store owns it)."""
+
+    id: int
+    order_id: int
+    leg_index: int
+    security_id: str
+    action: str | None = None
+    quantity: Decimal | None = None
+    remaining_quantity: Decimal | None = None
+    quantity_direction: str | None = None
+    price: Decimal | None = None
+    fill_price: Decimal | None = None
+
+
+@dataclass
+class OrderDetail:
+    """One order of a trade group with its legs + fills — ``trade_structure()``'s read shape.
+    ``fills`` is flat (each ``FillRow`` carries ``order_leg_id`` matching a leg's ``id``): fills
+    from the stream path may not be leg-attributed, so nesting them under legs would drop them."""
+
+    order_pk: int
+    order: OrderRow
+    legs: list["LegDetailRow"] = field(default_factory=list)
+    fills: list[FillRow] = field(default_factory=list)
+
+
+@dataclass
+class TransactionDetailRow:
+    """A transactions row WITH its surrogate id + the joined order's correlation ids — the
+    paged read shape for host transaction views (``LedgerClient.transactions``)."""
+
+    id: int
+    tt_transaction_id: str
+    account: str
+    transaction_type: str | None = None
+    transaction_sub_type: str | None = None
+    action: str | None = None
+    description: str | None = None
+    security_id: str | None = None
+    underlying: str | None = None
+    quantity: Decimal | None = None
+    price: Decimal | None = None
+    net_value: Decimal | None = None
+    net_value_effect: str | None = None  # "Credit" | "Debit" | "None" -- net_value is a magnitude
+    commission: Decimal | None = None
+    executed_at: datetime | None = None
+    order_id: int | None = None
+    tt_order_id: str | None = None
+    trade_group_id: int | None = None
+    signal_id: str | None = None  # from the joined order; None when unreconciled/broker-origin
+
+
+@dataclass
 class ActivityRow:
     """A row of v_account_activity (transaction joined to order + trade_group)."""
 
@@ -392,6 +447,22 @@ class ActivityFilter:
     start: date | None = None
     end: date | None = None
     unreconciled_only: bool = False
+
+
+@dataclass
+class TransactionQuery:
+    """Paged transactions read (``query_transactions``). Ordered newest-first
+    (``executed_at DESC, id DESC``); ``accounts`` scopes to a nickname set (host scope filters)."""
+
+    account: str | None = None
+    accounts: list[str] | None = None
+    start: date | None = None
+    end: date | None = None
+    underlying: str | None = None
+    transaction_type: str | None = None
+    trade_group_id: int | None = None
+    limit: int = 100
+    offset: int = 0
 
 
 @dataclass

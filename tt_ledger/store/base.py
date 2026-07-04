@@ -17,6 +17,7 @@ from ..rows import (
     ClosedPositionRow,
     EventRow,
     FillRow,
+    LegDetailRow,
     LegRow,
     OrderFilter,
     OrderRow,
@@ -25,6 +26,8 @@ from ..rows import (
     TradeFilter,
     TradeGroupRow,
     TradeRow,
+    TransactionDetailRow,
+    TransactionQuery,
     TxnRow,
 )
 
@@ -74,3 +77,10 @@ class LedgerStore(Protocol):
     async def query_orders(self, f: OrderFilter) -> list[OrderRow]: ...
     async def unified_trades(self, f: TradeFilter) -> list[TradeRow]: ...
     async def account_activity(self, f: ActivityFilter) -> list[ActivityRow]: ...
+
+    # --- reads (order structure + paged transactions -- host UI drill-downs) ---
+    async def get_group_orders_with_ids(self, trade_group_id: int) -> list[tuple[int, OrderRow]]: ...
+    async def get_legs_for_orders(self, order_ids: list[int]) -> list[LegDetailRow]: ...
+    async def get_fills_for_orders(self, order_ids: list[int]) -> list[FillRow]: ...
+    async def query_transactions(self, q: TransactionQuery) -> tuple[list[TransactionDetailRow], int]: ...
+    async def get_open_position_groups(self, account: str | None = None) -> list[tuple[str, str, int]]: ...

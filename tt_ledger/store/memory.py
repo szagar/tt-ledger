@@ -22,6 +22,7 @@ from ..rows import (
     ClosedPositionRow,
     EventRow,
     FillRow,
+    LegDetailRow,
     LegRow,
     OrderFilter,
     OrderRow,
@@ -30,6 +31,8 @@ from ..rows import (
     TradeFilter,
     TradeGroupRow,
     TradeRow,
+    TransactionDetailRow,
+    TransactionQuery,
     TxnRow,
 )
 
@@ -314,6 +317,78 @@ class InMemoryStore:
                 continue
             out.append(_project(tg, TradeRow))
         return out
+
+    async def get_group_orders_with_ids(self, trade_group_id: int) -> list[tuple[int, OrderRow]]:
+        rows = [
+            (row_id, row) for row_id, row in self._orders.all() if row.trade_group_id == trade_group_id
+        ]
+        rows.sort(key=lambda pair: (pair[1].received_at is None, pair[1].received_at, pair[0]))
+        return rows
+
+    async def get_legs_for_orders(self, order_ids: list[int]) -> list[LegDetailRow]:
+        wanted = set(order_ids)
+        rows = [
+            _project(leg, LegDetailRow, id=row_id)
+            for row_id, leg in self._legs.all()
+            if leg.order_id in wanted
+        ]
+        return sorted(rows, key=lambda r: (r.order_id, r.leg_index))
+
+    async def get_fills_for_orders(self, order_ids: list[int]) -> list[FillRow]:
+        wanted = set(order_ids)
+        rows = [
+            (row_id, fill) for row_id, fill in self._fills.all() if fill.order_id in wanted
+        ]
+        rows.sort(key=lambda pair: (pair[1].filled_at is None, pair[1].filled_at, pair[0]))
+        return [fill for _, fill in rows]
+
+    async def query_transactions(self, q: TransactionQuery) -> tuple[list[TransactionDetailRow], int]:
+        matched: list[tuple[int, TxnRow]] = []
+        for row_id, txn in self._transactions.all():
+            if q.account is not None and txn.account != q.account:
+                continue
+            if q.accounts is not None and txn.account not in q.accounts:
+                continue
+            if not _in_range(txn.executed_at, q.start, q.end):
+                continue
+            if q.underlying is not None and txn.underlying != q.underlying:
+                continue
+            if q.transaction_type is not None and txn.transaction_type != q.transaction_type:
+                continue
+            if q.trade_group_id is not None and txn.trade_group_id != q.trade_group_id:
+                continue
+            matched.append((row_id, txn))
+        # newest first; NULL executed_at sorts last (mirrors the SQL store's NULLS LAST)
+        matched.sort(
+            key=lambda pair: (
+                pair[1].executed_at is None,
+                -(pair[1].executed_at.timestamp() if pair[1].executed_at else 0),
+                -pair[0],
+            )
+        )
+        total = len(matched)
+        page = matched[q.offset : q.offset + q.limit]
+        out = []
+        for row_id, txn in page:
+            order = self._orders.get(txn.order_id) if txn.order_id is not None else None
+            out.append(
+                _project(txn, TransactionDetailRow, id=row_id,
+                         signal_id=order.signal_id if order is not None else None)
+            )
+        return out, total
+
+    async def get_open_position_groups(self, account: str | None = None) -> list[tuple[str, str, int]]:
+        seen: set[tuple[str, str, int]] = set()
+        for _, txn in self._transactions.all():
+            if txn.trade_group_id is None or txn.security_id is None:
+                continue
+            if account is not None and txn.account != account:
+                continue
+            group = self._trade_groups.get(txn.trade_group_id)
+            if group is None or group.status != "open":
+                continue
+            seen.add((txn.account, txn.security_id, txn.trade_group_id))
+        return sorted(seen)
 
     async def account_activity(self, f: ActivityFilter) -> list[ActivityRow]:
         out = []

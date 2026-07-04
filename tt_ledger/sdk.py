@@ -22,11 +22,13 @@ from .repositories import apply_fill_event, ensure_account
 from .rows import (
     ActivityFilter,
     EventRow,
+    OrderDetail,
     OrderFilter,
     OrderRow,
     SyncResult,
     TradeFilter,
     TradeGroupRow,
+    TransactionQuery,
     trade_group_to_row,
 )
 from .store import make_store
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
         OrderInput,
         PositionRow,
         TradeRow,
+        TransactionDetailRow,
     )
     from .store import LedgerStore
 
@@ -268,6 +271,50 @@ class LedgerClient:
         activity = await self._store.account_activity(ActivityFilter(account=tg.account))
         transactions = [row for row in activity if row.trade_group_id == pk]
         return orders, transactions
+
+    async def trade_structure(self, group_id: str) -> "list[OrderDetail]":
+        """A trade's orders with their legs + fills — the drill-down read path host UIs render
+        (each ``OrderDetail.fills`` entry's ``order_leg_id`` matches a leg's ``id``). Empty for a
+        group whose orders arrived without leg detail (e.g. intent-recorded paper orders — their
+        activity lives in ``trade_detail()``'s transactions instead)."""
+        pk = await self._store.get_trade_group_id(group_id)
+        if pk is None:
+            return []
+        orders = await self._store.get_group_orders_with_ids(pk)
+        order_ids = [order_pk for order_pk, _ in orders]
+        legs = await self._store.get_legs_for_orders(order_ids)
+        fills = await self._store.get_fills_for_orders(order_ids)
+        legs_by_order: dict[int, list] = {}
+        for leg in legs:
+            legs_by_order.setdefault(leg.order_id, []).append(leg)
+        fills_by_order: dict[int, list] = {}
+        for fill in fills:
+            if fill.order_id is not None:
+                fills_by_order.setdefault(fill.order_id, []).append(fill)
+        return [
+            OrderDetail(
+                order_pk=order_pk, order=order,
+                legs=legs_by_order.get(order_pk, []), fills=fills_by_order.get(order_pk, []),
+            )
+            for order_pk, order in orders
+        ]
+
+    async def transactions(self, **f) -> "tuple[list[TransactionDetailRow], int]":
+        """Paged transactions, newest first: ``(rows, total_matching)``. Filters are
+        ``TransactionQuery`` fields (account/accounts/start/end/underlying/transaction_type/
+        trade_group_id/limit/offset)."""
+        return await self._store.query_transactions(TransactionQuery(**f))
+
+    async def open_position_groups(self, account: str | None = None) -> "dict[tuple[str, str], int]":
+        """``(account, security_id) -> trade_group_id`` over OPEN groups' member transactions —
+        the join host position views stamp onto live position rows. A security claimed by more
+        than one open group resolves to the most recently created one (highest pk)."""
+        mapping: dict[tuple[str, str], int] = {}
+        for acct, security_id, group_pk in await self._store.get_open_position_groups(account):
+            key = (acct, security_id)
+            if group_pk > mapping.get(key, -1):
+                mapping[key] = group_pk
+        return mapping
 
     async def position(self, account: str, security_id: str) -> "PositionRow | None":
         return await self._store.get_position(account, security_id)

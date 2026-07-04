@@ -28,6 +28,7 @@ from ..rows import (
     ClosedPositionRow,
     EventRow,
     FillRow,
+    LegDetailRow,
     LegRow,
     OrderFilter,
     OrderRow,
@@ -36,6 +37,8 @@ from ..rows import (
     TradeFilter,
     TradeGroupRow,
     TradeRow,
+    TransactionDetailRow,
+    TransactionQuery,
     TxnRow,
 )
 from ..schema import metadata, models
@@ -520,6 +523,96 @@ class SqlLedgerStore:
         async with self._sessionmaker() as session:
             rows = (await session.execute(stmt)).all()
         return [_mapping_to(TradeRow, r, origin=Origin, review_status=ReviewStatus) for r in rows]
+
+    async def get_group_orders_with_ids(self, trade_group_id: int) -> list[tuple[int, OrderRow]]:
+        table = models.Order.__table__
+        stmt = (
+            select(table)
+            .where(table.c.trade_group_id == trade_group_id)
+            .order_by(table.c.received_at.asc().nulls_last(), table.c.id.asc())
+        )
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return [(r.id, _mapping_to(OrderRow, r, origin=Origin, ingest=Ingest)) for r in rows]
+
+    async def get_legs_for_orders(self, order_ids: list[int]) -> list[LegDetailRow]:
+        if not order_ids:
+            return []
+        table = models.OrderLeg.__table__
+        stmt = (
+            select(table)
+            .where(table.c.order_id.in_(order_ids))
+            .order_by(table.c.order_id.asc(), table.c.leg_index.asc())
+        )
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return [_mapping_to(LegDetailRow, r) for r in rows]
+
+    async def get_fills_for_orders(self, order_ids: list[int]) -> list[FillRow]:
+        if not order_ids:
+            return []
+        table = models.OrderFill.__table__
+        stmt = (
+            select(table)
+            .where(table.c.order_id.in_(order_ids))
+            .order_by(table.c.filled_at.asc().nulls_last(), table.c.id.asc())
+        )
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return [_mapping_to(FillRow, r) for r in rows]
+
+    async def query_transactions(self, q: TransactionQuery) -> tuple[list[TransactionDetailRow], int]:
+        txns = models.Transaction.__table__
+        orders = models.Order.__table__
+
+        conditions = []
+        if q.account is not None:
+            conditions.append(txns.c.account == q.account)
+        if q.accounts is not None:
+            conditions.append(txns.c.account.in_(q.accounts))
+        if q.start is not None:
+            conditions.append(txns.c.executed_at >= _day_start(q.start))
+        if q.end is not None:
+            conditions.append(txns.c.executed_at < _day_start(q.end) + timedelta(days=1))
+        if q.underlying is not None:
+            conditions.append(txns.c.underlying == q.underlying)
+        if q.transaction_type is not None:
+            conditions.append(txns.c.transaction_type == q.transaction_type)
+        if q.trade_group_id is not None:
+            conditions.append(txns.c.trade_group_id == q.trade_group_id)
+
+        cols = [
+            *[c for c in txns.columns if c.name in {f.name for f in TransactionDetailRow.__dataclass_fields__.values()}],
+            orders.c.signal_id.label("signal_id"),
+        ]
+        stmt = (
+            select(*cols)
+            .select_from(txns.outerjoin(orders, txns.c.order_id == orders.c.id))
+            .where(*conditions)
+            .order_by(txns.c.executed_at.desc().nulls_last(), txns.c.id.desc())
+            .limit(q.limit)
+            .offset(q.offset)
+        )
+        count_stmt = select(func.count()).select_from(txns).where(*conditions)
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+            total = (await session.execute(count_stmt)).scalar_one()
+        return [_mapping_to(TransactionDetailRow, r) for r in rows], total
+
+    async def get_open_position_groups(self, account: str | None = None) -> list[tuple[str, str, int]]:
+        txns = models.Transaction.__table__
+        groups = models.TradeGroup.__table__
+        stmt = (
+            select(txns.c.account, txns.c.security_id, txns.c.trade_group_id)
+            .distinct()
+            .select_from(txns.join(groups, txns.c.trade_group_id == groups.c.id))
+            .where(groups.c.status == "open", txns.c.security_id.isnot(None))
+        )
+        if account is not None:
+            stmt = stmt.where(txns.c.account == account)
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return [(r.account, r.security_id, r.trade_group_id) for r in rows]
 
     async def account_activity(self, f: ActivityFilter) -> list[ActivityRow]:
         txns = models.Transaction.__table__
