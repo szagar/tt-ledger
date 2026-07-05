@@ -227,6 +227,7 @@ class TradeGroupRow:
     unrealized_pnl: Decimal | None = None
     max_profit: Decimal | None = None
     max_loss: Decimal | None = None
+    initial_risk: Decimal | None = None  # planned 1R at open, frozen (see models.TradeGroup)
     profit_target: str | None = None
     stop_loss: str | None = None
     exit_strategy: str | None = None
@@ -278,6 +279,7 @@ class TradeRow:
     unrealized_pnl: Decimal | None = None
     max_profit: Decimal | None = None
     max_loss: Decimal | None = None
+    initial_risk: Decimal | None = None  # planned 1R at open, frozen (see models.TradeGroup)
     structure: dict | None = None  # host-written submit-time structure descriptor (opaque JSON)
     order_id: int | None = None
     strategy_id: int | None = None
@@ -285,6 +287,16 @@ class TradeRow:
     signal_id: str | None = None
     executed_at: datetime | None = None
     closed_at: datetime | None = None
+
+    @property
+    def pnl_net(self) -> Decimal | None:
+        """``realized_pnl - total_fees`` — the R-multiple numerator (same convention as
+        ``ClosedPositionRow.pnl_net``). Derived, never stored: reconcile revises
+        ``realized_pnl``/``total_fees``, so a stored copy would go silently stale.
+        ``None`` until the group has a realized PnL; missing fees count as zero."""
+        if self.realized_pnl is None:
+            return None
+        return self.realized_pnl - (self.total_fees or Decimal("0"))
 
 
 def trade_group_to_row(tg: TradeGroupRow) -> TradeRow:

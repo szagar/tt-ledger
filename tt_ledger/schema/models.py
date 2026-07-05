@@ -234,6 +234,11 @@ class TradeGroup(Base):
     unrealized_pnl: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     max_profit: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     max_loss: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    # Planned 1R in dollars, frozen at open — the host's declared risk (where it intends
+    # to stop), NOT the structure's worst case (max_loss). Written once by
+    # open_trade_group; no write path may recompute it after (partial closes measure
+    # against the ORIGINAL 1R).
+    initial_risk: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     profit_target: Mapped[str | None] = mapped_column(String(32), nullable=True)
     stop_loss: Mapped[str | None] = mapped_column(String(32), nullable=True)
     exit_strategy: Mapped[str | None] = mapped_column(String(100), nullable=True)

@@ -141,6 +141,7 @@ class LedgerClient:
         total_premium: "Decimal | None" = None,
         max_profit: "Decimal | None" = None,
         max_loss: "Decimal | None" = None,
+        initial_risk: "Decimal | None" = None,
         profit_target: str | None = None,
         stop_loss: str | None = None,
         exit_strategy: str | None = None,
@@ -156,7 +157,9 @@ class LedgerClient:
         ``group_id`` to ``record_order(trade_group=...)`` so fills attach to it. Financials
         (premium/fees/quantity) are refined from actual fills by reconcile. ``structure`` is
         an opaque host-written descriptor of the traded structure (legs/strikes/expiry/...);
-        the ledger stores it verbatim and never derives from or mutates it."""
+        the ledger stores it verbatim and never derives from or mutates it. ``initial_risk``
+        is the planned 1R in dollars (where the host intends to stop — may be tighter than
+        the structural ``max_loss``); it is frozen here and never recomputed."""
         await ensure_account(self._store, self._accounts, account, self._ensured_accounts)
         now = datetime.now(UTC)
         row = TradeGroupRow(
@@ -165,7 +168,7 @@ class LedgerClient:
             reviewed_at=now, reviewed_by=reviewed_by,
             underlying=underlying, security_id=security_id, strategy_type=strategy_type,
             total_premium=total_premium, quantity=quantity,
-            max_profit=max_profit, max_loss=max_loss,
+            max_profit=max_profit, max_loss=max_loss, initial_risk=initial_risk,
             profit_target=profit_target, stop_loss=stop_loss, exit_strategy=exit_strategy,
             structure=structure,
             strategy_id=strategy_id, bot_name=bot, signal_id=signal,

@@ -162,6 +162,66 @@ async def test_exit_fills_close_the_intent_group_with_events(client, store, acco
     assert events == [TradeGroupEventType.ENTRY.value, TradeGroupEventType.FULL_EXIT.value]
 
 
+async def test_initial_risk_persists_and_survives_reconcile(client, store, accounts):
+    """initial_risk is the planned 1R, frozen at open — distinct from max_loss (an IC
+    managed at a 2x-credit stop has 1R = the stop, not the wings), and reconcile's
+    financial refresh must never recompute or clobber it."""
+    trade = await client.open_trade_group(
+        "main", strategy_type="iron_condor", underlying="SPY",
+        max_loss=Decimal("1000"), initial_risk=Decimal("400"),
+    )
+    assert trade.initial_risk == Decimal("400")
+    assert trade.max_loss == Decimal("1000")
+
+    await client.record_order(
+        OrderInput(account="main", tt_order_id="O-1", underlying="SPY", trade_group=trade.group_id)
+    )
+    broker = MockTastyTradeClient()
+    _fill(broker, order_id="O-1", action="Sell to Open", net_value="250", executed_at=T0)
+    await _sync(store, accounts, broker)
+
+    await reconcile(store, "main")
+
+    trades = await store.unified_trades(TradeFilter(account="main"))
+    assert len(trades) == 1
+    assert trades[0].initial_risk == Decimal("400")
+    assert trades[0].max_loss == Decimal("1000")
+
+
+async def test_pnl_net_derives_realized_minus_fees(client, store, accounts):
+    """TradeRow.pnl_net is the R numerator: realized_pnl - total_fees, derived (never
+    stored), None until the group has realized PnL, missing fees counting as zero."""
+    from tt_ledger.rows import TradeRow
+
+    open_row = TradeRow(group_id="g", account="main", origin=Origin.ZTS)
+    assert open_row.pnl_net is None
+
+    no_fees = TradeRow(
+        group_id="g", account="main", origin=Origin.ZTS, realized_pnl=Decimal("150"),
+    )
+    assert no_fees.pnl_net == Decimal("150")
+
+    with_fees = TradeRow(
+        group_id="g", account="main", origin=Origin.ZTS,
+        realized_pnl=Decimal("150"), total_fees=Decimal("12.5"),
+    )
+    assert with_fees.pnl_net == Decimal("137.5")
+
+    # end-to-end: a closed intent group's pnl_net reflects the reconciled financials
+    trade = await client.open_trade_group("main", strategy_type="single", underlying="SPY")
+    await client.record_order(OrderInput(account="main", tt_order_id="O-1", trade_group=trade.group_id))
+    await client.record_order(OrderInput(account="main", tt_order_id="O-2", trade_group=trade.group_id))
+    broker = MockTastyTradeClient()
+    _fill(broker, order_id="O-1", action="Sell to Open", net_value="250", executed_at=T0)
+    _fill(broker, order_id="O-2", action="Buy to Close", net_value="-100", executed_at=T0 + timedelta(hours=3))
+    await _sync(store, accounts, broker)
+    await reconcile(store, "main")
+
+    trades = await store.unified_trades(TradeFilter(account="main"))
+    closed = trades[0]
+    assert closed.pnl_net == closed.realized_pnl - (closed.total_fees or Decimal("0"))
+
+
 # --------------------------------------------------------------------- synthetic imports (paper)
 
 
