@@ -41,6 +41,12 @@ class LedgerClient:
     async def latest_balance(self, account: str) -> BalanceSnapshotRow | None
     async def balances(self, account: str, *, since: date | None = None, until: date | None = None) -> list[BalanceSnapshotRow]
 
+    # read (drill-down / host UI surface)
+    async def trade_structure(self, group_id: str) -> list[OrderDetail]      # orders + legs (with surrogate ids) + fills
+    async def transactions(self, **f) -> tuple[list[TransactionDetailRow], int]  # paged newest-first; TransactionQuery fields
+    async def open_position_groups(self, account: str | None = None) -> dict[tuple[str, str], int]
+                                                                             # (account, security_id) -> open trade_group pk
+
     # remap
     async def remap_trade(self, group_id: str, *, strategy=None, bot=None, signal=None,
                           strategy_type=None, reviewed_by: str) -> TradeRow
