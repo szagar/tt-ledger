@@ -27,6 +27,15 @@ Delivery contract (at-least-once):
 
 Reconnects: retries forever with capped exponential backoff (a daemon transport), resetting
 after any successful read. ``max_connect_attempts`` bounds it for tests.
+
+Read timeouts are NOT connection loss: when the caller's client carries a ``socket_timeout``
+at or below ``block_ms``, every idle full-length server block races the client's own socket
+timeout and loses (observed in production 2026-07-06: four daemons logging "connection lost
+... reconnecting" in the same microsecond, ~1.4k WARNINGs/day/login, on a perfectly healthy
+stream). redis-py disconnects the socket before raising, so the pooled client is safe to
+reuse — a blocking-read timeout is treated as an empty poll and retried quietly, escalating
+to the reconnect path only after ``_MAX_CONSECUTIVE_READ_TIMEOUTS`` in a row (a genuinely
+hung server keeps timing out; an idle-but-healthy stream intersperses successful reads).
 """
 
 from __future__ import annotations
@@ -53,6 +62,18 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STREAM_KEY = "zts:events"
 _RECONNECT_INITIAL_SECONDS = 1.0
 _RECONNECT_MAX_SECONDS = 30.0
+_MAX_CONSECUTIVE_READ_TIMEOUTS = 3
+
+
+def _read_timeout_errors() -> tuple[type[BaseException], ...]:
+    """Exception types that mean "the blocking read timed out", not "the connection died".
+    Builtin ``TimeoutError`` covers ``asyncio.TimeoutError`` (an alias since 3.11); redis-py's
+    ``TimeoutError`` subclasses ``RedisError`` only, so it needs its own entry."""
+    try:
+        from redis.exceptions import TimeoutError as _RedisTimeoutError
+    except ModuleNotFoundError:  # test-seam clients don't require the [redis] extra
+        return (TimeoutError,)
+    return (TimeoutError, _RedisTimeoutError)
 
 
 class RedisStreamMessageSource:
@@ -125,24 +146,42 @@ class RedisStreamMessageSource:
     ) -> "AsyncIterator[FillEvent | BrokerPosition | BalanceMessage]":
         attempts = 0
         backoff = _RECONNECT_INITIAL_SECONDS
+        timeout_errors = _read_timeout_errors()
         while True:
             client = self._make_client()
             try:
                 await self._ensure_group(client)
                 next_reclaim = 0.0
+                idle_timeouts = 0
                 while True:
                     if time.monotonic() >= next_reclaim:
                         async for item in self._drain_reclaimed(client):
                             yield item
                         next_reclaim = time.monotonic() + self._reclaim_interval
 
-                    resp = await client.xreadgroup(
-                        groupname=self._group,
-                        consumername=self._consumer,
-                        streams={self._stream: ">"},
-                        count=self._batch_count,
-                        block=self._block_ms,
-                    )
+                    try:
+                        resp = await client.xreadgroup(
+                            groupname=self._group,
+                            consumername=self._consumer,
+                            streams={self._stream: ">"},
+                            count=self._batch_count,
+                            block=self._block_ms,
+                        )
+                    except timeout_errors:
+                        # Idle stream racing the client's socket_timeout — an
+                        # empty poll, not connection loss (redis-py already
+                        # recycled the socket; the pool reconnects on the next
+                        # command). Escalate only when timeouts are persistent.
+                        idle_timeouts += 1
+                        if idle_timeouts >= _MAX_CONSECUTIVE_READ_TIMEOUTS:
+                            raise
+                        logger.debug(
+                            "blocking read timed out on idle stream; polling again (%d/%d)",
+                            idle_timeouts,
+                            _MAX_CONSECUTIVE_READ_TIMEOUTS,
+                        )
+                        continue
+                    idle_timeouts = 0
                     attempts, backoff = 0, _RECONNECT_INITIAL_SECONDS  # healthy
                     if not resp:
                         # Real redis blocked server-side for block_ms; the

@@ -252,6 +252,61 @@ async def test_reclaim_replays_pending_entries(accounts):
     assert fake.pel == {}
 
 
+class _TimeoutScriptRedis(_FakeStreamRedis):
+    """xreadgroup consults a script first: "T" raises a read timeout (the
+    socket_timeout-races-block_ms production pattern), "E" delivers the next
+    scripted entry. Script exhausted → _Exhausted ends messages()."""
+
+    def __init__(self, entries: list[tuple[str, dict]], script: str) -> None:
+        super().__init__(entries)
+        self.script = list(script)
+        self.timeouts_raised = 0
+
+    async def xreadgroup(
+        self, groupname: str, consumername: str, streams: dict, count: int, block: int
+    ):
+        if not self.script:
+            raise _Exhausted()
+        step = self.script.pop(0)
+        if step == "T":
+            self.timeouts_raised += 1
+            raise TimeoutError("Timeout reading from localhost:6379")
+        return await super().xreadgroup(groupname, consumername, streams, count, block)
+
+
+async def test_read_timeouts_are_empty_polls_not_reconnects(accounts):
+    """Regression (2026-07-06): an idle stream + socket_timeout <= block_ms made
+    every full-length block "connection lost" — ~1.4k spurious WARNINGs/day/login.
+    Interspersed timeouts must deliver everything without touching the reconnect
+    path, and a successful read must reset the consecutive-timeout counter."""
+    entries = [
+        ("1-0", _entry(_envelope("balance", "main", {"net_liquidating_value": "1"}))),
+        ("2-0", _entry(_envelope("balance", "roth", {"net_liquidating_value": "2"}))),
+    ]
+    # 2 timeouts, a read, 2 more timeouts, a read — never 3 in a row.
+    fake = _TimeoutScriptRedis(entries, script="TTETTE")
+    out = await _drain(_source(fake, accounts))
+
+    assert [m.account_number for m in out] == ["ACCT1", "ACCT2"]
+    assert fake.timeouts_raised == 4
+    # No reconnect: the group was created exactly once (a reconnect re-enters
+    # _ensure_group and would bump this).
+    assert fake.group_creates == 1
+
+
+async def test_persistent_read_timeouts_escalate_to_reconnect(accounts):
+    """A genuinely hung server times out consecutively — the third in a row
+    escalates to the reconnect path (here surfaced by max_connect_attempts=1)."""
+    fake = _TimeoutScriptRedis([], script="TTTTTT")
+
+    with pytest.raises(TimeoutError):
+        async for _ in _source(fake, accounts).messages():
+            pass  # pragma: no cover - no messages expected
+
+    assert fake.timeouts_raised == 3  # escalated on the 3rd, not silently forever
+    assert fake.group_creates == 1
+
+
 async def test_end_to_end_fill_through_stream_consumer(accounts):
     store = InMemoryStore()
     await store.upsert_orders(
