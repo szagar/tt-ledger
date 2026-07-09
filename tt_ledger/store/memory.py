@@ -282,6 +282,23 @@ class InMemoryStore:
         rows = [txn for _, txn in self._transactions.all() if txn.trade_group_id == trade_group_id]
         return sorted(rows, key=lambda t: (t.executed_at is None, t.executed_at))
 
+    async def net_open_by_group(self, trade_group_ids: list[int]) -> dict[int, dict[str, int]]:
+        wanted = set(trade_group_ids)
+        result: dict[int, dict[str, int]] = {}
+        for _, txn in self._transactions.all():
+            if txn.trade_group_id not in wanted or txn.security_id is None:
+                continue
+            action = (txn.action or "").strip()
+            if action.endswith("to Open"):
+                delta = int(txn.quantity or 0)
+            elif action.endswith("to Close"):
+                delta = -int(txn.quantity or 0)
+            else:
+                delta = 0
+            group = result.setdefault(txn.trade_group_id, {})
+            group[txn.security_id] = group.get(txn.security_id, 0) + delta
+        return result
+
     async def query_orders(self, f: OrderFilter) -> list[OrderRow]:
         out = []
         for _, row in self._orders.all():

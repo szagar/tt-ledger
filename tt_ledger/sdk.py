@@ -319,6 +319,22 @@ class LedgerClient:
                 mapping[key] = group_pk
         return mapping
 
+    async def net_open_by_group(self, trade_group_ids: list[int]) -> "dict[int, dict[str, int]]":
+        """``trade_group_id -> {security_id: net_open}`` for the given groups, where
+        ``net_open = Σ(opening qty) − Σ(closing qty)`` per leg from that group's OWN
+        transactions.
+
+        The per-group fill-confirmation read: a leg is still open for a group iff its
+        net here is ``> 0``. Because it is scoped to the group's own transactions,
+        strikes shared across sibling groups never collapse (the account-wide
+        position view can't distinguish them). Batched — the whole set is one
+        indexed ``GROUP BY`` round-trip, not one query per group. Settlements /
+        corporate actions don't net (only ``* to Open`` / ``* to Close`` do), so a
+        cash-settled leg stays present at its opening quantity; confirm those closed
+        via positions-gone, not this net. Groups with no transactions are absent
+        from the result (``.get(pk)`` is ``None``)."""
+        return await self._store.net_open_by_group(trade_group_ids)
+
     async def position(self, account: str, security_id: str) -> "PositionRow | None":
         return await self._store.get_position(account, security_id)
 

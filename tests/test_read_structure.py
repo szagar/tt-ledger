@@ -190,6 +190,76 @@ async def test_open_position_groups_only_covers_open_groups(any_store):
     assert rows == [("main", "option:SPXW:2026-07-03:put:6200", group_pk)]
 
 
+# --- net open by group -------------------------------------------------------------------
+
+
+async def _seed_net_open(store) -> tuple[int, int]:
+    """Two groups that REUSE strike put:6200 (the shared-strike case). Group A holds
+    its long put open + a settled leg; group B is fully closed."""
+    await store.upsert_account(AccountRow(nickname="main", account_number="ACCT1", login="user1"))
+    pk_a = await store.upsert_trade_group(
+        TradeGroupRow(group_id="g-a", account="main", origin=Origin.ZTS,
+                      review_status=ReviewStatus.CONFIRMED, status="open")
+    )
+    pk_b = await store.upsert_trade_group(
+        TradeGroupRow(group_id="g-b", account="main", origin=Origin.ZTS,
+                      review_status=ReviewStatus.CONFIRMED, status="closed")
+    )
+
+    def _txn(tid, group_pk, action, sid, qty, *, at):
+        return TxnRow(tt_transaction_id=tid, tt_order_id=None, account="main",
+                      transaction_type="Trade", action=action, security_id=sid,
+                      quantity=Decimal(qty), trade_group_id=group_pk,
+                      executed_at=datetime(2026, 7, 1, at, 30, tzinfo=UTC))
+
+    await store.upsert_transactions([
+        # Group A: short 6200 opened then bought back (net 0); long 6180 still open;
+        # 6100 opened then cash-SETTLED (settlement action must NOT net it out).
+        _txn("A-1", pk_a, "Sell to Open", "option:SPXW:2026-07-03:put:6200", "2", at=14),
+        _txn("A-2", pk_a, "Buy to Open", "option:SPXW:2026-07-03:put:6180", "2", at=14),
+        _txn("A-3", pk_a, "Buy to Close", "option:SPXW:2026-07-03:put:6200", "2", at=15),
+        _txn("A-4", pk_a, "Sell to Open", "option:SPXW:2026-07-03:put:6100", "1", at=14),
+        _txn("A-5", pk_a, "Receive Deliver", "option:SPXW:2026-07-03:put:6100", "1", at=16),
+        # Group B: SAME 6200 strike + 6180, both fully closed → all net 0.
+        _txn("B-1", pk_b, "Sell to Open", "option:SPXW:2026-07-03:put:6200", "1", at=14),
+        _txn("B-2", pk_b, "Buy to Open", "option:SPXW:2026-07-03:put:6180", "1", at=14),
+        _txn("B-3", pk_b, "Buy to Close", "option:SPXW:2026-07-03:put:6200", "1", at=15),
+        _txn("B-4", pk_b, "Sell to Close", "option:SPXW:2026-07-03:put:6180", "1", at=15),
+    ])
+    return pk_a, pk_b
+
+
+async def test_net_open_by_group_scopes_shared_strike_per_group(any_store):
+    pk_a, pk_b = await _seed_net_open(any_store)
+
+    net = await any_store.net_open_by_group([pk_a, pk_b])
+
+    # The reused 6200 strike nets independently per group — never collapsed.
+    assert net[pk_a]["option:SPXW:2026-07-03:put:6200"] == 0
+    assert net[pk_a]["option:SPXW:2026-07-03:put:6180"] == 2  # long still open
+    assert net[pk_a]["option:SPXW:2026-07-03:put:6100"] == 1  # settled, NOT netted by the settlement
+    # Group B is fully closed: every leg nets to 0 (present, so "closed", not "unknown").
+    assert net[pk_b] == {
+        "option:SPXW:2026-07-03:put:6200": 0,
+        "option:SPXW:2026-07-03:put:6180": 0,
+    }
+
+
+async def test_net_open_by_group_empty_and_unknown(any_store):
+    pk_a, _ = await _seed_net_open(any_store)
+    assert await any_store.net_open_by_group([]) == {}
+    # Unknown pk is simply absent (caller's .get(pk) is None → "not confirmed closed").
+    result = await any_store.net_open_by_group([pk_a, 999_999])
+    assert set(result) == {pk_a}
+
+
+async def test_sdk_net_open_by_group(client):
+    pk_a, pk_b = await _seed_net_open(client._store)
+    net = await client.net_open_by_group([pk_a, pk_b])
+    assert net[pk_a]["option:SPXW:2026-07-03:put:6180"] == 2
+    assert net[pk_b]["option:SPXW:2026-07-03:put:6200"] == 0
+
+
 # --- SDK wrappers -------------------------------------------------------------------------
 
 

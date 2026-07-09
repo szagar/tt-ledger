@@ -15,7 +15,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import bindparam, func, select, text, update
+from sqlalchemy import bindparam, case, func, select, text, update
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -613,6 +613,38 @@ class SqlLedgerStore:
         async with self._sessionmaker() as session:
             rows = (await session.execute(stmt)).all()
         return [(r.account, r.security_id, r.trade_group_id) for r in rows]
+
+    async def net_open_by_group(self, trade_group_ids: list[int]) -> dict[int, dict[str, int]]:
+        if not trade_group_ids:
+            return {}
+        txns = models.Transaction.__table__
+        # Net open = Σ(opening qty) − Σ(closing qty) per (group, security_id). Only
+        # trade actions move the count; settlements / corporate actions (NULL or
+        # other actions) contribute 0, so a cash-settled leg's opening rows keep
+        # the security present at a positive net (the caller's positions-gone path
+        # confirms such a leg closed). Grouped in the DB over the indexed
+        # trade_group_id FK — one round-trip regardless of how many groups.
+        net = func.sum(
+            case(
+                (txns.c.action.like("%to Open"), txns.c.quantity),
+                (txns.c.action.like("%to Close"), -txns.c.quantity),
+                else_=0,
+            )
+        ).label("net_open")
+        stmt = (
+            select(txns.c.trade_group_id, txns.c.security_id, net)
+            .where(
+                txns.c.trade_group_id.in_(trade_group_ids),
+                txns.c.security_id.isnot(None),
+            )
+            .group_by(txns.c.trade_group_id, txns.c.security_id)
+        )
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        result: dict[int, dict[str, int]] = {}
+        for r in rows:
+            result.setdefault(r.trade_group_id, {})[r.security_id] = int(r.net_open or 0)
+        return result
 
     async def account_activity(self, f: ActivityFilter) -> list[ActivityRow]:
         txns = models.Transaction.__table__
