@@ -284,6 +284,35 @@ def _net_quantities(rows: list) -> dict[str, Decimal]:
     return net
 
 
+def _peak_exposures(rows: list) -> dict[str, Decimal]:
+    """Peak |running net| per security — the position size the group actually HELD, walked
+    with the same rules as ``_net_quantities``. This is the classification-grade quantity:
+    per-row quantities misread scale-ins (1 + 3 = two legs, not a 4-lot), partial fills
+    (2 filled as 1+1 = a "ratio"), and closes (open + close = a two-leg "spread")."""
+    ordered = sorted(
+        (r for r in rows if r.security_id and r.quantity is not None),
+        key=lambda r: (r.executed_at is None, r.executed_at),
+    )
+    net: dict[str, Decimal] = {}
+    peak: dict[str, Decimal] = {}
+    for r in ordered:
+        if getattr(r, "transaction_type", None) == "Money Movement":
+            continue
+        current = net.get(r.security_id, Decimal("0"))
+        if _is_nontrade_close(r):
+            if current == 0:
+                continue
+            qty = min(abs(r.quantity), abs(current))
+            new = current - qty if current > 0 else current + qty
+        elif r.action:
+            new = current + _action_delta(r)
+        else:
+            continue
+        net[r.security_id] = new
+        peak[r.security_id] = max(peak.get(r.security_id, Decimal("0")), abs(new))
+    return peak
+
+
 def _is_opening(row) -> bool:  # noqa: ANN001
     return row.action in _OPENING_ACTIONS
 
@@ -591,10 +620,12 @@ def _close_causes(rows: list) -> "set[TradeGroupStatus]":
     causes: set[TradeGroupStatus] = set()
     net = _net_quantities(rows)
     for r in rows:
-        if r.action in _CLOSING_ACTIONS:
-            causes.add(TradeGroupStatus.CLOSED)
-        elif _is_nontrade_close(r):
+        # settlement identity first: TT sometimes stamps an action ("Sell to Close") on a
+        # Receive Deliver expiration row — it's still an expiration, not a trade close
+        if _is_nontrade_close(r):
             causes.add(_STATUS_BY_EVENT[_RD_EVENT_BY_SUBTYPE[r.transaction_sub_type]])
+        elif r.action in _CLOSING_ACTIONS:
+            causes.add(TradeGroupStatus.CLOSED)
         elif r.action in _BARE_ACTIONS and r.security_id and net.get(r.security_id) == 0:
             # a bare Buy/Sell that participated in a flattened security acted as a close
             causes.add(TradeGroupStatus.CLOSED)
@@ -677,7 +708,12 @@ async def _apply_exit(
     event_at = max(event_ats) if event_ats else None
 
     # every routed-as-close trade row: explicit "* to Close" plus bare futures Buy/Sell
-    trade_rows = [r for r in rows if r.action in _CLOSING_ACTIONS or r.action in _BARE_ACTIONS]
+    # settlement identity wins over a stamped action: an action-bearing Receive Deliver
+    # expiration belongs in the settlement bucket below, not double-counted as a trade exit
+    trade_rows = [
+        r for r in rows
+        if not _is_nontrade_close(r) and (r.action in _CLOSING_ACTIONS or r.action in _BARE_ACTIONS)
+    ]
     if trade_rows:
         event_type = TradeGroupEventType.FULL_EXIT if fully_closed else TradeGroupEventType.PARTIAL_EXIT
         await store.add_trade_group_event(
@@ -791,6 +827,10 @@ async def compute_group_fields(store: "LedgerStore", cluster: "list[ActivityRow]
     (underlying, security_id, strategy_type, leg_count, total_premium, total_fees, quantity,
     executed_at). Shared between reconcile's group-creation and remap's regroup recompute —
     both need to (re)derive a group's financials/classification from its member transactions.
+
+    Legs are ONE PER SECURITY at the group's peak exposure (``_peak_exposures``), never one
+    per row: per-row legs misclassified every recompute of a group holding closes (open +
+    close read as a two-leg spread), scale-ins (1 + 3 read as a ratio), and partial fills.
     """
     distinct_security_ids = list(dict.fromkeys(row.security_id for row in cluster if row.security_id))
     securities = {}
@@ -799,16 +839,22 @@ async def compute_group_fields(store: "LedgerStore", cluster: "list[ActivityRow]
         if sec is not None:
             securities[security_id] = sec
 
+    peaks = _peak_exposures(cluster)
+
+    def _fallback_quantity(security_id: str) -> Decimal:
+        row_qtys = [abs(r.quantity) for r in cluster if r.security_id == security_id and r.quantity is not None]
+        return max(row_qtys) if row_qtys else Decimal("0")
+
     legs = [
         LegInfo(
-            product_type=securities[row.security_id].product_type,
-            option_type=securities[row.security_id].option_type,
-            expiry=securities[row.security_id].expiry,
-            strike=securities[row.security_id].strike,
-            quantity=row.quantity or Decimal("0"),
+            product_type=securities[security_id].product_type,
+            option_type=securities[security_id].option_type,
+            expiry=securities[security_id].expiry,
+            strike=securities[security_id].strike,
+            quantity=peaks.get(security_id) or _fallback_quantity(security_id),
         )
-        for row in cluster
-        if row.security_id in securities
+        for security_id in distinct_security_ids
+        if security_id in securities
     ]
 
     underlying = next((row.underlying for row in cluster if row.underlying), None)
@@ -820,8 +866,10 @@ async def compute_group_fields(store: "LedgerStore", cluster: "list[ActivityRow]
         ),
         Decimal("0"),
     )
-    quantities = [abs(row.quantity) for row in cluster if row.quantity is not None]
-    quantity = max(quantities) if quantities else None
+    # the size the group actually held, not the largest single fill
+    quantity = max(peaks.values()) if peaks else (
+        max((abs(r.quantity) for r in cluster if r.quantity is not None), default=None)
+    )
     executed_ats = [row.executed_at for row in cluster if row.executed_at is not None]
     executed_at = min(executed_ats) if executed_ats else None
 

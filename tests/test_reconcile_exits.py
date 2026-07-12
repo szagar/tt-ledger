@@ -378,3 +378,28 @@ async def test_overclose_falls_back_to_membership(store, accounts, resolver):
     assert result.trade_groups == 1  # no junk group from the over-close
     trades = await _trades(store)
     assert len(trades) == 1
+
+
+async def test_action_stamped_expiration_still_expires_the_group(store, accounts, resolver):
+    """TT sometimes stamps an action ("Sell to Close") on a Receive Deliver expiration row.
+    Settlement identity must win: the group EXPIRES (not 'closed'), and the row produces ONE
+    expiration event — not a full_exit + expiration double-count."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Buy to Open", quantity="1",
+           net_value="-250", executed_at=T0)
+    client.add_transaction(BrokerTransaction(
+        id="RD-STAMPED", account_number="ACCT1", order_id=None, underlying_symbol="SPY",
+        symbol=PUT_A, instrument_type="Equity Option", transaction_type="Receive Deliver",
+        transaction_sub_type="Expiration", action="Sell to Close", quantity=Decimal("1"),
+        net_value=Decimal("0"), executed_at=T0 + timedelta(days=11),
+        transaction_date=(T0 + timedelta(days=11)).date(),
+    ))
+
+    await _sync_and_reconcile(store, accounts, resolver, client)
+
+    trade = (await _trades(store))[0]
+    assert trade.status == TradeGroupStatus.EXPIRED.value
+    events = await _events(store, trade.group_id)
+    assert [e.event_type for e in events] == [
+        TradeGroupEventType.ENTRY.value, TradeGroupEventType.EXPIRATION.value,
+    ]

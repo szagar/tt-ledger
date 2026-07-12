@@ -389,3 +389,81 @@ async def test_reconcile_iron_condor_against_sql_store(sql_store, accounts, reso
 
     result2 = await reconcile(sql_store, "main")
     assert result2.trade_groups == 0
+
+
+# --- compute_group_fields: legs are per SECURITY at peak exposure (2026-07-12 fix) ----------
+
+
+def _act(security_id, action, qty, at, *, txn_type="Trade", sub_type=None):
+    from tt_ledger.rows import ActivityRow
+    return ActivityRow(
+        tt_transaction_id=f"T-{security_id}-{action}-{at:%H%M%S}", account="main",
+        transaction_type=txn_type, transaction_sub_type=sub_type, action=action,
+        security_id=security_id, underlying="SPY", quantity=Decimal(qty),
+        net_value=Decimal("1"), executed_at=at,
+    )
+
+
+async def _fields_store(securities):
+    from tt_ledger.rows import SecurityRow
+    from tt_ledger.store.memory import InMemoryStore
+    store = InMemoryStore()
+    for sec in securities:
+        await store.upsert_security(SecurityRow(**sec))
+    return store
+
+
+_T = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
+_OPT = {"security_id": "OPT-P580", "product_type": "OS", "option_type": "P",
+        "expiry": date(2026, 1, 16), "strike": Decimal("580"), "multiplier": 100}
+
+
+async def test_fields_closed_round_trip_stays_single():
+    """Open + close of one option = ONE leg (single), not a two-leg 'spread' — the wart that
+    degraded every regroup recompute of a closed group."""
+    from tt_ledger.ingest.reconcile import compute_group_fields
+    store = await _fields_store([_OPT])
+    cluster = [
+        _act("OPT-P580", "Sell to Open", "1", _T),
+        _act("OPT-P580", "Buy to Close", "1", _T + timedelta(hours=2)),
+    ]
+    fields = await compute_group_fields(store, cluster)
+    assert fields["strategy_type"] == "single"
+    assert fields["leg_count"] == 1
+    assert fields["quantity"] == Decimal("1")
+
+
+async def test_fields_scale_in_classifies_at_peak():
+    """1-lot entry + 3-lot add + 4-lot close per leg = a 4-lot condor, not a 12-leg custom."""
+    from tt_ledger.ingest.reconcile import compute_group_fields
+    store = await _fields_store([
+        {"security_id": f"OPT-{name}", "product_type": "OS", "option_type": ot,
+         "expiry": date(2026, 1, 16), "strike": Decimal(strike), "multiplier": 100}
+        for name, ot, strike in (("P95", "P", "95"), ("P100", "P", "100"),
+                                 ("C110", "C", "110"), ("C115", "C", "115"))
+    ])
+    cluster = []
+    for sid, open_action, close_action in (
+        ("OPT-P95", "Buy to Open", "Sell to Close"), ("OPT-P100", "Sell to Open", "Buy to Close"),
+        ("OPT-C110", "Sell to Open", "Buy to Close"), ("OPT-C115", "Buy to Open", "Sell to Close"),
+    ):
+        cluster.append(_act(sid, open_action, "1", _T))
+        cluster.append(_act(sid, open_action, "3", _T + timedelta(hours=3)))
+        cluster.append(_act(sid, close_action, "4", _T + timedelta(days=4)))
+    fields = await compute_group_fields(store, cluster)
+    assert fields["strategy_type"] == "iron_condor"
+    assert fields["leg_count"] == 4
+    assert fields["quantity"] == Decimal("4")
+
+
+async def test_fields_partial_fill_is_not_a_ratio():
+    """A 2-lot leg filled as 1+1 is one 2-lot leg, not a 1:1 'ratio' of two legs."""
+    from tt_ledger.ingest.reconcile import compute_group_fields
+    store = await _fields_store([_OPT])
+    cluster = [
+        _act("OPT-P580", "Sell to Open", "1", _T),
+        _act("OPT-P580", "Sell to Open", "1", _T),
+    ]
+    fields = await compute_group_fields(store, cluster)
+    assert fields["strategy_type"] == "single"
+    assert fields["quantity"] == Decimal("2")
