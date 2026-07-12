@@ -56,16 +56,19 @@ Turns ungrouped broker activity into reviewable trades.
    sets `order_id` (then leg linkage by `security_id`). No fuzzy/heuristic matching.
 2. **Synthesize lapsed settlements** (`synthesize_lapsed_settlements`): a lot past expiry that an
    OPEN group still holds, whose broker settlement row never arrived (futures options that just
-   vanish), gets the missing `Receive Deliver / Expiration` transaction recreated — deterministic
-   id `lapse-<account>-<security_id>`, price 0 at expiry 21:15Z, quantity = the lot's net. Open
-   lots come from `net_open_quantities` over the account's full transaction history (replay's lot
-   rules, except price-less action rows still count — matching group accounting's view — and
-   never the positions table, which replay's lapse backstop has already flattened); the clock is
-   the account's own latest transaction, never wall-clock. A real (or prior synthetic) settlement
-   nets the lot to zero, so re-runs and late-arriving broker truth no-op; a lot no open group
-   holds is skipped (a settlement with no group to land in would just orphan into a junk
-   NEEDS_REVIEW group — a not-yet-grouped entry synthesizes on the next pass instead). The rows
-   are admitted as candidates in the same pass, so the stuck group closes organically below.
+   vanish), gets the missing `Receive Deliver / Expiration` transaction recreated — ONE ROW PER
+   (open group, security), deterministic id `lapse-<account>-<group_pk>-<security_id>`, price 0
+   at expiry 21:15Z, quantity = that group's own net capped by the account-level net. Rows are
+   pre-attributed and applied straight to their group via the exit machinery, NOT routed through
+   clustering: the same contract is routinely held open by several groups, and first-match
+   routing would hand a single whole-quantity settlement to one group and leave the rest stuck.
+   Open lots come from `net_open_quantities` over the account's full transaction history
+   (replay's lot rules, except price-less action rows still count — matching group accounting's
+   view — and never the positions table, which replay's lapse backstop has already flattened);
+   the clock is the account's own latest transaction, never wall-clock. A real (or prior
+   synthetic) settlement nets the lot to zero, so re-runs and late-arriving broker truth no-op;
+   only groups whose net direction matches the account net participate (mismatches are regroup
+   material), and a not-yet-grouped entry synthesizes on the next pass, once its group exists.
 3. **Group** ungrouped transactions by `(account, executed_at)` (tolerance window joins multi-order
    strategies executed together).
 4. **Route** each cluster against the account's OPEN groups:

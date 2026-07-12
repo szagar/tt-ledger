@@ -11,7 +11,7 @@ NEXT pass (once its group exists and is seen open) — fresh-history tests recon
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -30,7 +30,9 @@ T0 = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
 
 PUT_A = "SPY   260116P00580000"
 EXPIRY = date(2026, 1, 16)
-LAPSE_ID = f"lapse-main-{PUT_A}"
+# per-group deterministic id: lapse-<account>-<group_pk>-<security_id>
+def _lapse_id(group_pk: int) -> str:
+    return f"lapse-main-{group_pk}-{PUT_A}"
 # the deterministic settlement timestamp: expiry 21:15Z
 LAPSED_AT = datetime(2026, 1, 16, 21, 15, tzinfo=UTC)
 
@@ -136,8 +138,9 @@ async def test_lapsed_lot_synthesizes_settlement_and_expires_the_stuck_group(sto
 
     result = await reconcile(store, "main")  # pass 2: the stuck group closes organically
 
+    pk = await store.get_trade_group_id((await _trades(store))[0].group_id)
     lapses = await _lapse_rows(store)
-    assert [r.tt_transaction_id for r in lapses] == [LAPSE_ID]
+    assert [r.tt_transaction_id for r in lapses] == [_lapse_id(pk)]
     lapse = lapses[0]
     assert lapse.transaction_type == "Receive Deliver"
     assert lapse.transaction_sub_type == "Expiration"
@@ -145,7 +148,7 @@ async def test_lapsed_lot_synthesizes_settlement_and_expires_the_stuck_group(sto
     assert lapse.price == Decimal("0")
     assert lapse.executed_at == LAPSED_AT
     assert lapse.underlying == "SPY"
-    assert lapse.trade_group_id is not None  # attributed to the group it closed
+    assert lapse.trade_group_id == pk  # pre-attributed to the group it closed
     assert result.transactions >= 1  # the synthesized row is reported
     assert result.trade_groups == 0  # ...and did NOT orphan into a new group
 
@@ -166,11 +169,41 @@ async def test_rerun_is_idempotent(store, accounts, resolver):
 
     result = await reconcile(store, "main")
 
-    assert [r.tt_transaction_id for r in await _lapse_rows(store)] == [LAPSE_ID]  # no second row
+    trade = (await _trades(store))[0]
+    pk = await store.get_trade_group_id(trade.group_id)
+    assert [r.tt_transaction_id for r in await _lapse_rows(store)] == [_lapse_id(pk)]  # no second row
     assert result.transactions == 0
     assert result.trade_groups == 0
-    trade = (await _trades(store))[0]
     assert trade.status == TradeGroupStatus.EXPIRED.value
+
+
+async def test_lot_split_across_groups_settles_each_group(store, accounts, resolver):
+    """The same contract held open by SEVERAL groups (parallel strategies on one chain) gets one
+    settlement per group, sized to that group's net — first-match whole-quantity routing left
+    every group but the first stuck (the kaity_paper/tommyboy_paper SPXW 2026-07-08 incident)."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="250", executed_at=T0)
+    _trade(client, order_id="O-2", symbol=PUT_A, action="Sell to Open", quantity="2",
+           net_value="500", executed_at=T0 + timedelta(minutes=30))  # own cluster -> own group
+    _clock_trade(client, executed_at=datetime(2026, 2, 2, 15, 0, tzinfo=UTC))
+    await _sync(store, accounts, resolver, client)
+    first = await reconcile(store, "main")
+    assert first.trade_groups == 2
+
+    result = await reconcile(store, "main")
+
+    assert result.transactions == 2  # one settlement PER group
+    trades = await _trades(store)
+    assert [t.status for t in trades] == [TradeGroupStatus.EXPIRED.value] * 2
+    quantities = sorted(r.quantity for r in await _lapse_rows(store))
+    assert quantities == [Decimal("1"), Decimal("2")]  # each sized to its group's net
+    for trade in trades:
+        pk = await store.get_trade_group_id(trade.group_id)
+        events = await _events(store, trade.group_id)
+        assert events[-1].event_type == TradeGroupEventType.EXPIRATION.value
+        lapse = next(r for r in await _lapse_rows(store) if r.trade_group_id == pk)
+        assert lapse.tt_transaction_id == _lapse_id(pk)
 
 
 async def test_real_settlement_present_skips_synthesis(store, accounts, resolver):

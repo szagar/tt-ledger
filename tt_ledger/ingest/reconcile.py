@@ -85,89 +85,104 @@ async def synthesize_lapsed_settlements(
     account: str,
     *,
     dry_run: bool = False,
-) -> "list[ActivityRow]":
-    """Synthesize the MISSING broker settlement row for open lots past expiry.
+) -> "list[TxnRow]":
+    """Synthesize the MISSING broker settlement rows for open lots past expiry — per group.
 
     Some expirations never produce a broker transaction (futures options that
     just vanish; corporate-action re-symbols whose settlement arrives under a
     different security_id). Without one, transaction-driven accounting — group
     nets, group status — can never see the close, even though replay's lapse
-    backstop flattens the *position*. This pass recreates the row the broker
-    should have sent, and everything downstream consumes it like any real
-    ``Receive Deliver / Expiration``.
+    backstop flattens the *position*. This pass recreates the rows the broker
+    should have sent and applies them straight to the stuck groups.
 
     Rules (deterministic, idempotent):
     * open lots come from ``net_open_quantities`` over the account's FULL
       transaction history — never the positions table, which replay's lapse
-      backstop has already flattened for exactly these lots.
+      backstop has already flattened for exactly these lots. A real settlement
+      (or a prior synthetic one) already nets the lot to zero, so re-runs and
+      late-arriving broker truth no-op.
     * clock = the account's own latest transaction, never wall-clock (same
       rule as replay's ``_lapse_expired_lot``); a lot lapses only once the
       account has activity a full day past the contract's expiry.
-    * id = ``lapse-<account>-<security_id>`` — re-runs upsert the same row.
-    * a real settlement (or a prior synthetic one) already nets the lot to
-      zero, so late-arriving broker truth wins and re-runs no-op — no
-      separate collision check needed.
-    * only lots some OPEN group still holds synthesize — the feature exists
-      to close stuck groups, and a settlement with no group to land in would
-      just orphan into a junk NEEDS_REVIEW group (position-level flattening
-      is already replay's backstop). A lot whose entry hasn't been grouped
-      yet synthesizes on the NEXT pass, once its group exists.
+    * ONE ROW PER (OPEN GROUP, SECURITY), quantity = the group's own net,
+      capped by the account-level net, pre-attributed to that group and
+      applied via ``_apply_exit`` directly — NOT routed through clustering.
+      The same contract is routinely held open by several groups (parallel
+      paper strategies on one chain), and ``_route_cluster``'s first-match
+      would hand a single whole-quantity settlement to one group and leave
+      the rest stuck. Only groups whose net direction matches the account
+      net participate (mismatches are misattribution messes for regroup);
+      allocation walks groups in pk order until the account net is spent.
+      A lot whose entry hasn't been grouped yet synthesizes on the NEXT
+      pass, once its group exists — position-level flattening is already
+      replay's backstop, so nothing is lost in between.
+    * id = ``lapse-<account>-<group_pk>-<security_id>`` — re-runs upsert the
+      same row.
     * price 0 at expiry 21:15Z; replay's ``_effective_delta_price`` offsets
       the open lot exactly like a feed-delivered expiration.
 
-    Returns the synthesized rows in ``v_account_activity`` shape so the
-    calling reconcile pass can admit them as candidates immediately (their
-    historical ``executed_at`` would fall outside any ``since`` window).
+    Returns the synthesized transactions (already written and applied unless
+    ``dry_run``); the caller only counts them.
     """
     activity = await store.account_activity(ActivityFilter(account=account))
     last_activity = max((a.executed_at for a in activity if a.executed_at is not None), default=None)
     if last_activity is None:
         return []
 
-    held_by_open_group: set[str] = set()
-    for group in await _load_open_groups(store, account):
-        held_by_open_group.update(
-            sid for sid, qty in _net_quantities(group.rows).items() if qty != 0
-        )
+    open_groups = await _load_open_groups(store, account)
+    group_nets = {group.pk: _net_quantities(group.rows) for group in open_groups}
 
-    txns: list[TxnRow] = []
-    rows: list[ActivityRow] = []
+    synthesized: list[TxnRow] = []
+    by_group: dict[int, list[ActivityRow]] = {}
     for security_id, net in sorted(net_open_quantities(activity).items()):
-        if net == 0 or security_id not in held_by_open_group:
+        if net == 0:
             continue
         sec = await store.get_security(security_id)
         expiry = sec.expiry if sec is not None else None
         if expiry is None or last_activity.date() <= expiry + timedelta(days=1):
             continue
-        txn_id = f"lapse-{account}-{security_id}"
-        common = {
-            "tt_transaction_id": txn_id,
-            "account": account,
-            "transaction_type": "Receive Deliver",
-            "transaction_sub_type": "Expiration",
-            "security_id": security_id,
-            "underlying": sec.underlying if sec is not None else None,
-            "quantity": abs(net),
-            "price": Decimal("0"),
-            "net_value": Decimal("0"),
-            "executed_at": datetime.combine(expiry, datetime.min.time(), tzinfo=UTC).replace(
-                hour=21, minute=15
-            ),
-        }
-        txns.append(
-            TxnRow(
-                tt_order_id=None,
-                description="synthesized lapse: contract expired with no broker settlement row",
-                transaction_date=expiry,
-                **common,
+        remaining = abs(net)
+        for group in sorted(open_groups, key=lambda g: g.pk):
+            if remaining == 0:
+                break
+            group_net = group_nets[group.pk].get(security_id, Decimal("0"))
+            if group_net == 0 or (group_net > 0) != (net > 0):
+                continue
+            qty = min(abs(group_net), remaining)
+            remaining -= qty
+            common = {
+                "tt_transaction_id": f"lapse-{account}-{group.pk}-{security_id}",
+                "account": account,
+                "transaction_type": "Receive Deliver",
+                "transaction_sub_type": "Expiration",
+                "security_id": security_id,
+                "underlying": sec.underlying if sec is not None else None,
+                "quantity": qty,
+                "price": Decimal("0"),
+                "net_value": Decimal("0"),
+                "executed_at": datetime.combine(expiry, datetime.min.time(), tzinfo=UTC).replace(
+                    hour=21, minute=15
+                ),
+            }
+            synthesized.append(
+                TxnRow(
+                    tt_order_id=None,
+                    description="synthesized lapse: contract expired with no broker settlement row",
+                    transaction_date=expiry,
+                    trade_group_id=group.pk,
+                    **common,
+                )
             )
-        )
-        rows.append(ActivityRow(**common))
+            by_group.setdefault(group.pk, []).append(ActivityRow(trade_group_id=group.pk, **common))
 
-    if txns and not dry_run:
-        await store.upsert_transactions(txns)
-        logger.info("synthesized %d lapse settlement(s) for %s", len(txns), account)
-    return rows
+    if synthesized and not dry_run:
+        await store.upsert_transactions(synthesized)
+        for group in open_groups:
+            rows = by_group.get(group.pk)
+            if rows:
+                await _apply_exit(store, group, rows, rolled_to_pk=None)
+        logger.info("synthesized %d lapse settlement(s) for %s", len(synthesized), account)
+    return synthesized
 
 
 def _is_nontrade_close(row) -> bool:  # noqa: ANN001 -- ActivityRow | TxnRow (duck-typed)
@@ -253,15 +268,13 @@ async def reconcile(
             # the preserve-on-resync fix, or created after their transactions were grouped)
             await store.link_orders_to_groups(acct)
 
-            activity = await store.account_activity(ActivityFilter(account=acct, start=since))
-            # Self-heal: recreate settlement rows the broker never sent for
-            # open lots past expiry, then admit them as candidates in this
-            # same pass (their executed_at is the historical expiry, which a
-            # ``since`` window would otherwise exclude).
+            # Self-heal: recreate the settlement rows the broker never sent for
+            # open lots past expiry and apply them straight to the stuck groups
+            # (pre-attributed — they never enter the candidate/cluster path).
             synthesized = await synthesize_lapsed_settlements(store, acct, dry_run=dry_run)
-            if synthesized:
-                result.transactions += len(synthesized)
-                activity = [*activity, *synthesized]
+            result.transactions += len(synthesized)
+
+            activity = await store.account_activity(ActivityFilter(account=acct, start=since))
             candidates = [
                 a for a in activity
                 if a.trade_group_id is None
