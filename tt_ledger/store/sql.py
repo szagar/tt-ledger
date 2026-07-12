@@ -495,6 +495,8 @@ class SqlLedgerStore:
             stmt = stmt.where(table.c.underlying == f.underlying)
         if f.trade_group_id is not None:
             stmt = stmt.where(table.c.trade_group_id == f.trade_group_id)
+        if f.oms_order_id is not None:
+            stmt = stmt.where(table.c.oms_order_id == f.oms_order_id)
         if f.start is not None:
             stmt = stmt.where(table.c.submitted_at >= _day_start(f.start))
         if f.end is not None:

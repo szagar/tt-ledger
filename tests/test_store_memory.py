@@ -207,6 +207,19 @@ async def test_query_orders_date_range_filter(store):
     assert {r.tt_order_id for r in result} == {"TT-late"}
 
 
+async def test_query_orders_oms_order_id_filter(store):
+    await store.upsert_orders(
+        [
+            OrderRow(tt_order_id="TT-a", account="main", origin=Origin.ZTS, ingest=Ingest.OMS_SUBMIT, oms_order_id="OMS-aaa"),
+            OrderRow(tt_order_id="TT-b", account="main", origin=Origin.ZTS, ingest=Ingest.OMS_SUBMIT, oms_order_id="OMS-bbb"),
+            OrderRow(tt_order_id="TT-c", account="main", origin=Origin.BROKER, ingest=Ingest.ORDER_HISTORY),
+        ]
+    )
+    result = await store.query_orders(OrderFilter(oms_order_id="OMS-bbb"))
+    assert [r.tt_order_id for r in result] == ["TT-b"]
+    assert await store.query_orders(OrderFilter(oms_order_id="OMS-missing")) == []
+
+
 async def test_get_order_by_tt_order_id(store):
     await store.upsert_orders([OrderRow(tt_order_id="TT-6", account="main", origin=Origin.BROKER, ingest=Ingest.ORDER_HISTORY)])
     found = await store.get_order("TT-6")

@@ -438,6 +438,7 @@ class OrderFilter:
     status: str | None = None
     underlying: str | None = None
     trade_group_id: int | None = None
+    oms_order_id: str | None = None  # host OMS's order id (unique per order)
     start: date | None = None
     end: date | None = None
 

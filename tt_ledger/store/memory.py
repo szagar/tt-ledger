@@ -312,6 +312,8 @@ class InMemoryStore:
                 continue
             if f.trade_group_id is not None and row.trade_group_id != f.trade_group_id:
                 continue
+            if f.oms_order_id is not None and row.oms_order_id != f.oms_order_id:
+                continue
             if not _in_range(row.submitted_at, f.start, f.end):
                 continue
             out.append(row)
