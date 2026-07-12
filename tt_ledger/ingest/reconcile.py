@@ -185,6 +185,58 @@ async def synthesize_lapsed_settlements(
     return synthesized
 
 
+async def heal_fully_closed_groups(
+    store: "LedgerStore",
+    account: str,
+    *,
+    dry_run: bool = False,
+) -> int:
+    """Flip status on OPEN groups whose content is already fully closed.
+
+    Every member transaction is present and nets to zero, yet ``status`` stayed
+    ``open`` — the closes attached on a code path/rev that skipped the
+    ``_apply_exit`` status flip (first seen: paper groups 1023/1024, whose
+    2026-07-08 fill imports carried complete open+close pairs). Reconcile
+    normally flips status only at the moment NEW closing rows attach, so
+    without this pass such a group stays open forever.
+
+    Deterministic + idempotent: status from ``_close_causes`` (``mixed`` when
+    causes differ — same rule as ``_apply_exit``), ``closed_at`` = the group's
+    last activity, cash-basis ``realized_pnl`` = signed net across members
+    (same math as ``_apply_exit``). An ``adjustment`` event records the repair.
+    A healed group leaves the open set, so re-runs no-op. Returns the number
+    of groups healed (counted, not written, under ``dry_run``).
+    """
+    healed = 0
+    for group in await _load_open_groups(store, account):
+        if not _fully_closed(group.rows):
+            continue
+        healed += 1
+        if dry_run:
+            continue
+        causes = _close_causes(group.rows)
+        status = causes.pop() if len(causes) == 1 else TradeGroupStatus.MIXED
+        event_ats = [r.executed_at for r in group.rows if r.executed_at is not None]
+        closed_at = max(event_ats) if event_ats else None
+        tg = await store.get_trade_group_by_id(group.pk)
+        if tg is None:
+            continue
+        realized = sum((_signed_net(r) for r in group.rows), Decimal("0"))
+        await store.upsert_trade_group(
+            replace(tg, status=status.value, closed_at=closed_at, realized_pnl=realized)
+        )
+        await store.add_trade_group_event(
+            EventRow(
+                trade_group_id=group.pk,
+                event_type=TradeGroupEventType.ADJUSTMENT.value,
+                event_at=closed_at,
+                notes="self-heal: content fully closed but status was open",
+            )
+        )
+        logger.info("healed fully-closed group %d for %s -> %s", group.pk, account, status.value)
+    return healed
+
+
 def _is_nontrade_close(row) -> bool:  # noqa: ANN001 -- ActivityRow | TxnRow (duck-typed)
     return row.transaction_type == "Receive Deliver" and row.transaction_sub_type in _RD_EVENT_BY_SUBTYPE
 
@@ -319,6 +371,10 @@ async def reconcile(
 
             if not dry_run:
                 await _link_cross_cluster_rolls(store, exits, created)
+
+            # Self-heal: legacy groups whose content is fully closed but whose
+            # status flip never happened (closes attached outside _apply_exit).
+            result.healed_groups += await heal_fully_closed_groups(store, acct, dry_run=dry_run)
         except Exception as exc:  # noqa: BLE001 - one account's failure must not abort the rest
             result.errors.append(f"{acct}: {exc}")
             logger.warning("reconcile failed for %s: %s", acct, exc)

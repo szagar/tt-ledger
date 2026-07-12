@@ -84,6 +84,11 @@ Turns ungrouped broker activity into reviewable trades.
 5. **Classify** `strategy_type` from the remaining (opening) legs.
 6. **Create** the `trade_group` with `origin=broker`, `review_status=NEEDS_REVIEW`, an `ENTRY` event,
    premium / max-profit-loss; set `orders.trade_group_id` + `transactions.trade_group_id`.
+7. **Heal fully-closed groups** (`heal_fully_closed_groups`): an OPEN group whose member
+   transactions already net to zero gets its overdue status flip — status from the close causes
+   (`mixed` when they differ), `closed_at` = last activity, cash-basis `realized_pnl` — plus an
+   `adjustment` event recording the repair. Targets legacy data where closes attached on a path
+   that skipped the exit machinery's flip; a healed group leaves the open set, so re-runs no-op.
 
 **Idempotent**, and it **never re-attributes a `manually_attributed` group's membership** — so
 re-running after every sync is safe and never clobbers an operator's edits. (Closing activity may

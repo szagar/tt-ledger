@@ -486,4 +486,5 @@ class SyncResult:
     balances: int = 0
     fills: int = 0
     trade_groups: int = 0
+    healed_groups: int = 0  # reconcile self-heal: fully-closed-content groups whose status flipped
     errors: list[str] = field(default_factory=list)
