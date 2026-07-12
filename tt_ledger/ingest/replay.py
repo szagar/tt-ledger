@@ -164,7 +164,7 @@ def _lapse_expired_lot(
 
 
 def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
-    """Signed net open quantity per security, using replay's exact lot rules.
+    """Signed net open quantity per security, using replay's lot rules for QUANTITY.
 
     This is the transaction-level answer to "which lots does the ledger still think are
     open" — the same walk ``_replay_security`` does (Money Movement excluded, settlements
@@ -172,6 +172,15 @@ def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
     within one timestamp), reduced to the running signed quantity. Reconcile's lapse
     synthesis keys off this instead of the positions table, because ``_lapse_expired_lot``
     has already flattened the *stored* position for exactly the lots it needs to find.
+
+    One deliberate divergence from ``_effective_delta_price``: an action-bearing row with NO
+    price still moves the quantity here. Corporate-action closes (``Receive Deliver /
+    Special Dividend`` re-symbols) carry action + quantity but no price, so replay's
+    cost-basis walk skips them (and its lapse backstop flattens the leftover) — but group
+    accounting (``_net_quantities``) counts them and closes the group. Lapse synthesis asks
+    "can group accounting see the close", so its netting must match group accounting's
+    view; skipping price-less closes here would fabricate a settlement for a lot whose
+    group already closed.
     """
     by_security: dict[str, list[ActivityRow]] = {}
     for row in rows:
@@ -184,9 +193,17 @@ def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
         sec_rows.sort(key=lambda r: (r.executed_at, _closes_last(r)))
         lot = _Lot()
         for row in sec_rows:
-            delta, price = _effective_delta_price(row, lot)
-            if delta == 0 or price is None:
+            if row.transaction_type == "Money Movement":
                 continue
+            if _is_settlement(row):
+                if lot.signed_quantity == 0:
+                    continue
+                qty = min(abs(row.quantity), abs(lot.signed_quantity))
+                delta = -qty if lot.signed_quantity > 0 else qty
+            elif lot.signed_quantity == 0 and (row.action or "").strip().endswith("to Close"):
+                continue  # history window didn't reach the opening
+            else:
+                delta = _signed_delta(row.action, row.quantity)
             lot.signed_quantity += delta
         nets[security_id] = lot.signed_quantity
     return nets

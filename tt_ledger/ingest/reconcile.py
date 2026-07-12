@@ -107,6 +107,11 @@ async def synthesize_lapsed_settlements(
     * a real settlement (or a prior synthetic one) already nets the lot to
       zero, so late-arriving broker truth wins and re-runs no-op — no
       separate collision check needed.
+    * only lots some OPEN group still holds synthesize — the feature exists
+      to close stuck groups, and a settlement with no group to land in would
+      just orphan into a junk NEEDS_REVIEW group (position-level flattening
+      is already replay's backstop). A lot whose entry hasn't been grouped
+      yet synthesizes on the NEXT pass, once its group exists.
     * price 0 at expiry 21:15Z; replay's ``_effective_delta_price`` offsets
       the open lot exactly like a feed-delivered expiration.
 
@@ -119,10 +124,16 @@ async def synthesize_lapsed_settlements(
     if last_activity is None:
         return []
 
+    held_by_open_group: set[str] = set()
+    for group in await _load_open_groups(store, account):
+        held_by_open_group.update(
+            sid for sid, qty in _net_quantities(group.rows).items() if qty != 0
+        )
+
     txns: list[TxnRow] = []
     rows: list[ActivityRow] = []
     for security_id, net in sorted(net_open_quantities(activity).items()):
-        if net == 0:
+        if net == 0 or security_id not in held_by_open_group:
             continue
         sec = await store.get_security(security_id)
         expiry = sec.expiry if sec is not None else None
