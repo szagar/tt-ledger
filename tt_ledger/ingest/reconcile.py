@@ -237,6 +237,37 @@ async def heal_fully_closed_groups(
     return healed
 
 
+async def find_misattributed_open_groups(store: "LedgerStore", account: str) -> list[dict]:
+    """OPEN groups whose every open net is zeroed account-wide — the close is attached elsewhere.
+
+    The "Class B" misattribution shape: the group still shows an open net in some security,
+    but the account's full transaction history nets that security to zero, so the offsetting
+    rows exist and carry ANOTHER group's ``trade_group_id``. Reconcile cannot repair this —
+    attributed rows are never candidates again — and neither lapse synthesis (account net is
+    zero) nor the fully-closed heal (the group's own net is NOT zero) applies. It needs an
+    operator ``regroup()`` decision, which is why this surfaces in a report instead of being
+    auto-fixed. Typical source: a manual close order or settlement spanning lots held by
+    several groups (one row, one ``trade_group_id`` column — it cannot split).
+
+    Returns ``[{"group_pk", "group_id", "securities"}]``, ordered by pk.
+    """
+    activity = await store.account_activity(ActivityFilter(account=account))
+    account_nets = net_open_quantities(activity)
+    found: list[dict] = []
+    for group in await _load_open_groups(store, account):
+        group_nets = {sid: n for sid, n in _net_quantities(group.rows).items() if n != 0}
+        if group_nets and all(account_nets.get(sid, Decimal("0")) == 0 for sid in group_nets):
+            tg = await store.get_trade_group_by_id(group.pk)
+            found.append(
+                {
+                    "group_pk": group.pk,
+                    "group_id": tg.group_id if tg is not None else None,
+                    "securities": sorted(group_nets),
+                }
+            )
+    return sorted(found, key=lambda f: f["group_pk"])
+
+
 def _is_nontrade_close(row) -> bool:  # noqa: ANN001 -- ActivityRow | TxnRow (duck-typed)
     return row.transaction_type == "Receive Deliver" and row.transaction_sub_type in _RD_EVENT_BY_SUBTYPE
 

@@ -403,3 +403,38 @@ async def test_action_stamped_expiration_still_expires_the_group(store, accounts
     assert [e.event_type for e in events] == [
         TradeGroupEventType.ENTRY.value, TradeGroupEventType.EXPIRATION.value,
     ]
+
+
+async def test_misattributed_open_groups_detector(store, accounts, resolver):
+    """The residual Class B shape routing can't fix: ONE qty-2 close spans lots held by two
+    groups (a row can't split), so the second group stays open while the account nets zero.
+    The detector flags exactly that group for an operator regroup() decision."""
+    from tt_ledger.ingest.reconcile import find_misattributed_open_groups
+
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="250", executed_at=T0)
+    _trade(client, order_id="O-2", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="245", executed_at=T0 + timedelta(minutes=10))
+    _trade(client, order_id="O-3", symbol=PUT_A, action="Buy to Close", quantity="2",
+           net_value="-200", executed_at=T0 + timedelta(hours=2))
+
+    await _sync_and_reconcile(store, accounts, resolver, client)
+
+    # the whole-quantity close over-closes the first group (net +1) and never reaches the
+    # second (net -1): BOTH stay open, and BOTH are the entangled pair an operator must
+    # untangle — exactly the 155<->156 shape from the 2026-07-12 production sweep
+    trades = sorted(await _trades(store), key=lambda t: t.executed_at)
+    assert [t.status for t in trades] == [TradeGroupStatus.OPEN.value] * 2
+
+    found = await find_misattributed_open_groups(store, "main")
+    pks = sorted([await store.get_trade_group_id(t.group_id) for t in trades])
+    assert [f["group_pk"] for f in found] == pks
+    assert all(f["securities"] == [PUT_A] for f in found)
+
+    # a genuinely-open lot (account net nonzero) is NOT misattribution
+    client2 = MockTastyTradeClient()
+    _trade(client2, order_id="O-4", symbol=PUT_B, action="Sell to Open", quantity="1",
+           net_value="300", executed_at=T0 + timedelta(days=1))
+    await _sync_and_reconcile(store, accounts, resolver, client2)
+    assert [f["group_pk"] for f in await find_misattributed_open_groups(store, "main")] == pks

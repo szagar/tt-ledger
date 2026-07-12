@@ -15,7 +15,7 @@ from .enums import Ingest, Origin, ReviewStatus, TradeGroupEventType
 from .identity import PassthroughResolver
 from .ingest.pull import sync_all
 from .ingest.push import StreamConsumer
-from .ingest.reconcile import reconcile
+from .ingest.reconcile import find_misattributed_open_groups, reconcile
 from .ingest.remap import dismiss_trade_group, regroup_transactions, remap_trade_group
 from .ingest.replay import rebuild_positions_from_transactions
 from .repositories import apply_fill_event, ensure_account
@@ -368,6 +368,12 @@ class LedgerClient:
         """Rebuild ``positions``/``closed_positions`` from transaction history
         (``ingest/replay.py``) -- no broker pull, safe to re-run any time after ``sync``."""
         return await rebuild_positions_from_transactions(self._store, account)
+
+    async def misattributed_open_groups(self, account: str) -> list[dict]:
+        """Open groups whose closes are attached to OTHER groups (Class B misattribution) --
+        candidates for an operator ``regroup()`` decision; reconcile cannot repair them.
+        Read-only; see ``ingest.reconcile.find_misattributed_open_groups``."""
+        return await find_misattributed_open_groups(self._store, account)
 
     # --- remap ---
 
