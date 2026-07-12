@@ -29,17 +29,17 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from ..enums import Origin, ReviewStatus, StrategyType, TradeGroupEventType, TradeGroupStatus
-from ..rows import ActivityFilter, EventRow, SyncResult, TradeFilter, TradeGroupRow
+from ..rows import ActivityFilter, ActivityRow, EventRow, SyncResult, TradeFilter, TradeGroupRow, TxnRow
+from .replay import net_open_quantities
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from ..rows import ActivityRow
     from ..store import LedgerStore
 
 # Transactions executed within this window of each other cluster into one trade_group — covers
@@ -78,6 +78,85 @@ _STATUS_BY_EVENT = {
 
 
 _BARE_ACTIONS = {"Buy", "Sell"}  # futures trade without open/close intent -- direction from context
+
+
+async def synthesize_lapsed_settlements(
+    store: "LedgerStore",
+    account: str,
+    *,
+    dry_run: bool = False,
+) -> "list[ActivityRow]":
+    """Synthesize the MISSING broker settlement row for open lots past expiry.
+
+    Some expirations never produce a broker transaction (futures options that
+    just vanish; corporate-action re-symbols whose settlement arrives under a
+    different security_id). Without one, transaction-driven accounting — group
+    nets, group status — can never see the close, even though replay's lapse
+    backstop flattens the *position*. This pass recreates the row the broker
+    should have sent, and everything downstream consumes it like any real
+    ``Receive Deliver / Expiration``.
+
+    Rules (deterministic, idempotent):
+    * open lots come from ``net_open_quantities`` over the account's FULL
+      transaction history — never the positions table, which replay's lapse
+      backstop has already flattened for exactly these lots.
+    * clock = the account's own latest transaction, never wall-clock (same
+      rule as replay's ``_lapse_expired_lot``); a lot lapses only once the
+      account has activity a full day past the contract's expiry.
+    * id = ``lapse-<account>-<security_id>`` — re-runs upsert the same row.
+    * a real settlement (or a prior synthetic one) already nets the lot to
+      zero, so late-arriving broker truth wins and re-runs no-op — no
+      separate collision check needed.
+    * price 0 at expiry 21:15Z; replay's ``_effective_delta_price`` offsets
+      the open lot exactly like a feed-delivered expiration.
+
+    Returns the synthesized rows in ``v_account_activity`` shape so the
+    calling reconcile pass can admit them as candidates immediately (their
+    historical ``executed_at`` would fall outside any ``since`` window).
+    """
+    activity = await store.account_activity(ActivityFilter(account=account))
+    last_activity = max((a.executed_at for a in activity if a.executed_at is not None), default=None)
+    if last_activity is None:
+        return []
+
+    txns: list[TxnRow] = []
+    rows: list[ActivityRow] = []
+    for security_id, net in sorted(net_open_quantities(activity).items()):
+        if net == 0:
+            continue
+        sec = await store.get_security(security_id)
+        expiry = sec.expiry if sec is not None else None
+        if expiry is None or last_activity.date() <= expiry + timedelta(days=1):
+            continue
+        txn_id = f"lapse-{account}-{security_id}"
+        common = {
+            "tt_transaction_id": txn_id,
+            "account": account,
+            "transaction_type": "Receive Deliver",
+            "transaction_sub_type": "Expiration",
+            "security_id": security_id,
+            "underlying": sec.underlying if sec is not None else None,
+            "quantity": abs(net),
+            "price": Decimal("0"),
+            "net_value": Decimal("0"),
+            "executed_at": datetime.combine(expiry, datetime.min.time(), tzinfo=UTC).replace(
+                hour=21, minute=15
+            ),
+        }
+        txns.append(
+            TxnRow(
+                tt_order_id=None,
+                description="synthesized lapse: contract expired with no broker settlement row",
+                transaction_date=expiry,
+                **common,
+            )
+        )
+        rows.append(ActivityRow(**common))
+
+    if txns and not dry_run:
+        await store.upsert_transactions(txns)
+        logger.info("synthesized %d lapse settlement(s) for %s", len(txns), account)
+    return rows
 
 
 def _is_nontrade_close(row) -> bool:  # noqa: ANN001 -- ActivityRow | TxnRow (duck-typed)
@@ -164,6 +243,14 @@ async def reconcile(
             await store.link_orders_to_groups(acct)
 
             activity = await store.account_activity(ActivityFilter(account=acct, start=since))
+            # Self-heal: recreate settlement rows the broker never sent for
+            # open lots past expiry, then admit them as candidates in this
+            # same pass (their executed_at is the historical expiry, which a
+            # ``since`` window would otherwise exclude).
+            synthesized = await synthesize_lapsed_settlements(store, acct, dry_run=dry_run)
+            if synthesized:
+                result.transactions += len(synthesized)
+                activity = [*activity, *synthesized]
             candidates = [
                 a for a in activity
                 if a.trade_group_id is None

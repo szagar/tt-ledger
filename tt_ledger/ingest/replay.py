@@ -163,6 +163,35 @@ def _lapse_expired_lot(
     return flattened, [*plan, (f"__lapsed__{security_id}", False, closed)]
 
 
+def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
+    """Signed net open quantity per security, using replay's exact lot rules.
+
+    This is the transaction-level answer to "which lots does the ledger still think are
+    open" — the same walk ``_replay_security`` does (Money Movement excluded, settlements
+    clamp toward zero, an explicit close against a flat lot is a no-op, opens-before-closes
+    within one timestamp), reduced to the running signed quantity. Reconcile's lapse
+    synthesis keys off this instead of the positions table, because ``_lapse_expired_lot``
+    has already flattened the *stored* position for exactly the lots it needs to find.
+    """
+    by_security: dict[str, list[ActivityRow]] = {}
+    for row in rows:
+        if row.security_id is None or row.quantity is None or row.executed_at is None:
+            continue
+        by_security.setdefault(row.security_id, []).append(row)
+
+    nets: dict[str, Decimal] = {}
+    for security_id, sec_rows in by_security.items():
+        sec_rows.sort(key=lambda r: (r.executed_at, _closes_last(r)))
+        lot = _Lot()
+        for row in sec_rows:
+            delta, price = _effective_delta_price(row, lot)
+            if delta == 0 or price is None:
+                continue
+            lot.signed_quantity += delta
+        nets[security_id] = lot.signed_quantity
+    return nets
+
+
 async def _multiplier_of(store: "LedgerStore", security_id: str) -> int:
     sec = await store.get_security(security_id)
     return sec.multiplier if sec is not None and sec.multiplier else 1

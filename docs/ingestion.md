@@ -54,9 +54,19 @@ Turns ungrouped broker activity into reviewable trades.
 
 1. **Link** transactions → order deterministically: `transactions.tt_order_id = orders.tt_order_id`
    sets `order_id` (then leg linkage by `security_id`). No fuzzy/heuristic matching.
-2. **Group** ungrouped transactions by `(account, executed_at)` (tolerance window joins multi-order
+2. **Synthesize lapsed settlements** (`synthesize_lapsed_settlements`): an open lot past expiry
+   whose broker settlement row never arrived (futures options that just vanish; corporate-action
+   re-symbols) gets the missing `Receive Deliver / Expiration` transaction recreated —
+   deterministic id `lapse-<account>-<security_id>`, price 0 at expiry 21:15Z, quantity = the
+   lot's net. Open lots come from `net_open_quantities` over the account's full transaction
+   history (replay's exact lot rules — never the positions table, which replay's lapse backstop
+   has already flattened); the clock is the account's own latest transaction, never wall-clock.
+   A real (or prior synthetic) settlement nets the lot to zero, so re-runs and late-arriving
+   broker truth no-op. The rows are admitted as candidates in the same pass, so the stuck group
+   closes organically below.
+3. **Group** ungrouped transactions by `(account, executed_at)` (tolerance window joins multi-order
    strategies executed together).
-3. **Route** each cluster against the account's OPEN groups:
+4. **Route** each cluster against the account's OPEN groups:
    - **closing** rows (`* to Close` trades, `Receive Deliver` expiration/assignment/exercise —
      the latter carry no order-id and are admitted on sub-type) that offset an open group's legs
      **attach to that group** with the matching lifecycle event (`partial_exit` / `full_exit` /
@@ -66,8 +76,8 @@ Turns ungrouped broker activity into reviewable trades.
    - **rolls**: closes + opens in one cluster on the same underlying, or a close-cluster and an
      open-cluster within 60s (same underlying/option type/quantity), add a `roll` event with
      `rolled_to_group_id` on the old group.
-4. **Classify** `strategy_type` from the remaining (opening) legs.
-5. **Create** the `trade_group` with `origin=broker`, `review_status=NEEDS_REVIEW`, an `ENTRY` event,
+5. **Classify** `strategy_type` from the remaining (opening) legs.
+6. **Create** the `trade_group` with `origin=broker`, `review_status=NEEDS_REVIEW`, an `ENTRY` event,
    premium / max-profit-loss; set `orders.trade_group_id` + `transactions.trade_group_id`.
 
 **Idempotent**, and it **never re-attributes a `manually_attributed` group's membership** — so
