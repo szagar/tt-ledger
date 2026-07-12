@@ -518,29 +518,52 @@ def _route_cluster(
 ) -> "tuple[list[tuple[_OpenGroup, list[ActivityRow]]], list[ActivityRow]]":
     """Split a cluster into per-open-group closing buckets + the rest (which opens a new group).
 
-    A closing row belongs to the first open group holding its security; a closing row with no
-    matching open group (history doesn't reach the entry) falls into ``rest`` like any opener.
+    A closing row routes to the first open group still holding an OFFSETTING NET in its
+    security — long for ``Sell to Close``, short for ``Buy to Close``, either for a settlement
+    (no action) — and the group's remaining net is drawn down as rows are assigned, so several
+    closes in one cluster spread across the several groups they offset instead of first-match
+    piling them all onto one (two same-instant expirations, one lot each in groups 251/252,
+    both landed on 251 and left 252 stuck open forever). A closing row no group has net for
+    (history doesn't reach the entry, or the broker over-closes) falls back to the first group
+    whose MEMBERSHIP includes the security — attaching there is harmless (nets clamp) and beats
+    orphaning it into a junk rest-group; with no membership match either, it falls into ``rest``
+    like any opener.
     """
     buckets: list[tuple[_OpenGroup, list["ActivityRow"]]] = []
     by_id: dict[int, list["ActivityRow"]] = {}
     rest: list["ActivityRow"] = []
+    remaining = {id(g): _net_quantities(g.rows) for g in open_groups}  # drawn down per assignment
     for row in cluster:
         group = None
         if row.security_id is not None:
+            sid = row.security_id
             if _is_closing(row):
-                group = next((g for g in open_groups if row.security_id in g.security_ids()), None)
+                # settlements carry no action -> any nonzero net; trade closes must offset
+                delta = _action_delta(row) if row.action else None
+                group = next(
+                    (
+                        g for g in open_groups
+                        if (net := remaining[id(g)].get(sid)) and (delta is None or net * delta < 0)
+                    ),
+                    None,
+                )
+                if group is not None:
+                    net = remaining[id(group)][sid]
+                    qty = min(abs(row.quantity or Decimal("0")), abs(net))
+                    remaining[id(group)][sid] = net - qty if net > 0 else net + qty
+                else:
+                    group = next((g for g in open_groups if sid in g.security_ids()), None)
             elif row.action in _BARE_ACTIONS:
                 # a bare futures Buy/Sell closes when an open group holds the OPPOSITE
                 # position in that security (e.g. covering an assignment-delivered short);
                 # same-sign or no holder -> it opens/extends nothing here, falls to rest.
                 delta = _action_delta(row)
                 group = next(
-                    (
-                        g for g in open_groups
-                        if (net := _net_quantities(g.rows).get(row.security_id)) and net * delta < 0
-                    ),
+                    (g for g in open_groups if (net := remaining[id(g)].get(sid)) and net * delta < 0),
                     None,
                 )
+                if group is not None:
+                    remaining[id(group)][sid] += delta
         if group is None:
             rest.append(row)
             continue

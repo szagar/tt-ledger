@@ -309,3 +309,72 @@ async def test_assignment_delivery_forms_linked_group_and_bare_cover_closes_it(s
     assert future_group.realized_pnl == Decimal("-3562.50")
     future_events = await _events(store, future_group.group_id)
     assert TradeGroupEventType.FULL_EXIT.value in [e.event_type for e in future_events]
+
+
+# ------------------------------------------------- net-aware close routing (2026-07-12 fix)
+
+
+async def test_same_instant_closes_spread_across_holding_groups(store, accounts, resolver):
+    """The group-251/252 regression: two same-instant settlements, one lot each in two open
+    groups — first-match membership routing piled both onto the first group and left the
+    second stuck open forever. Net-aware routing draws down each group's remaining net, so
+    the second row moves on to the second group."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Buy to Open", quantity="1",
+           net_value="-100", executed_at=T0)
+    _trade(client, order_id="O-2", symbol=PUT_A, action="Buy to Open", quantity="1",
+           net_value="-105", executed_at=T0 + timedelta(minutes=10))  # own cluster -> own group
+    _receive_deliver(client, txn_id="RD-1", symbol=PUT_A, sub_type="Expiration", quantity="1",
+                     net_value="0", executed_at=T0 + timedelta(days=11))
+    _receive_deliver(client, txn_id="RD-2", symbol=PUT_A, sub_type="Expiration", quantity="1",
+                     net_value="0", executed_at=T0 + timedelta(days=11))
+
+    result = await _sync_and_reconcile(store, accounts, resolver, client)
+
+    assert result.trade_groups == 2  # the settlements created nothing new
+    trades = await _trades(store)
+    assert [t.status for t in trades] == [TradeGroupStatus.EXPIRED.value] * 2
+    for trade in trades:
+        events = await _events(store, trade.group_id)
+        expirations = [e for e in events if e.event_type == TradeGroupEventType.EXPIRATION.value]
+        assert len(expirations) == 1  # exactly ONE settlement each, not both on the first group
+        assert expirations[0].quantity_change == Decimal("-1")
+
+
+async def test_close_routes_to_the_group_with_offsetting_direction(store, accounts, resolver):
+    """A ``Buy to Close`` offsets a SHORT net: it must route to the short group even when a
+    long group holding the same contract comes first."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Buy to Open", quantity="1",
+           net_value="-100", executed_at=T0)  # first group: LONG
+    _trade(client, order_id="O-2", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="250", executed_at=T0 + timedelta(minutes=10))  # second group: SHORT
+    _trade(client, order_id="O-3", symbol=PUT_A, action="Buy to Close", quantity="1",
+           net_value="-90", executed_at=T0 + timedelta(hours=2))
+
+    await _sync_and_reconcile(store, accounts, resolver, client)
+
+    trades = sorted(await _trades(store), key=lambda t: t.executed_at)
+    long_group, short_group = trades
+    assert long_group.status == TradeGroupStatus.OPEN.value  # untouched
+    assert short_group.status == TradeGroupStatus.CLOSED.value
+    assert short_group.realized_pnl == Decimal("160")  # 250 credit - 90 debit
+
+
+async def test_overclose_falls_back_to_membership(store, accounts, resolver):
+    """A close no group has net for (broker over-close / window artifact) still attaches to
+    the group whose membership includes the security — old behavior preserved; it must NOT
+    orphan into a junk rest-group."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="250", executed_at=T0)
+    _trade(client, order_id="O-2", symbol=PUT_A, action="Buy to Close", quantity="1",
+           net_value="-100", executed_at=T0 + timedelta(hours=1))
+    _trade(client, order_id="O-3", symbol=PUT_A, action="Buy to Close", quantity="1",
+           net_value="-100", executed_at=T0 + timedelta(hours=1))  # same cluster, over-closes
+
+    result = await _sync_and_reconcile(store, accounts, resolver, client)
+
+    assert result.trade_groups == 1  # no junk group from the over-close
+    trades = await _trades(store)
+    assert len(trades) == 1

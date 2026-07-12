@@ -73,11 +73,16 @@ Turns ungrouped broker activity into reviewable trades.
    strategies executed together).
 4. **Route** each cluster against the account's OPEN groups:
    - **closing** rows (`* to Close` trades, `Receive Deliver` expiration/assignment/exercise —
-     the latter carry no order-id and are admitted on sub-type) that offset an open group's legs
-     **attach to that group** with the matching lifecycle event (`partial_exit` / `full_exit` /
-     `expiration` / `assignment` / `exercise`). A fully-offset group's `status` flips
-     (closed/expired/assigned/exercised; `mixed` when causes differ), `closed_at` is stamped, and
-     cash-basis `realized_pnl` (signed net across all member transactions) is written.
+     the latter carry no order-id and are admitted on sub-type) **attach to the first open group
+     still holding an offsetting net** in their security (long for `Sell to Close`, short for
+     `Buy to Close`, either for an action-less settlement), drawing that group's remaining net
+     down as rows are assigned — so several closes in one cluster spread across the several
+     groups they offset instead of first-match piling onto one. A close no group has net for
+     falls back to membership match (over-close / window artifact); the attach emits the
+     matching lifecycle event (`partial_exit` / `full_exit` / `expiration` / `assignment` /
+     `exercise`). A fully-offset group's `status` flips (closed/expired/assigned/exercised;
+     `mixed` when causes differ), `closed_at` is stamped, and cash-basis `realized_pnl` (signed
+     net across all member transactions) is written.
    - **rolls**: closes + opens in one cluster on the same underlying, or a close-cluster and an
      open-cluster within 60s (same underlying/option type/quantity), add a `roll` event with
      `rolled_to_group_id` on the old group.
