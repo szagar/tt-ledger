@@ -71,9 +71,10 @@ class Security(Base):
     multiplier: Mapped[int | None] = mapped_column(Integer, nullable=True)
     exchange: Mapped[str | None] = mapped_column(String(16), nullable=True)
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    tt_symbol: Mapped[str | None] = mapped_column(String(100), index=True, nullable=True)
-    occ_symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    streamer_symbol: Mapped[str | None] = mapped_column(String(50), index=True, nullable=True)
+    # Broker/vendor symbols — Text (no width guess; futures-option symbols run long).
+    tt_symbol: Mapped[str | None] = mapped_column(Text, index=True, nullable=True)
+    occ_symbol: Mapped[str | None] = mapped_column(Text, nullable=True)
+    streamer_symbol: Mapped[str | None] = mapped_column(Text, index=True, nullable=True)
     source_system: Mapped[str] = mapped_column(String(32), default="tastytrade")
     meta_json: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -104,18 +105,22 @@ class Order(Base):
     source_system: Mapped[str] = mapped_column(String(32), default="tastytrade")
     security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.security_id"), nullable=True)
     underlying: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    order_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
-    time_in_force: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Broker-supplied order vocab — Text, so an expanded TT value never truncates.
+    order_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    time_in_force: Mapped[str | None] = mapped_column(Text, nullable=True)
     gtc_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
     price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     stop_trigger: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     price_effect: Mapped[str | None] = mapped_column(String(8), nullable=True)
     average_fill_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     is_complex: Mapped[bool] = mapped_column(Boolean, default=False)
-    complex_order_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Holds the broker complex-order TAG (e.g. "OTOCO::trigger-order", 20 chars) —
+    # Text, not String(16): the width guess broke sync_orders on the first complex order.
+    complex_order_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     oms_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
-    tt_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
-    status_message: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # tt_status + status_message are broker-supplied (status vocab / free-form reject text).
+    tt_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     filled_quantity: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     remaining_quantity: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     signal_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
@@ -160,7 +165,7 @@ class OrderFill(Base):
     quantity: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     fill_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    destination_venue: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    destination_venue: Mapped[str | None] = mapped_column(Text, nullable=True)  # broker venue names
     ext_exec_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ext_group_fill_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
@@ -285,9 +290,10 @@ class Transaction(Base):
     account: Mapped[str] = mapped_column(ForeignKey("accounts.nickname"), index=True)
     account_number: Mapped[str | None] = mapped_column(String(32), nullable=True)  # audit
     source_system: Mapped[str] = mapped_column(String(32), default="tastytrade")
-    transaction_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    transaction_sub_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    action: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Broker transaction vocab — Text (TT's type/sub-type/action set expands over time).
+    transaction_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    transaction_sub_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action: Mapped[str | None] = mapped_column(Text, nullable=True)
     security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.security_id"), nullable=True)
     underlying: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     quantity: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
@@ -301,7 +307,7 @@ class Transaction(Base):
     regulatory_fees: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     proprietary_index_option_fees: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     is_estimated_fee: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)  # broker free-form text
     order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
     order_leg_id: Mapped[int | None] = mapped_column(ForeignKey("order_legs.id"), nullable=True, index=True)
     position_id: Mapped[int | None] = mapped_column(ForeignKey("positions.id"), nullable=True, index=True)
