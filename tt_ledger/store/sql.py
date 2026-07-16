@@ -524,8 +524,14 @@ class SqlLedgerStore:
             stmt = stmt.where(table.c.origin == f.origin.value)
         if f.account is not None:
             stmt = stmt.where(table.c.account == f.account)
+        if f.status is not None:
+            stmt = stmt.where(table.c.oms_status == f.status)
         if f.underlying is not None:
             stmt = stmt.where(table.c.underlying == f.underlying)
+        if f.trade_group_id is not None:
+            stmt = stmt.where(table.c.trade_group_id == f.trade_group_id)
+        if f.oms_order_id is not None:
+            stmt = stmt.where(table.c.oms_order_id == f.oms_order_id)
         if f.unlinked:
             stmt = stmt.where(table.c.trade_group_id.is_(None))
         if f.start is not None:

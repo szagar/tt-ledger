@@ -256,11 +256,14 @@ class LedgerClient:
     async def unlinked_orders(self, account: str | None = None, **f) -> "list[OrderDetail]":
         """Orders with no ``trade_group_id`` (the manual-attribution queue — typically
         broker-entered orders), with legs + fills for display and candidate ranking."""
+        return await self.order_details(account=account, unlinked=True, **f)
+
+    async def order_details(self, **f) -> "list[OrderDetail]":
+        """Filtered orders WITH legs + fills — the display-shaped read (``orders()`` is the
+        flat-row twin). Same ``OrderFilter`` fields as keywords."""
         if "origin" in f and isinstance(f["origin"], str):
             f["origin"] = Origin(f["origin"])
-        pairs = await self._store.query_orders_with_ids(
-            OrderFilter(account=account, unlinked=True, **f)
-        )
+        pairs = await self._store.query_orders_with_ids(OrderFilter(**f))
         order_ids = [pk for pk, _ in pairs]
         legs = await self._store.get_legs_for_orders(order_ids)
         fills = await self._store.get_fills_for_orders(order_ids)
