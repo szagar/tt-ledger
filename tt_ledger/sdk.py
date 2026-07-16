@@ -253,6 +253,32 @@ class LedgerClient:
             f["origin"] = Origin(f["origin"])
         return await self._store.query_orders(OrderFilter(**f))
 
+    async def unlinked_orders(self, account: str | None = None, **f) -> "list[OrderDetail]":
+        """Orders with no ``trade_group_id`` (the manual-attribution queue — typically
+        broker-entered orders), with legs + fills for display and candidate ranking."""
+        if "origin" in f and isinstance(f["origin"], str):
+            f["origin"] = Origin(f["origin"])
+        pairs = await self._store.query_orders_with_ids(
+            OrderFilter(account=account, unlinked=True, **f)
+        )
+        order_ids = [pk for pk, _ in pairs]
+        legs = await self._store.get_legs_for_orders(order_ids)
+        fills = await self._store.get_fills_for_orders(order_ids)
+        legs_by_order: dict[int, list] = {}
+        for leg in legs:
+            legs_by_order.setdefault(leg.order_id, []).append(leg)
+        fills_by_order: dict[int, list] = {}
+        for fill in fills:
+            if fill.order_id is not None:
+                fills_by_order.setdefault(fill.order_id, []).append(fill)
+        return [
+            OrderDetail(
+                order_pk=pk, order=row,
+                legs=legs_by_order.get(pk, []), fills=fills_by_order.get(pk, []),
+            )
+            for pk, row in pairs
+        ]
+
     async def trades(self, **f) -> "list[TradeRow]":
         if "origin" in f and isinstance(f["origin"], str):
             f["origin"] = Origin(f["origin"])

@@ -313,8 +313,11 @@ class InMemoryStore:
         return result
 
     async def query_orders(self, f: OrderFilter) -> list[OrderRow]:
+        return [row for _, row in await self.query_orders_with_ids(f)]
+
+    async def query_orders_with_ids(self, f: OrderFilter) -> list[tuple[int, OrderRow]]:
         out = []
-        for _, row in self._orders.all():
+        for row_id, row in self._orders.all():
             if f.origin is not None and row.origin != f.origin:
                 continue
             if f.account is not None and row.account != f.account:
@@ -327,9 +330,12 @@ class InMemoryStore:
                 continue
             if f.oms_order_id is not None and row.oms_order_id != f.oms_order_id:
                 continue
+            if f.unlinked and row.trade_group_id is not None:
+                continue
             if not _in_range(row.submitted_at, f.start, f.end):
                 continue
-            out.append(row)
+            out.append((row_id, row))
+        out.sort(key=lambda pair: (pair[1].received_at is None, pair[1].received_at, pair[0]))
         return out
 
     async def unified_trades(self, f: TradeFilter) -> list[TradeRow]:

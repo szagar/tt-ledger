@@ -507,6 +507,8 @@ class SqlLedgerStore:
             stmt = stmt.where(table.c.trade_group_id == f.trade_group_id)
         if f.oms_order_id is not None:
             stmt = stmt.where(table.c.oms_order_id == f.oms_order_id)
+        if f.unlinked:
+            stmt = stmt.where(table.c.trade_group_id.is_(None))
         if f.start is not None:
             stmt = stmt.where(table.c.submitted_at >= _day_start(f.start))
         if f.end is not None:
@@ -514,6 +516,25 @@ class SqlLedgerStore:
         async with self._sessionmaker() as session:
             rows = (await session.execute(stmt)).all()
         return [_mapping_to(OrderRow, r, origin=Origin, ingest=Ingest) for r in rows]
+
+    async def query_orders_with_ids(self, f: OrderFilter) -> list[tuple[int, OrderRow]]:
+        table = models.Order.__table__
+        stmt = select(table).order_by(table.c.received_at.asc().nulls_last(), table.c.id.asc())
+        if f.origin is not None:
+            stmt = stmt.where(table.c.origin == f.origin.value)
+        if f.account is not None:
+            stmt = stmt.where(table.c.account == f.account)
+        if f.underlying is not None:
+            stmt = stmt.where(table.c.underlying == f.underlying)
+        if f.unlinked:
+            stmt = stmt.where(table.c.trade_group_id.is_(None))
+        if f.start is not None:
+            stmt = stmt.where(table.c.submitted_at >= _day_start(f.start))
+        if f.end is not None:
+            stmt = stmt.where(table.c.submitted_at < _day_start(f.end) + timedelta(days=1))
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return [(r.id, _mapping_to(OrderRow, r, origin=Origin, ingest=Ingest)) for r in rows]
 
     async def unified_trades(self, f: TradeFilter) -> list[TradeRow]:
         table = models.TradeGroup.__table__

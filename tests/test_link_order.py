@@ -232,3 +232,29 @@ async def test_resync_of_working_order_preserves_the_link(store, accounts, resol
 
     order = await store.get_order("O-MANUAL")
     assert order.trade_group_id == linked_pk
+
+
+# --- the unlinked-orders read (cockpit queue) ---------------------------------------------------
+
+
+async def test_unlinked_orders_returns_only_ungrouped_with_legs(store, accounts, resolver):
+    await _open_group(store, accounts, resolver)  # linked via reconcile
+    client = MockTastyTradeClient()
+    order = _working_order("O-MANUAL", "XSP")
+    from tt_ledger.ingest.broker import PlacedLeg
+
+    order.legs = [
+        PlacedLeg(instrument_type="Equity Option", symbol="XSP   260116P00753000",
+                  action="Buy to Close", quantity=Decimal("1"), remaining_quantity=Decimal("1")),
+    ]
+    client.add_order(order)
+    await _sync(store, "main", client, accounts, resolver)
+
+    from tt_ledger.sdk import LedgerClient
+
+    ledger = LedgerClient(store=store, accounts=accounts, resolver=resolver)
+    details = await ledger.unlinked_orders(account="main")
+
+    assert [d.order.tt_order_id for d in details] == ["O-MANUAL"]
+    assert len(details[0].legs) == 1
+    assert details[0].legs[0].action == "Buy to Close"

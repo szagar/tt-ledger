@@ -439,6 +439,7 @@ class OrderFilter:
     underlying: str | None = None
     trade_group_id: int | None = None
     oms_order_id: str | None = None  # host OMS's order id (unique per order)
+    unlinked: bool = False  # only orders with NO trade_group_id (manual-attribution queue)
     start: date | None = None
     end: date | None = None
 
