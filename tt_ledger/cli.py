@@ -416,6 +416,31 @@ def build_app():
 
         _run(_do())
 
+    @trades_app.command("link-order")
+    def trades_link_order(
+        ctx: typer.Context,
+        tt_order_id: str,
+        to: str | None = typer.Option(None, "--to", help="Target group id. Omit and pass --new to create a fresh group."),
+        new: bool = typer.Option(False, "--new"),
+        reviewed_by: str = typer.Option(getpass.getuser(), "--reviewed-by"),
+    ) -> None:
+        """Attach an unlinked (broker-entered) order to a trade group; its fills follow."""
+        if to and new:
+            console.print("[red]Error:[/red] specify either --to or --new, not both")
+            raise typer.Exit(code=1)
+        if not to and not new:
+            console.print("[red]Error:[/red] specify --to <group_id> or --new")
+            raise typer.Exit(code=1)
+
+        async def _do():
+            client = _open_client(ctx)
+            try:
+                _print_trades_table([await client.link_order(tt_order_id, target=to, reviewed_by=reviewed_by)])
+            finally:
+                await client.close()
+
+        _run(_do())
+
     @trades_app.command("dismiss")
     def trades_dismiss(
         ctx: typer.Context,

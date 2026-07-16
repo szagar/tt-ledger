@@ -14,6 +14,7 @@ from .schemas import (
     ActivityDTO,
     ClosedPositionDTO,
     DismissRequest,
+    LinkOrderRequest,
     OrderDTO,
     PositionDTO,
     RegroupRequest,
@@ -133,6 +134,18 @@ async def regroup_trade(request: Request, group_id: str, body: RegroupRequest): 
 async def dismiss_trade(request: Request, group_id: str, body: DismissRequest):
     try:
         return await _client(request).dismiss_trade(group_id, reviewed_by=body.reviewed_by)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/orders/{tt_order_id}/link", response_model=TradeDTO)
+async def link_order(request: Request, tt_order_id: str, body: LinkOrderRequest):
+    """Attach an unlinked order to ``body.target`` (a group_id) or a new group when omitted.
+    Already-synced ungrouped fills attach immediately; later fills follow on every sync."""
+    try:
+        return await _client(request).link_order(
+            tt_order_id, target=body.target, reviewed_by=body.reviewed_by
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

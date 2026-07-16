@@ -16,7 +16,12 @@ from .identity import PassthroughResolver
 from .ingest.pull import sync_all
 from .ingest.push import StreamConsumer
 from .ingest.reconcile import find_misattributed_open_groups, reconcile
-from .ingest.remap import dismiss_trade_group, regroup_transactions, remap_trade_group
+from .ingest.remap import (
+    dismiss_trade_group,
+    link_order_to_group,
+    regroup_transactions,
+    remap_trade_group,
+)
 from .ingest.replay import rebuild_positions_from_transactions
 from .repositories import apply_fill_event, ensure_account
 from .rows import (
@@ -388,6 +393,13 @@ class LedgerClient:
 
     async def regroup(self, txn_ids: list[int], *, target: str | None, reviewed_by: str) -> "list[TradeRow]":
         return await regroup_transactions(self._store, txn_ids, target_group_id=target, reviewed_by=reviewed_by)
+
+    async def link_order(self, tt_order_id: str, *, target: str | None, reviewed_by: str) -> "TradeRow":
+        """Attach an unlinked order to ``target`` (a group_id) or a new group when None;
+        already-synced ungrouped fills attach immediately, later fills follow on every sync."""
+        return await link_order_to_group(
+            self._store, tt_order_id, target_group_id=target, reviewed_by=reviewed_by
+        )
 
     async def dismiss_trade(self, group_id: str, *, reviewed_by: str) -> "TradeRow":
         return await dismiss_trade_group(self._store, group_id, reviewed_by=reviewed_by)

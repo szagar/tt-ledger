@@ -171,8 +171,13 @@ class DismissRequest(BaseModel):
     reviewed_by: str
 
 
+class LinkOrderRequest(BaseModel):
+    target: str | None = None  # target group_id; None -> create a new group
+    reviewed_by: str
+
+
 __all__ = [
     "OrderDTO", "TradeDTO", "ActivityDTO", "TradeDetailDTO",
     "PositionDTO", "ClosedPositionDTO",
-    "RemapRequest", "RegroupRequest", "DismissRequest",
+    "RemapRequest", "RegroupRequest", "DismissRequest", "LinkOrderRequest",
 ]

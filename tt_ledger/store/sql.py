@@ -49,6 +49,15 @@ from ..schema.namespace import pg_schema, translate_map_for
 # re-upserts of the same tt_transaction_id (see _upsert's preserve_if_null).
 _TXN_LINKAGE_COLS = {"order_id", "order_leg_id", "position_id", "closed_position_id", "trade_group_id"}
 
+# Host-enrichment columns the broker order-history resync never knows -- preserved across
+# re-upserts of the same tt_order_id. A working (Live) order is re-upserted on every sync
+# cycle; without this, ``record_order`` pre-attribution or a manual ``link_order`` would be
+# wiped back to None between placement and fill.
+_ORDER_LINKAGE_COLS = {
+    "oms_order_id", "client_order_id", "signal_id", "trace_id",
+    "strategy_id", "trade_group_id", "market_context_id",
+}
+
 # Comfortably under asyncpg's 32767-bind-parameter statement cap (SQLite's modern cap is higher).
 _MAX_BIND_PARAMS = 30000
 
@@ -186,6 +195,7 @@ class SqlLedgerStore:
             return await self._upsert(
                 session, table, [_row_dict(r) for r in rows], ["tt_order_id"],
                 index_where=table.c.tt_order_id.isnot(None),
+                preserve_if_null=_ORDER_LINKAGE_COLS,
             )
 
     async def upsert_legs(self, rows: list[LegRow]) -> list[int]:

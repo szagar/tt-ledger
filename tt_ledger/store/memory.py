@@ -127,7 +127,20 @@ class InMemoryStore:
         self._accounts.upsert(row)
 
     async def upsert_orders(self, rows: list[OrderRow]) -> list[int]:
-        return [self._orders.upsert(row) for row in rows]
+        ids = []
+        for row in rows:
+            # mirror the SQL store's preserve-if-null on host-enrichment columns: a broker
+            # resync of a still-working order must not wipe record_order/link_order linkage.
+            existing = self._orders.get_by_key(row.tt_order_id) if row.tt_order_id else None
+            if existing is not None:
+                for f in (
+                    "oms_order_id", "client_order_id", "signal_id", "trace_id",
+                    "strategy_id", "trade_group_id", "market_context_id",
+                ):
+                    if getattr(row, f, None) is None:
+                        setattr(row, f, getattr(existing, f, None))
+            ids.append(self._orders.upsert(row))
+        return ids
 
     async def upsert_legs(self, rows: list[LegRow]) -> list[int]:
         return [self._legs.upsert(row) for row in rows]

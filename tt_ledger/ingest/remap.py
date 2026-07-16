@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from ..enums import Origin, ReviewStatus, TradeGroupEventType, TradeGroupStatus
 from ..rows import ActivityFilter, EventRow, OrderFilter, TradeGroupRow, trade_group_to_row
-from .reconcile import compute_group_fields
+from .reconcile import compute_group_fields, reconcile
 
 if TYPE_CHECKING:
     from ..rows import TradeRow
@@ -135,6 +135,77 @@ async def _recompute_group(store: "LedgerStore", trade_group_id: int, tg: TradeG
     updated = replace(tg, **fields)
     await store.upsert_trade_group(updated)
     return updated
+
+
+async def link_order_to_group(
+    store: "LedgerStore",
+    tt_order_id: str,
+    *,
+    target_group_id: str | None,  # None -> new group
+    reviewed_by: str,
+) -> "TradeRow":
+    """Attach an unlinked order (typically a broker-entered one, ``origin=broker``) to
+    ``target_group_id``, or to a brand-new group when omitted; ADJUSTMENT event; then run a
+    scoped ``reconcile`` so the order's already-synced ungrouped fills attach immediately.
+
+    Later fills follow automatically: once ``orders.trade_group_id`` is set, every future
+    fill routes through reconcile's pre-attributed-order path (``_apply_intent_rows`` — opens
+    attach as members, closes run the exit machinery), the same path OMS-submitted orders
+    use. The stamp survives broker resyncs of the still-working order via ``upsert_orders``'s
+    preserve-if-null.
+
+    Fills that an earlier reconcile pass already routed to some OTHER group are not moved —
+    that is ``regroup``'s job (transactions with a ``trade_group_id`` are permanently excluded
+    from automatic re-grouping).
+    """
+    order = await store.get_order(tt_order_id)
+    if order is None:
+        raise ValueError(f"order {tt_order_id!r} not found")
+    if order.trade_group_id is not None:
+        raise ValueError(
+            f"order {tt_order_id!r} is already linked to trade group pk={order.trade_group_id}"
+            " — move its transactions with regroup instead"
+        )
+
+    now = datetime.now(UTC)
+    if target_group_id is None:
+        group_pk = await store.upsert_trade_group(
+            TradeGroupRow(
+                group_id=str(uuid.uuid4()), account=order.account, origin=Origin.BROKER,
+                review_status=ReviewStatus.NEEDS_REVIEW, manually_attributed=True,
+                status=TradeGroupStatus.OPEN.value, reviewed_by=reviewed_by, reviewed_at=now,
+                underlying=order.underlying, security_id=order.security_id,
+            )
+        )
+    else:
+        target_tg = await store.get_trade_group(target_group_id)
+        if target_tg is None:
+            raise ValueError(f"target trade group {target_group_id!r} not found")
+        if target_tg.account != order.account:
+            raise ValueError(
+                f"target trade group {target_group_id!r} belongs to account "
+                f"{target_tg.account!r}, order {tt_order_id!r} to {order.account!r}"
+            )
+        group_pk = await store.upsert_trade_group(
+            replace(target_tg, manually_attributed=True, reviewed_by=reviewed_by, reviewed_at=now)
+        )
+
+    await store.upsert_orders([replace(order, trade_group_id=group_pk)])
+
+    await store.add_trade_group_event(
+        EventRow(
+            trade_group_id=group_pk, event_type=TradeGroupEventType.ADJUSTMENT.value,
+            event_at=now, notes=f"order {tt_order_id} linked by {reviewed_by}",
+        )
+    )
+
+    # Attach any fills that already synced ungrouped; future fills follow on every sync.
+    await reconcile(store, order.account)
+
+    tg = await store.get_trade_group_by_id(group_pk)
+    if tg is None:  # pragma: no cover - the group was just written
+        raise ValueError(f"trade group pk={group_pk} vanished during link")
+    return trade_group_to_row(tg)
 
 
 async def dismiss_trade_group(store: "LedgerStore", group_id: str, *, reviewed_by: str) -> "TradeRow":
