@@ -392,12 +392,30 @@ class ActivityRow:
 
 
 @dataclass
+class OrderLegInput:
+    """One leg of an order recorded at submission — the host OMS knows its legs synchronously,
+    so a resting (working) order renders with structure immediately instead of waiting for the
+    pull path to backfill ``order_legs``. Carries the broker-native ``symbol`` (like
+    ``BrokerTransaction``) — ``record_order`` resolves it through the injected resolver and
+    upserts the securities dimension row, exactly as the pull path does. Fill fields are never
+    set here; sync/push enrichment owns those."""
+
+    symbol: str  # broker-native leg symbol; resolved via the injected SecurityResolver
+    instrument_type: str | None = None  # resolver hint (broker instrument-type vocab)
+    action: str | None = None  # broker or proto vocab ("Buy to Open" / "BUY_TO_OPEN")
+    quantity: Decimal | None = None
+    price: Decimal | None = None  # per-leg limit price, when the host has one
+
+
+@dataclass
 class OrderInput:
     """An order recorded at submission (oms_submit path). ``tt_order_id`` may be set when the
     host records right after the broker's submit response (the id is known synchronously there);
     left None, it arrives later via push/pull enrichment (docs/ingestion.md). ``trade_group``
     (the public UUID from ``open_trade_group``) pre-attributes the order — its fills/transactions
-    then attach to that group in reconcile instead of clustering into a new one."""
+    then attach to that group in reconcile instead of clustering into a new one. ``legs``
+    (optional) writes ``order_legs`` at record time; the pull path later enriches the same
+    (order_id, leg_index) rows with fill data."""
 
     account: str
     tt_order_id: str | None = None
@@ -415,6 +433,7 @@ class OrderInput:
     strategy_id: int | None = None
     market_context_id: int | None = None
     trade_group: str | None = None  # trade_groups.group_id (UUID), not the surrogate pk
+    legs: list[OrderLegInput] = field(default_factory=list)
 
 
 @dataclass

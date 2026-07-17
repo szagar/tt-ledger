@@ -23,10 +23,11 @@ from .ingest.remap import (
     remap_trade_group,
 )
 from .ingest.replay import rebuild_positions_from_transactions
-from .repositories import apply_fill_event, ensure_account
+from .repositories import SecurityRepository, apply_fill_event, ensure_account
 from .rows import (
     ActivityFilter,
     EventRow,
+    LegRow,
     OrderDetail,
     OrderFilter,
     OrderRow,
@@ -114,7 +115,10 @@ class LedgerClient:
         submit response already supplied it (the pull/push paths then enrich this row instead of
         creating a broker-origin duplicate); pass ``trade_group`` (from ``open_trade_group``) to
         pre-attribute the order -- reconcile attaches its transactions to that group instead of
-        clustering them into a new needs-review one."""
+        clustering them into a new needs-review one. ``order.legs`` (optional) writes
+        ``order_legs`` immediately -- a resting (working) order then carries its structure from
+        the first read instead of waiting for pull-path backfill; the pull path later enriches
+        the same (order_id, leg_index) rows with fill data."""
         await ensure_account(self._store, self._accounts, order.account, self._ensured_accounts)
         trade_group_id = None
         if order.trade_group is not None:
@@ -132,7 +136,25 @@ class LedgerClient:
             trade_group_id=trade_group_id,
             market_context_id=order.market_context_id, received_at=datetime.now(UTC),
         )
-        await self._store.upsert_orders([row])
+        order_ids = await self._store.upsert_orders([row])
+        if order.legs:
+            securities = SecurityRepository(self._store)
+            seen_security_ids: set[str] = set()
+            leg_rows: list[LegRow] = []
+            for leg_index, leg in enumerate(order.legs):
+                resolved = self._resolver.resolve(leg.symbol, leg.instrument_type)
+                if resolved.security_id not in seen_security_ids:
+                    await securities.upsert(resolved, tt_symbol=leg.symbol)
+                    seen_security_ids.add(resolved.security_id)
+                leg_rows.append(
+                    LegRow(
+                        order_id=order_ids[0], leg_index=leg_index,
+                        security_id=resolved.security_id,
+                        action=leg.action, quantity=leg.quantity,
+                        remaining_quantity=leg.quantity, price=leg.price,
+                    )
+                )
+            await self._store.upsert_legs(leg_rows)
         return row
 
     async def open_trade_group(

@@ -14,7 +14,7 @@ from tt_ledger.identity import AccountMapper, PassthroughResolver
 from tt_ledger.ingest.mock_broker import MockTastyTradeClient
 from tt_ledger.ingest.pull import sync_orders, sync_transactions
 from tt_ledger.ingest.reconcile import reconcile
-from tt_ledger.rows import OrderInput, TradeFilter
+from tt_ledger.rows import OrderInput, OrderLegInput, TradeFilter
 from tt_ledger.sdk import LedgerClient
 from tt_ledger.store.memory import InMemoryStore
 
@@ -85,6 +85,58 @@ async def test_record_order_carries_the_intent_group(client, store):
 async def test_record_order_rejects_an_unknown_group(client):
     with pytest.raises(ValueError, match="unknown trade_group"):
         await client.record_order(OrderInput(account="main", trade_group="nope"))
+
+
+async def test_record_order_writes_legs_at_submission(client, store):
+    """Legs passed with the intent write land in order_legs immediately — a resting
+    (working) order carries its structure from the first read, no pull-path wait."""
+    call_b = "SPY   260116C00600000"
+    trade = await client.open_trade_group("main", strategy_type="vertical", underlying="SPY")
+    await client.record_order(
+        OrderInput(
+            account="main", tt_order_id="O-1", underlying="SPY", trade_group=trade.group_id,
+            legs=[
+                OrderLegInput(symbol=PUT_A, instrument_type="Equity Option",
+                              action="Buy to Open", quantity=Decimal("1")),
+                OrderLegInput(symbol=call_b, instrument_type="Equity Option",
+                              action="Sell to Open", quantity=Decimal("2")),
+            ],
+        )
+    )
+
+    details = await client.trade_structure(trade.group_id)
+    assert len(details) == 1
+    legs = details[0].legs
+    assert [(leg.security_id, leg.action, leg.quantity, leg.remaining_quantity) for leg in legs] == [
+        (PUT_A, "Buy to Open", Decimal("1"), Decimal("1")),
+        (call_b, "Sell to Open", Decimal("2"), Decimal("2")),
+    ]
+    # The securities dimension rows exist (order_legs FKs securities.security_id in SQL).
+    for sid in (PUT_A, call_b):
+        assert await store.get_security(sid) is not None
+
+
+async def test_sync_enriches_intent_legs_in_place(client, store, accounts):
+    """The pull path upserts on (order_id, leg_index) — intent-recorded legs are enriched
+    with fill data, never duplicated."""
+    trade = await client.open_trade_group("main", strategy_type="single", underlying="SPY")
+    await client.record_order(
+        OrderInput(
+            account="main", tt_order_id="O-1", underlying="SPY", trade_group=trade.group_id,
+            legs=[OrderLegInput(symbol=PUT_A, instrument_type="Equity Option",
+                                action="Sell to Open", quantity=Decimal("1"))],
+        )
+    )
+    broker = MockTastyTradeClient()
+    _fill(broker, order_id="O-1", action="Sell to Open", net_value="250", executed_at=T0)
+    await _sync(store, accounts, broker)
+
+    details = await client.trade_structure(trade.group_id)
+    assert len(details) == 1
+    legs = details[0].legs
+    assert len(legs) == 1  # enriched in place, not duplicated
+    assert legs[0].security_id == PUT_A
+    assert legs[0].fill_price == Decimal("2.5")
 
 
 async def test_entry_fills_attach_to_the_intent_group_not_a_new_one(client, store, accounts):
