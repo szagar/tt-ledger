@@ -14,6 +14,7 @@ from sqlalchemy import select
 from tt_ledger.enums import Ingest, Origin, ReviewStatus
 from tt_ledger.rows import (
     ActivityFilter,
+    ClosedPositionRow,
     EventRow,
     FillRow,
     LegRow,
@@ -533,3 +534,46 @@ async def test_bulk_upsert_chunks_past_the_bind_parameter_cap(store):
     ]
     leg_ids = await store.upsert_legs(legs)
     assert len(leg_ids) == 4000
+
+
+async def test_link_closed_positions_to_groups(seeded):
+    """closed_positions.trade_group_id is stamped from its closing order's group
+    (tt-ledger#2) — only for attributed orders, only NULLs, idempotently."""
+    store = seeded
+    group_pk = await store.upsert_trade_group(
+        TradeGroupRow(group_id="GRP-C", account="main", origin=Origin.ZTS)
+    )
+    # an ATTRIBUTED closing order + the position it closed
+    await store.upsert_orders([
+        OrderRow(
+            tt_order_id="TT-CLOSE", account="main", origin=Origin.ZTS,
+            ingest=Ingest.OMS_SUBMIT, security_id="AAPL", trade_group_id=group_pk,
+        )
+    ])
+    close_oid = await _order_surrogate_id(store, "TT-CLOSE")
+    await store.upsert_closed_position(ClosedPositionRow(
+        account="main", security_id="AAPL", quantity=Decimal("1"), quantity_direction="Long",
+        closing_order_id=close_oid,
+        opened_at=datetime(2026, 7, 1, tzinfo=UTC), closed_at=datetime(2026, 7, 2, tzinfo=UTC),
+    ))
+    # an UNATTRIBUTED closing order + its position (must stay NULL)
+    await store.upsert_orders([
+        OrderRow(
+            tt_order_id="TT-ORPHAN", account="main", origin=Origin.BROKER,
+            ingest=Ingest.ORDER_HISTORY, security_id="/ESM6",
+        )
+    ])
+    orphan_oid = await _order_surrogate_id(store, "TT-ORPHAN")
+    await store.upsert_closed_position(ClosedPositionRow(
+        account="main", security_id="/ESM6", quantity=Decimal("1"), quantity_direction="Short",
+        closing_order_id=orphan_oid,
+        opened_at=datetime(2026, 7, 1, tzinfo=UTC), closed_at=datetime(2026, 7, 3, tzinfo=UTC),
+    ))
+
+    assert await store.link_closed_positions_to_groups("main") == 1
+
+    by_sec = {cp.security_id: cp for cp in await store.get_closed_positions("main")}
+    assert by_sec["AAPL"].trade_group_id == group_pk   # stamped from the closing order
+    assert by_sec["/ESM6"].trade_group_id is None      # unattributed order → stays NULL
+
+    assert await store.link_closed_positions_to_groups("main") == 0  # idempotent

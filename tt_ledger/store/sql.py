@@ -290,6 +290,32 @@ class SqlLedgerStore:
             )
             return result.rowcount or 0
 
+    async def link_closed_positions_to_groups(self, account: str) -> int:
+        """Self-heal the closed_positions ⋈ trade_groups edge: stamp
+        ``closed_positions.trade_group_id`` from its closing order
+        (``orders.trade_group_id``). closed_positions is built by replay (which
+        knows the closing order but not the group); group attribution lives on
+        ``orders`` (remap), so without this the direct column is never written.
+        Only fills NULLs, only from attributed orders — idempotent, backfilling."""
+        closed = models.ClosedPosition.__table__
+        orders = models.Order.__table__
+        sub = (
+            select(orders.c.id.label("oid"), orders.c.trade_group_id.label("tg"))
+            .where(orders.c.account == account, orders.c.trade_group_id.isnot(None))
+            .subquery()
+        )
+        async with self._sessionmaker() as session, session.begin():
+            result = await session.execute(
+                update(closed)
+                .where(
+                    closed.c.account == account,
+                    closed.c.trade_group_id.is_(None),
+                    closed.c.closing_order_id == sub.c.oid,
+                )
+                .values(trade_group_id=sub.c.tg)
+            )
+            return result.rowcount or 0
+
     async def link_transactions_to_positions(self, links: list[tuple[str, int | None, int | None]]) -> int:
         if not links:
             return 0

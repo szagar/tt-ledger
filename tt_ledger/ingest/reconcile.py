@@ -379,6 +379,10 @@ async def reconcile(
             # earlier pass but whose own trade_group_id is unset (e.g. rows re-synced before
             # the preserve-on-resync fix, or created after their transactions were grouped)
             await store.link_orders_to_groups(acct)
+            # and the closed_positions ⋈ trade_groups edge (from the closing
+            # order) — runs after orders are attributed above, so it backfills
+            # the direct column the replay path never writes.
+            await store.link_closed_positions_to_groups(acct)
 
             # Self-heal: recreate the settlement rows the broker never sent for
             # open lots past expiry and apply them straight to the stuck groups

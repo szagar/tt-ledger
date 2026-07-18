@@ -79,6 +79,11 @@ Composite indexes: `(account, executed_at)`, `(account, transaction_date)`.
 `average_close_price` / `realized_pnl` (gross) / `fees` / `pnl_net` (= realized_pnl − fees; use for
 R-multiples) (Money) · `opening_order_id` / `closing_order_id` / `trade_group_id` (FK) ·
 `opened_at` / `closed_at` · `holding_period_days`.
+`trade_group_id` is NOT written by replay (which builds these rows and knows only
+the closing order); it is back-filled from the closing order's group by
+`reconcile` via `link_closed_positions_to_groups` (self-heal, idempotent) — so
+group linkage still lives primarily on `orders`, and per-closed-position group
+queries only work after a reconcile pass. (tt-ledger#2.)
 
 ### trade_groups
 `id` PK · `group_id` UNIQUE · `account` · `origin` (zts|broker) · `source_system` · `review_status`

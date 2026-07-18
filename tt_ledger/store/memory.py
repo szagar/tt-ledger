@@ -202,6 +202,22 @@ class InMemoryStore:
                 linked += 1
         return linked
 
+    async def link_closed_positions_to_groups(self, account: str) -> int:
+        tg_by_order_id = {
+            oid: order.trade_group_id
+            for oid, order in self._orders.all()
+            if order.trade_group_id is not None
+        }
+        linked = 0
+        for _, cp in self._closed_positions.all():
+            if cp.account != account or cp.trade_group_id is not None or cp.closing_order_id is None:
+                continue
+            tg = tg_by_order_id.get(cp.closing_order_id)
+            if tg is not None:
+                cp.trade_group_id = tg
+                linked += 1
+        return linked
+
     async def link_transactions_to_positions(self, links: list[tuple[str, int | None, int | None]]) -> int:
         by_tt_transaction_id = {tt_transaction_id: (position_id, closed_position_id) for tt_transaction_id, position_id, closed_position_id in links}
         linked = 0
