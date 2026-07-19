@@ -234,7 +234,7 @@ class TradeGroup(Base):
     total_premium: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     quantity: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     total_fees: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="open")
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
     realized_pnl: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     unrealized_pnl: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
     max_profit: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
