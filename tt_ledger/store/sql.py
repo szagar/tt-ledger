@@ -30,6 +30,7 @@ from ..rows import (
     FillRow,
     LegDetailRow,
     LegRow,
+    OpenGroupLegRow,
     OrderFilter,
     OrderRow,
     PositionRow,
@@ -40,6 +41,7 @@ from ..rows import (
     TransactionDetailRow,
     TransactionQuery,
     TxnRow,
+    fold_open_group_legs as _fold_open_group_legs,
 )
 from ..schema import metadata, models
 from ..schema.namespace import pg_schema, translate_map_for
@@ -98,7 +100,24 @@ def _mapping_to(cls: type, row: Row, **enum_fields: type[Enum]) -> Any:
 
 
 class SqlLedgerStore:
-    def __init__(self, url: str = "sqlite+aiosqlite:///ledger.db") -> None:
+    def __init__(
+        self,
+        url: str = "sqlite+aiosqlite:///ledger.db",
+        *,
+        pool_size: int | None = None,
+        max_overflow: int | None = None,
+        pool_timeout: int | None = None,
+    ) -> None:
+        """A SQL-backed ledger store.
+
+        ``pool_size`` / ``max_overflow`` / ``pool_timeout`` bound this store's connection
+        pool; omit them for SQLAlchemy's defaults (5 + 10 overflow). Pass them whenever
+        many stores share ONE server: the ceiling that matters is per-pool x pool count,
+        and an unbounded default can exhaust the server's ``max_connections`` during a
+        burst while every individual pool still looks well-behaved. (2026-07-28: four
+        strategy-engine processes each holding several 15-connection ledger pools took
+        the zts Postgres to its 100-connection limit; 406 bot fires lost their audit row.)
+        """
         engine_kwargs: dict[str, Any] = {"pool_pre_ping": True}
         if url.startswith("sqlite") and ":memory:" in url:
             # an in-memory SQLite DB is per-connection; pin the pool to one connection so
@@ -106,6 +125,14 @@ class SqlLedgerStore:
             from sqlalchemy.pool import StaticPool
 
             engine_kwargs = {"poolclass": StaticPool, "connect_args": {"check_same_thread": False}}
+        else:
+            # StaticPool takes no sizing args, hence the else.
+            if pool_size is not None:
+                engine_kwargs["pool_size"] = pool_size
+            if max_overflow is not None:
+                engine_kwargs["max_overflow"] = max_overflow
+            if pool_timeout is not None:
+                engine_kwargs["pool_timeout"] = pool_timeout
         translate_map = translate_map_for(url)
         if translate_map is not None:
             # Postgres: ledger tables live in a dedicated schema (schema/namespace.py).
@@ -678,6 +705,42 @@ class SqlLedgerStore:
         async with self._sessionmaker() as session:
             rows = (await session.execute(stmt)).all()
         return [(r.account, r.security_id, r.trade_group_id) for r in rows]
+
+    async def open_group_legs(self, account: str | None = None) -> list[OpenGroupLegRow]:
+        """Per-(open group, security) stake: the group's OWN net-open quantity and the
+        VWAP of its OWN opening fills. Same netting convention as ``net_open_by_group``
+        (only ``* to Open`` / ``* to Close`` move the count); the VWAP is over opening
+        fills alone, so a partially-closed leg keeps its entry basis.
+
+        The netting + VWAP are folded in PYTHON over the open book's member transactions
+        rather than aggregated in SQL. ``price * quantity`` inside SQL is not portable
+        across our two backends: ``Money`` is a native NUMERIC on Postgres but a SCALED
+        INTEGER (micro-units) on SQLite, so a product of two Money columns comes back
+        10^6 times too large there and the VWAP silently differs by backend. Folding the
+        already-typed Decimals sidesteps the whole class. The scan is bounded by the OPEN
+        book (not history) and this read refreshes on group-map reload, not per tick."""
+        txns = models.Transaction.__table__
+        groups = models.TradeGroup.__table__
+        stmt = (
+            select(
+                txns.c.account,
+                txns.c.security_id,
+                txns.c.trade_group_id,
+                txns.c.action,
+                txns.c.quantity,
+                txns.c.price,
+            )
+            .select_from(txns.join(groups, txns.c.trade_group_id == groups.c.id))
+            .where(groups.c.status == "open", txns.c.security_id.isnot(None))
+        )
+        if account is not None:
+            stmt = stmt.where(txns.c.account == account)
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+        return _fold_open_group_legs(
+            (r.account, r.security_id, r.trade_group_id, r.action, r.quantity, r.price)
+            for r in rows
+        )
 
     async def net_open_by_group(self, trade_group_ids: list[int]) -> dict[int, dict[str, int]]:
         if not trade_group_ids:

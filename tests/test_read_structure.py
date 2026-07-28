@@ -292,3 +292,94 @@ async def test_sdk_transactions_and_open_position_groups(client):
 
     mapping = await client.open_position_groups()
     assert mapping == {("main", "option:SPXW:2026-07-03:put:6200"): group_pk}
+
+
+# --- per-group shares of a broker-aggregated position -------------------------------------
+
+
+async def _seed_shared_strike(store) -> tuple[int, int]:
+    """Two OPEN groups holding the SAME strike at different prices — the A/B-arm
+    case the account-wide ``positions`` row cannot represent (the broker blends
+    both lots into one row)."""
+    await store.upsert_account(AccountRow(nickname="main", account_number="ACCT1", login="user1"))
+    pk_a = await store.upsert_trade_group(
+        TradeGroupRow(group_id="s-a", account="main", origin=Origin.ZTS,
+                      review_status=ReviewStatus.CONFIRMED, status="open")
+    )
+    pk_b = await store.upsert_trade_group(
+        TradeGroupRow(group_id="s-b", account="main", origin=Origin.ZTS,
+                      review_status=ReviewStatus.CONFIRMED, status="open")
+    )
+
+    def _txn(tid, group_pk, action, sid, qty, price, *, at):
+        return TxnRow(tt_transaction_id=tid, tt_order_id=None, account="main",
+                      transaction_type="Trade", action=action, security_id=sid,
+                      quantity=Decimal(qty), price=Decimal(price), trade_group_id=group_pk,
+                      executed_at=datetime(2026, 7, 1, at, 30, tzinfo=UTC))
+
+    sid = "option:SPXW:2026-07-03:put:6200"
+    await store.upsert_transactions([
+        _txn("S-A1", pk_a, "Sell to Open", sid, "1", "3.00", at=14),
+        _txn("S-B1", pk_b, "Sell to Open", sid, "2", "5.00", at=15),
+        # B also scaled out of half its lot: net 1 left, entry basis unchanged.
+        _txn("S-B2", pk_b, "Buy to Close", sid, "1", "4.00", at=16),
+    ])
+    return pk_a, pk_b
+
+
+async def test_open_group_legs_splits_a_shared_strike(any_store):
+    pk_a, pk_b = await _seed_shared_strike(any_store)
+    sid = "option:SPXW:2026-07-03:put:6200"
+
+    legs = {leg.trade_group_id: leg for leg in await any_store.open_group_legs()}
+
+    assert legs[pk_a].net_open == 1
+    assert legs[pk_a].average_open_price == Decimal("3.00")
+    # B opened 2 @ 5.00 and closed 1 → net 1, and the CLOSE does not move the
+    # entry basis (the VWAP is over opening fills only).
+    assert legs[pk_b].net_open == 1
+    assert legs[pk_b].average_open_price == Decimal("5.00")
+    assert {leg.security_id for leg in legs.values()} == {sid}
+    assert {leg.account for leg in legs.values()} == {"main"}
+
+
+async def test_open_group_legs_excludes_closed_groups(any_store):
+    """Only OPEN groups claim a contract — a closed sibling must not appear."""
+    pk_a, _ = await _seed_net_open(any_store)  # group B there is status="closed"
+    accounts = {leg.trade_group_id for leg in await any_store.open_group_legs()}
+    assert accounts == {pk_a}
+
+
+async def test_open_group_legs_account_filter(any_store):
+    await _seed_shared_strike(any_store)
+    assert await any_store.open_group_legs("nobody") == []
+    assert len(await any_store.open_group_legs("main")) == 2
+
+
+async def test_sdk_open_position_shares_lists_every_claim(client):
+    pk_a, pk_b = await _seed_shared_strike(client._store)
+    sid = "option:SPXW:2026-07-03:put:6200"
+
+    shares = await client.open_position_shares()
+
+    claims = shares[("main", sid)]
+    assert [c.trade_group_id for c in claims] == [pk_a, pk_b]  # oldest group first
+    assert [c.net_open for c in claims] == [1, 1]
+    assert [c.average_open_price for c in claims] == [Decimal("3.00"), Decimal("5.00")]
+    # open_position_groups collapses the same contract to ONE owner — the loss
+    # this read exists to undo.
+    assert await client.open_position_groups() == {("main", sid): pk_b}
+
+
+async def test_sdk_open_position_shares_drops_fully_closed_legs(client):
+    """A group that has closed its side of a shared strike no longer claims it."""
+    pk_a, pk_b = await _seed_shared_strike(client._store)
+    sid = "option:SPXW:2026-07-03:put:6200"
+    await client._store.upsert_transactions([
+        TxnRow(tt_transaction_id="S-A2", tt_order_id=None, account="main",
+               transaction_type="Trade", action="Buy to Close", security_id=sid,
+               quantity=Decimal("1"), price=Decimal("2.00"), trade_group_id=pk_a,
+               executed_at=datetime(2026, 7, 1, 17, 30, tzinfo=UTC)),
+    ])
+    claims = (await client.open_position_shares())[("main", sid)]
+    assert [c.trade_group_id for c in claims] == [pk_b]

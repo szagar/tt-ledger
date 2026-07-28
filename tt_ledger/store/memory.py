@@ -24,6 +24,7 @@ from ..rows import (
     FillRow,
     LegDetailRow,
     LegRow,
+    OpenGroupLegRow,
     OrderFilter,
     OrderRow,
     PositionRow,
@@ -34,6 +35,7 @@ from ..rows import (
     TransactionDetailRow,
     TransactionQuery,
     TxnRow,
+    fold_open_group_legs,
 )
 
 T = TypeVar("T")
@@ -310,6 +312,17 @@ class InMemoryStore:
     async def get_group_transactions(self, trade_group_id: int) -> list[TxnRow]:
         rows = [txn for _, txn in self._transactions.all() if txn.trade_group_id == trade_group_id]
         return sorted(rows, key=lambda t: (t.executed_at is None, t.executed_at))
+
+    async def open_group_legs(self, account: str | None = None) -> list[OpenGroupLegRow]:
+        open_ids = {
+            row_id for row_id, tg in self._trade_groups.all() if (tg.status or "") == "open"
+        }
+        return fold_open_group_legs(
+            (txn.account, txn.security_id, txn.trade_group_id, txn.action, txn.quantity, txn.price)
+            for _, txn in self._transactions.all()
+            if txn.trade_group_id in open_ids
+            and (account is None or txn.account == account)
+        )
 
     async def net_open_by_group(self, trade_group_ids: list[int]) -> dict[int, dict[str, int]]:
         wanted = set(trade_group_ids)

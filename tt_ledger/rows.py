@@ -164,6 +164,66 @@ class PositionRow:
 
 
 @dataclass
+class OpenGroupLegRow:
+    """One open trade group's OWN stake in a security, replayed from that group's own
+    transactions.
+
+    ``positions`` holds one row per (account, security_id) because the broker aggregates
+    every lot of a contract into a single position — so when two open groups hold the same
+    strike (A/B arms of one strategy, laddered entries), the account-wide position view
+    cannot say which group owns what. This row can: ``net_open`` is the group's own
+    Σ(opening qty) − Σ(closing qty), and ``average_open_price`` is the VWAP of the group's
+    OWN opening fills, not the blend across sibling groups.
+
+    Consumers attribute a pooled position row across its claiming groups with these
+    shares — per-group quantity, cost basis, and therefore per-group unrealized P&L
+    against the (correctly shared) live mark."""
+
+    account: str
+    security_id: str
+    trade_group_id: int
+    net_open: int
+    average_open_price: Decimal | None = None
+
+
+def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
+    """``(account, security_id, trade_group_id, action, quantity, price)`` tuples →
+    one ``OpenGroupLegRow`` per (account, security, group).
+
+    The single netting/VWAP implementation both stores share, so the SQL and in-memory
+    backends cannot drift. ``net_open`` counts only ``* to Open`` / ``* to Close``
+    (settlements and corporate actions contribute 0, matching ``net_open_by_group``);
+    ``average_open_price`` is the quantity-weighted mean of the OPENING fills only, so
+    scaling out of a leg never moves its entry basis."""
+    acc: dict[tuple[str, str, int], list[Decimal]] = {}  # [net, opening qty, Σ price×qty]
+    for account, security_id, trade_group_id, action, quantity, price in records:
+        if security_id is None or trade_group_id is None:
+            continue
+        verb = (action or "").strip()
+        qty = Decimal(str(quantity or 0))
+        slot = acc.setdefault(
+            (account, security_id, trade_group_id), [Decimal(0), Decimal(0), Decimal(0)]
+        )
+        if verb.endswith("to Open"):
+            slot[0] += qty
+            slot[1] += qty
+            if price is not None:
+                slot[2] += Decimal(str(price)) * qty
+        elif verb.endswith("to Close"):
+            slot[0] -= qty
+    return [
+        OpenGroupLegRow(
+            account=account,
+            security_id=security_id,
+            trade_group_id=trade_group_id,
+            net_open=int(net),
+            average_open_price=(notional / open_qty) if open_qty else None,
+        )
+        for (account, security_id, trade_group_id), (net, open_qty, notional) in acc.items()
+    ]
+
+
+@dataclass
 class ClosedPositionRow:
     """A completed open->close round-trip, produced by replaying transaction history
     (``ingest/replay.py``) — the durable historical record ``positions`` itself can't hold, since

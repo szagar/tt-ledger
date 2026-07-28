@@ -50,6 +50,7 @@ if TYPE_CHECKING:
         BalanceSnapshotRow,
         ClosedPositionRow,
         FillEvent,
+        OpenGroupLegRow,
         OrderInput,
         PositionRow,
         TradeRow,
@@ -85,14 +86,26 @@ class LedgerClient:
         accounts: "AccountMapper",
         resolver: "SecurityResolver | None" = None,
         client: "BrokerClient | None" = None,
+        pool_size: int | None = None,
+        max_overflow: int | None = None,
+        pool_timeout: int | None = None,
     ) -> "LedgerClient":
         """Open a ledger on ``url`` (SQLite default, Postgres opt-in).
 
         ``resolver`` translates broker symbols to your canonical ``security_id``; if omitted,
         the vendor symbol is used as the canonical id (PassthroughResolver). ``client`` is the
         broker connection ``sync()`` pulls from; omit it if you only need the read/remap surface.
+        ``pool_size``/``max_overflow``/``pool_timeout`` bound the store's connection pool —
+        set them when many clients share one server (see ``SqlLedgerStore``).
         """
-        return cls(make_store(url), accounts=accounts, resolver=resolver, client=client)
+        return cls(
+            make_store(
+                url, pool_size=pool_size, max_overflow=max_overflow, pool_timeout=pool_timeout
+            ),
+            accounts=accounts,
+            resolver=resolver,
+            client=client,
+        )
 
     # --- capture ---
 
@@ -374,6 +387,33 @@ class LedgerClient:
             if group_pk > mapping.get(key, -1):
                 mapping[key] = group_pk
         return mapping
+
+    async def open_position_shares(
+        self, account: str | None = None
+    ) -> "dict[tuple[str, str], list[OpenGroupLegRow]]":
+        """``(account, security_id) -> [each open group's own stake]``, newest group last.
+
+        The attribution-aware sibling of ``open_position_groups``. That one answers "which
+        ONE group owns this contract" — necessarily lossy, because the broker aggregates
+        every lot of a contract into a single ``positions`` row, so two open groups holding
+        the same strike (A/B arms of one strategy, laddered entries) collapse and the older
+        one silently shows nothing. This returns the FULL claim list instead: each group's
+        own net-open quantity and its own opening VWAP, replayed from that group's own
+        transactions.
+
+        Consumers split a pooled position row across the returned shares to get per-group
+        quantity, cost basis, and unrealized P&L against the (correctly shared) live mark.
+        Only shares with ``net_open > 0`` are returned — a group that has closed its side of
+        a shared strike no longer claims it.
+        """
+        shares: dict[tuple[str, str], list[OpenGroupLegRow]] = {}
+        for leg in await self._store.open_group_legs(account):
+            if leg.net_open <= 0:
+                continue
+            shares.setdefault((leg.account, leg.security_id), []).append(leg)
+        for claims in shares.values():
+            claims.sort(key=lambda leg: leg.trade_group_id)
+        return shares
 
     async def net_open_by_group(self, trade_group_ids: list[int]) -> "dict[int, dict[str, int]]":
         """``trade_group_id -> {security_id: net_open}`` for the given groups, where
