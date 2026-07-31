@@ -81,8 +81,10 @@ Turns ungrouped broker activity into reviewable trades.
      falls back to membership match (over-close / window artifact); the attach emits the
      matching lifecycle event (`partial_exit` / `full_exit` / `expiration` / `assignment` /
      `exercise`). A fully-offset group's `status` flips (closed/expired/assigned/exercised;
-     `mixed` when causes differ), `closed_at` is stamped, and cash-basis `realized_pnl` (signed
-     net across all member transactions) is written.
+     `mixed` when causes differ), `closed_at` is stamped, and GROSS `realized_pnl` (signed
+     across all member transactions, fees added back) plus the lifecycle-complete `total_fees`
+     are written — the `ClosedPositionRow` trio convention (gross + fees stored, `pnl_net`
+     derived via `TradeRow.pnl_net`).
    - **rolls**: closes + opens in one cluster on the same underlying, or a close-cluster and an
      open-cluster within 60s (same underlying/option type/quantity), add a `roll` event with
      `rolled_to_group_id` on the old group.
@@ -91,8 +93,8 @@ Turns ungrouped broker activity into reviewable trades.
    premium / max-profit-loss; set `orders.trade_group_id` + `transactions.trade_group_id`.
 7. **Heal fully-closed groups** (`heal_fully_closed_groups`): an OPEN group whose member
    transactions already net to zero gets its overdue status flip — status from the close causes
-   (`mixed` when they differ), `closed_at` = last activity, cash-basis `realized_pnl` — plus an
-   `adjustment` event recording the repair. Targets legacy data where closes attached on a path
+   (`mixed` when they differ), `closed_at` = last activity, gross `realized_pnl` + complete
+   `total_fees` — plus an `adjustment` event recording the repair. Targets legacy data where closes attached on a path
    that skipped the exit machinery's flip; a healed group leaves the open set, so re-runs no-op.
 
 **Idempotent**, and it **never re-attributes a `manually_attributed` group's membership** — so

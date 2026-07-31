@@ -7,8 +7,10 @@ transactions→order by tt_order_id; group ungrouped by (account, executed_at); 
   expiration/assignment/exercise rows) that offsets an OPEN group's legs attaches to THAT group
   and emits the matching lifecycle event (``partial_exit`` / ``full_exit`` / ``expiration`` /
   ``assignment`` / ``exercise``); a fully-offset group's status flips
-  (closed/expired/assigned/exercised — ``mixed`` when causes differ) and its cash-basis
-  ``realized_pnl`` (signed net across all member transactions, fees netted) is stamped.
+  (closed/expired/assigned/exercised — ``mixed`` when causes differ) and its GROSS
+  ``realized_pnl`` (signed across all member transactions, fees added back) plus its
+  lifecycle-complete ``total_fees`` are stamped — the same trio convention as
+  ``ClosedPositionRow`` (gross + fees stored, ``pnl_net`` derived).
 * **opening** activity creates a new trade_group (origin=broker, review_status=NEEDS_REVIEW,
   ENTRY event) — the original behavior.
 * a cluster that does BOTH against the same underlying is a **roll**: the closes attach to the
@@ -202,8 +204,9 @@ async def heal_fully_closed_groups(
 
     Deterministic + idempotent: status from ``_close_causes`` (``mixed`` when
     causes differ — same rule as ``_apply_exit``), ``closed_at`` = the group's
-    last activity, cash-basis ``realized_pnl`` = signed net across members
-    (same math as ``_apply_exit``). An ``adjustment`` event records the repair.
+    last activity, GROSS ``realized_pnl`` + complete ``total_fees`` across
+    members (same math as ``_apply_exit``). An ``adjustment`` event records the
+    repair.
     A healed group leaves the open set, so re-runs no-op. Returns the number
     of groups healed (counted, not written, under ``dry_run``).
     """
@@ -221,9 +224,13 @@ async def heal_fully_closed_groups(
         tg = await store.get_trade_group_by_id(group.pk)
         if tg is None:
             continue
-        realized = sum((_signed_net(r) for r in group.rows), Decimal("0"))
+        realized = sum((_signed_gross(r) for r in group.rows), Decimal("0"))
+        fees = sum((_row_fees(r) for r in group.rows), Decimal("0"))
         await store.upsert_trade_group(
-            replace(tg, status=status.value, closed_at=closed_at, realized_pnl=realized)
+            replace(
+                tg, status=status.value, closed_at=closed_at,
+                realized_pnl=realized, total_fees=fees,
+            )
         )
         await store.add_trade_group_event(
             EventRow(
@@ -353,6 +360,30 @@ def _signed_net(row) -> Decimal:  # noqa: ANN001
     some feeds carry an already-signed value with no effect — only an explicit Debit negates."""
     net = row.net_value or Decimal("0")
     return -net if getattr(row, "net_value_effect", None) == "Debit" else net
+
+
+def _row_fees(row) -> Decimal:  # noqa: ANN001
+    """Every fee TT itemizes on one transaction (missing fields count as zero)."""
+    return (
+        (getattr(row, "commission", None) or Decimal("0"))
+        + (getattr(row, "clearing_fees", None) or Decimal("0"))
+        + (getattr(row, "regulatory_fees", None) or Decimal("0"))
+        + (getattr(row, "proprietary_index_option_fees", None) or Decimal("0"))
+    )
+
+
+def _signed_gross(row) -> Decimal:  # noqa: ANN001
+    """The transaction's signed GROSS value — fees added back onto the broker's net.
+
+    TT's ``net_value`` bakes fees in on both sides (a credit is value − fees, a debit's
+    magnitude is value + fees), so signed net + fees == signed gross for either effect.
+    This is the group-level ``realized_pnl`` term: gross with ``total_fees`` stored
+    beside it and ``pnl_net`` DERIVED (``TradeRow.pnl_net``), mirroring the
+    ``ClosedPositionRow`` trio. Summing ``_signed_net`` here instead double-counted
+    fees in every downstream ``realized_pnl - total_fees`` (found 2026-07-30 via the
+    excursion backfill's realized cross-check: group 2542 fills +$7.00, fees $4.96,
+    stored 2.04 — and zero-fee paper groups masked the defect everywhere else)."""
+    return _signed_net(row) + _row_fees(row)
 
 
 async def reconcile(
@@ -732,7 +763,7 @@ async def _apply_exit(
     rolled_to_pk: int | None, delivery_pk: int | None = None,
 ) -> "_AppliedExit":
     """Attach closing rows to their open group, emit lifecycle events, and flip the group's
-    status (+ cash-basis realized_pnl) once fully offset. ``delivery_pk`` links an
+    status (+ gross realized_pnl and complete total_fees) once fully offset. ``delivery_pk`` links an
     assignment/exercise event to the group holding the position it delivered (the option's
     underlying future/shares) -- the same continuation edge rolls use."""
     await store.attach_transactions_to_trade_group([r.tt_transaction_id for r in rows], group.pk)
@@ -793,11 +824,18 @@ async def _apply_exit(
         status = causes.pop() if len(causes) == 1 else TradeGroupStatus.MIXED
         tg = await store.get_trade_group_by_id(group.pk)
         if tg is not None:
-            # cash-basis realized P&L: signed net across every member transaction (fees netted
-            # by the broker's own net-value); position-level cost-basis P&L stays replay's job.
-            realized = sum((_signed_net(r) for r in group.rows), Decimal("0"))
+            # GROSS realized P&L (fees added back) + the lifecycle-complete fee total —
+            # total_fees was previously stamped from the OPENING cluster only and never
+            # updated when closes attached, so live groups under-counted their fees on
+            # top of realized_pnl already netting them. Position-level cost-basis P&L
+            # stays replay's job.
+            realized = sum((_signed_gross(r) for r in group.rows), Decimal("0"))
+            fees = sum((_row_fees(r) for r in group.rows), Decimal("0"))
             await store.upsert_trade_group(
-                replace(tg, status=status.value, closed_at=event_at, realized_pnl=realized)
+                replace(
+                    tg, status=status.value, closed_at=event_at,
+                    realized_pnl=realized, total_fees=fees,
+                )
             )
 
     return _AppliedExit(
@@ -894,13 +932,7 @@ async def compute_group_fields(store: "LedgerStore", cluster: "list[ActivityRow]
 
     underlying = next((row.underlying for row in cluster if row.underlying), None)
     total_premium = sum((_signed_net(row) for row in cluster if row.net_value is not None), Decimal("0"))
-    total_fees = sum(
-        (
-            (row.commission or Decimal("0")) + (row.clearing_fees or Decimal("0")) + (row.regulatory_fees or Decimal("0"))
-            for row in cluster
-        ),
-        Decimal("0"),
-    )
+    total_fees = sum((_row_fees(row) for row in cluster), Decimal("0"))
     # the size the group actually held, not the largest single fill
     quantity = max(peaks.values()) if peaks else (
         max((abs(r.quantity) for r in cluster if r.quantity is not None), default=None)
