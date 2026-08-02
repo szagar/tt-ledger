@@ -40,6 +40,19 @@ class TradeGroupStatus(StrEnum):
     ASSIGNED = "assigned"
     EXERCISED = "exercised"
     MIXED = "mixed"
+    # Opened in intent, never traded: the group exists because an order was
+    # submitted (record_order pre-attributes the group at submit time), but that
+    # order reached a terminal state without a single fill -- expired unfilled,
+    # cancelled, or rejected. No position ever existed, so there is nothing to
+    # close and nothing to settle.
+    #
+    # Deliberately NOT reusing EXPIRED, which is the opposite situation: an
+    # ORDER can expire unfilled, but a GROUP that is `expired` traded and was
+    # held to settlement (it has fills and realized P&L). Sharing the word would
+    # file "never traded" alongside "rode to expiry" and corrupt settlement-rate
+    # analysis. `OrderStatus.EXPIRED` and `TradeGroupStatus.EXPIRED` are
+    # different vocabularies about different objects.
+    UNFILLED = "unfilled"
 
 
 class StrategyType(StrEnum):

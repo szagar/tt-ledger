@@ -18,6 +18,7 @@ from .ingest.push import StreamConsumer
 from .ingest.reconcile import find_misattributed_open_groups, reconcile
 from .ingest.remap import (
     dismiss_trade_group,
+    mark_trade_group_unfilled,
     link_order_to_group,
     regroup_transactions,
     remap_trade_group,
@@ -504,6 +505,15 @@ class LedgerClient:
 
     async def dismiss_trade(self, group_id: str, *, reviewed_by: str) -> "TradeRow":
         return await dismiss_trade_group(self._store, group_id, reviewed_by=reviewed_by)
+
+    async def mark_unfilled(
+        self, group_id: str, *, reviewed_by: str, reason: str = ""
+    ) -> "TradeRow":
+        """status=UNFILLED for an intent-only group whose order never filled.
+        Raises if the group has any transactions (see the ingest docstring)."""
+        return await mark_trade_group_unfilled(
+            self._store, group_id, reviewed_by=reviewed_by, reason=reason
+        )
 
     async def close(self) -> None:
         dispose = getattr(self._store, "dispose", None)

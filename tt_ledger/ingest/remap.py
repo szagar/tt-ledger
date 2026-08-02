@@ -208,6 +208,52 @@ async def link_order_to_group(
     return trade_group_to_row(tg)
 
 
+async def mark_trade_group_unfilled(
+    store: "LedgerStore", group_id: str, *, reviewed_by: str, reason: str = ""
+) -> "TradeRow":
+    """status=UNFILLED for a group whose order never filled.
+
+    ``record_order`` pre-attributes a trade group at SUBMIT time, so the group
+    exists before any fill does. When the order then terminates unfilled --
+    expired at the close, cancelled, rejected -- nothing ever transitions the
+    group out of OPEN: reconcile only moves groups on exit events, and a group
+    with no transactions has none. It stays open forever, holding nothing.
+
+    Refuses to touch a group that has ANY transactions: those really traded, and
+    their terminal state is CLOSED / EXPIRED / ASSIGNED via the normal exit
+    machinery. This is only for the empty shells.
+    """
+    tg = await store.get_trade_group(group_id)
+    if tg is None:
+        raise ValueError(f"trade group {group_id!r} not found")
+
+    group_pk = await store.get_trade_group_id(group_id)
+    if group_pk is not None:
+        rows = list(await store.get_group_transactions(group_pk))
+        if rows:
+            raise ValueError(
+                f"trade group {group_id!r} has {len(rows)} transaction(s) -- it traded, "
+                "so it is not unfilled; let the exit machinery set its terminal status"
+            )
+
+    now = datetime.now(UTC)
+    updated = replace(
+        tg, status=TradeGroupStatus.UNFILLED.value, reviewed_by=reviewed_by, reviewed_at=now
+    )
+    group_pk = await store.upsert_trade_group(updated)
+
+    note = f"marked unfilled by {reviewed_by}"
+    await store.add_trade_group_event(
+        EventRow(
+            trade_group_id=group_pk,
+            event_type=TradeGroupEventType.ADJUSTMENT.value,
+            event_at=now,
+            notes=f"{note}: {reason}" if reason else note,
+        )
+    )
+    return trade_group_to_row(updated)
+
+
 async def dismiss_trade_group(store: "LedgerStore", group_id: str, *, reviewed_by: str) -> "TradeRow":
     """review_status=IGNORED (transfers / non-trades) -- leaves the review queue without
     attribution (``manually_attributed`` stays untouched: dismissing isn't attributing)."""

@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from tt_ledger.enums import Ingest, Origin, ReviewStatus
+from tt_ledger.enums import Ingest, Origin, ReviewStatus, TradeGroupStatus
 from tt_ledger.identity import AccountMapper, PassthroughResolver
 from tt_ledger.ingest.broker import BalanceMessage, BrokerPosition
 from tt_ledger.ingest.mock_broker import MockMessageSource, MockTastyTradeClient
@@ -296,6 +296,38 @@ async def test_dismiss_trade_delegates_and_persists(client, broker):
 
     result = await client.dismiss_trade(trade.group_id, reviewed_by="alice")
     assert result.review_status is ReviewStatus.IGNORED
+
+
+async def test_mark_unfilled_sets_status_on_an_intent_only_group(client):
+    """A group opened at submit time whose order never filled: no transactions,
+    so nothing in the exit machinery ever moves it out of OPEN."""
+    trade = await client.open_trade_group(
+        account="main", underlying="SPX", strategy_type="butterfly_call"
+    )
+    assert trade.status == TradeGroupStatus.OPEN
+
+    result = await client.mark_unfilled(
+        trade.group_id, reviewed_by="oms", reason="order EXPIRED unfilled"
+    )
+    assert result.status == TradeGroupStatus.UNFILLED
+    # And it is durable: reconcile only reconsiders OPEN groups.
+    again = await client.trade(trade.group_id)
+    assert again is not None and again.status == TradeGroupStatus.UNFILLED
+
+
+async def test_mark_unfilled_refuses_a_group_that_actually_traded(client, broker):
+    """The guard that keeps `unfilled` meaning what it says: a group with fills
+    has a real terminal state (closed / expired / assigned), not this one."""
+    broker.fill(
+        account_number="ACCT1", order_id="O-1", symbol="AAPL", instrument_type="Equity",
+        action="Buy to Open", quantity=Decimal("10"), fill_price=Decimal("150"),
+        filled_at=datetime(2026, 1, 5, tzinfo=UTC), status="Filled",
+    )
+    await client.sync("main")
+    trade = (await client.trades(account="main"))[0]
+
+    with pytest.raises(ValueError, match="it traded"):
+        await client.mark_unfilled(trade.group_id, reviewed_by="oms")
 
 
 async def test_regroup_delegates_and_persists(client, broker):
