@@ -377,6 +377,16 @@ class LedgerClient:
         trade_group_id/limit/offset)."""
         return await self._store.query_transactions(TransactionQuery(**f))
 
+    async def transaction_value_total(self, account: str) -> "Decimal":
+        """Signed sum of ``value`` across the account's entire transaction history.
+
+        The paper-balance primitive: a paper account's cash balance is exactly this
+        total, since every paper cash flow (fills, settlements, and the synthetic
+        ``Money Movement`` seed/reset adjustments) is a transaction row. Usable for
+        live accounts too, but broker fee/interest rows make it an approximation
+        there — live balances come from ``balance_snapshots``."""
+        return await self._store.transaction_value_total(account)
+
     async def open_position_groups(self, account: str | None = None) -> "dict[tuple[str, str], int]":
         """``(account, security_id) -> trade_group_id`` over OPEN groups' member transactions —
         the join host position views stamp onto live position rows. A security claimed by more

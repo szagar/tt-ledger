@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import fields as dc_fields
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Any, Callable, Generic, TypeVar
 
 from ..rows import (
@@ -443,6 +444,13 @@ class InMemoryStore:
                          signal_id=order.signal_id if order is not None else None)
             )
         return out, total
+
+    async def transaction_value_total(self, account: str) -> Decimal:
+        total = Decimal("0")
+        for _, txn in self._transactions.all():
+            if txn.account == account and txn.value is not None:
+                total += txn.value
+        return total
 
     async def get_open_position_groups(self, account: str | None = None) -> list[tuple[str, str, int]]:
         seen: set[tuple[str, str, int]] = set()

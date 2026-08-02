@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -690,6 +691,20 @@ class SqlLedgerStore:
             rows = (await session.execute(stmt)).all()
             total = (await session.execute(count_stmt)).scalar_one()
         return [_mapping_to(TransactionDetailRow, r) for r in rows], total
+
+    async def transaction_value_total(self, account: str) -> Decimal:
+        """Signed cash total of an account's entire transaction history.
+
+        SUM is linear, so the SQLite scaled-integer ``Money`` representation
+        stays correct here (unlike products — see ``open_group_legs``); the
+        aggregate's result type is inferred from the column, so micro-units
+        convert back to Decimal on read.
+        """
+        txns = models.Transaction.__table__
+        stmt = select(func.sum(txns.c.value)).where(txns.c.account == account)
+        async with self._sessionmaker() as session:
+            total = (await session.execute(stmt)).scalar_one()
+        return total if total is not None else Decimal("0")
 
     async def get_open_position_groups(self, account: str | None = None) -> list[tuple[str, str, int]]:
         txns = models.Transaction.__table__
