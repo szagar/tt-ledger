@@ -8,9 +8,10 @@ transactions→order by tt_order_id; group ungrouped by (account, executed_at); 
   and emits the matching lifecycle event (``partial_exit`` / ``full_exit`` / ``expiration`` /
   ``assignment`` / ``exercise``); a fully-offset group's status flips
   (closed/expired/assigned/exercised — ``mixed`` when causes differ) and its GROSS
-  ``realized_pnl`` (signed across all member transactions, fees added back) plus its
-  lifecycle-complete ``total_fees`` are stamped — the same trio convention as
-  ``ClosedPositionRow`` (gross + fees stored, ``pnl_net`` derived).
+  ``realized_pnl`` (signed across all member transactions, fees added back; bare-futures
+  legs price-based instead — ``_group_realized``) plus its lifecycle-complete
+  ``total_fees`` are stamped — the same trio convention as ``ClosedPositionRow``
+  (gross + fees stored, ``pnl_net`` derived).
 * **opening** activity creates a new trade_group (origin=broker, review_status=NEEDS_REVIEW,
   ENTRY event) — the original behavior.
 * a cluster that does BOTH against the same underlying is a **roll**: the closes attach to the
@@ -37,7 +38,7 @@ from typing import TYPE_CHECKING
 
 from ..enums import Origin, ReviewStatus, StrategyType, TradeGroupEventType, TradeGroupStatus
 from ..rows import ActivityFilter, ActivityRow, EventRow, SyncResult, TradeFilter, TradeGroupRow, TxnRow
-from .replay import net_open_quantities
+from .replay import net_open_quantities, price_realized_gross
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ async def heal_fully_closed_groups(
         tg = await store.get_trade_group_by_id(group.pk)
         if tg is None:
             continue
-        realized = sum((_signed_gross(r) for r in group.rows), Decimal("0"))
+        realized = await _group_realized(store, group.rows)
         fees = sum((_row_fees(r) for r in group.rows), Decimal("0"))
         await store.upsert_trade_group(
             replace(
@@ -242,6 +243,76 @@ async def heal_fully_closed_groups(
         )
         logger.info("healed fully-closed group %d for %s -> %s", group.pk, account, status.value)
     return healed
+
+
+async def recompute_futures_group_pnl(
+    store: "LedgerStore",
+    account: str | None = None,
+    *,
+    dry_run: bool = False,
+) -> list[dict]:
+    """Re-stamp ``realized_pnl`` on groups holding bare-futures legs whose stored value
+    predates the price-based futures semantics (``_group_realized``).
+
+    One-time repair companion to the 2026-08-04 fix: groups already closed under the old
+    Σ-signed-gross math keep their settlement-relative numbers forever (reconcile never
+    revisits a stamped group), so this walks every group with a stamped ``realized_pnl``,
+    recomputes it under current semantics, and rewrites it where it differs — futures-
+    containing groups only; a pure premium-settled group recomputes to the identical
+    value and is skipped by construction, but is not even recomputed, to keep this
+    surgical. ``total_fees`` is untouched (same rows, same fee sum). Idempotent: a second
+    run finds nothing to change. Each change records an ``adjustment`` event.
+
+    Returns ``[{"group_pk", "group_id", "account", "old", "new"}]`` for every group
+    whose value changed (would change, under ``dry_run``).
+    """
+    changes: list[dict] = []
+    accounts = [account] if account is not None else await _accounts_with_activity(store, None)
+    for acct in accounts:
+        for trade in await store.unified_trades(TradeFilter(account=acct)):
+            if trade.realized_pnl is None:
+                continue
+            pk = await store.get_trade_group_id(trade.group_id)
+            if pk is None:
+                continue
+            rows = await store.get_group_transactions(pk)
+            has_future = False
+            for sid in {r.security_id for r in rows if r.security_id is not None}:
+                sec = await store.get_security(sid)
+                if sec is not None and sec.product_type == "F":
+                    has_future = True
+                    break
+            if not has_future:
+                continue
+            recomputed = await _group_realized(store, rows)
+            if recomputed == trade.realized_pnl:
+                continue
+            changes.append({
+                "group_pk": pk, "group_id": trade.group_id, "account": acct,
+                "old": trade.realized_pnl, "new": recomputed,
+            })
+            if dry_run:
+                continue
+            tg = await store.get_trade_group_by_id(pk)
+            if tg is None:
+                continue
+            await store.upsert_trade_group(replace(tg, realized_pnl=recomputed))
+            await store.add_trade_group_event(
+                EventRow(
+                    trade_group_id=pk,
+                    event_type=TradeGroupEventType.ADJUSTMENT.value,
+                    event_at=tg.closed_at,
+                    notes=(
+                        "recompute: price-based futures realized_pnl "
+                        f"({trade.realized_pnl} -> {recomputed})"
+                    ),
+                )
+            )
+            logger.info(
+                "recomputed futures realized_pnl for group %d (%s): %s -> %s",
+                pk, acct, trade.realized_pnl, recomputed,
+            )
+    return changes
 
 
 async def find_misattributed_open_groups(store: "LedgerStore", account: str) -> list[dict]:
@@ -382,8 +453,46 @@ def _signed_gross(row) -> Decimal:  # noqa: ANN001
     ``ClosedPositionRow`` trio. Summing ``_signed_net`` here instead double-counted
     fees in every downstream ``realized_pnl - total_fees`` (found 2026-07-30 via the
     excursion backfill's realized cross-check: group 2542 fills +$7.00, fees $4.96,
-    stored 2.04 — and zero-fee paper groups masked the defect everywhere else)."""
+    stored 2.04 — and zero-fee paper groups masked the defect everywhere else).
+
+    NOT valid for bare futures — their transaction values are settlement-relative
+    (``_group_realized`` routes those legs through ``price_realized_gross`` instead)."""
     return _signed_net(row) + _row_fees(row)
+
+
+async def _group_realized(store: "LedgerStore", rows: "list") -> Decimal:
+    """GROSS realized P&L across one group's member transactions — the value stamped on
+    ``trade_groups.realized_pnl`` (``total_fees`` beside it, ``pnl_net`` derived).
+
+    Premium-settled legs (options, equities, crypto): Σ ``_signed_gross`` — the broker's
+    cash values with fees added back. Bare-futures legs (``securities.product_type``
+    ``"F"``): price-based per security via ``price_realized_gross``, because TastyTrade
+    pays futures P/L through daily ``Money Movement / Mark to Market`` rows that are
+    position-level and never group members — the member transactions carry only
+    settlement-relative fragments (and Receive Deliver deliveries carry intrinsic-vs-
+    settle values), so summing them books economically meaningless numbers on any
+    futures group held across a 17:00 ET settlement. Found 2026-08-04: a delivered
+    short /ESM6 6600 covered at 6625 showed +14,887.50 for a $1,250 loss.
+
+    Multiplier from the securities dimension; absent → 1, the same per-unit convention
+    replay's ``closed_positions`` walk uses. ``rows`` duck-types ``ActivityRow``/``TxnRow``.
+    """
+    securities: dict[str, object] = {}
+    futures_rows: dict[str, list] = {}
+    total = Decimal("0")
+    for row in rows:
+        sid = row.security_id
+        if sid is not None and sid not in securities:
+            securities[sid] = await store.get_security(sid)
+        sec = securities.get(sid) if sid is not None else None
+        if sec is not None and getattr(sec, "product_type", None) == "F":
+            futures_rows.setdefault(sid, []).append(row)
+        else:
+            total += _signed_gross(row)
+    for sid, sec_rows in futures_rows.items():
+        multiplier = getattr(securities[sid], "multiplier", None) or 1
+        total += price_realized_gross(sec_rows, multiplier)
+    return total
 
 
 async def reconcile(
@@ -824,12 +933,13 @@ async def _apply_exit(
         status = causes.pop() if len(causes) == 1 else TradeGroupStatus.MIXED
         tg = await store.get_trade_group_by_id(group.pk)
         if tg is not None:
-            # GROSS realized P&L (fees added back) + the lifecycle-complete fee total —
-            # total_fees was previously stamped from the OPENING cluster only and never
-            # updated when closes attached, so live groups under-counted their fees on
-            # top of realized_pnl already netting them. Position-level cost-basis P&L
-            # stays replay's job.
-            realized = sum((_signed_gross(r) for r in group.rows), Decimal("0"))
+            # GROSS realized P&L (fees added back; futures legs price-based — see
+            # _group_realized) + the lifecycle-complete fee total — total_fees was
+            # previously stamped from the OPENING cluster only and never updated when
+            # closes attached, so live groups under-counted their fees on top of
+            # realized_pnl already netting them. Position-level cost-basis P&L stays
+            # replay's job.
+            realized = await _group_realized(store, group.rows)
             fees = sum((_row_fees(r) for r in group.rows), Decimal("0"))
             await store.upsert_trade_group(
                 replace(

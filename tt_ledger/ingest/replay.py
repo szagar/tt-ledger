@@ -209,6 +209,56 @@ def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
     return nets
 
 
+def price_realized_gross(rows: "list[ActivityRow]", multiplier: int) -> Decimal:
+    """Price-based GROSS realized P&L over ONE security's rows, using replay's lot rules.
+
+    The same walk ``_replay_security`` does (weighted-average open, partial closes, flips
+    through zero, Money Movement excluded, settlements offset at price 0 when the feed
+    omits one, opens-before-closes within one timestamp), reduced to the realized
+    accumulator. Rows are ordered here; callers pass them in any order. A row the lot walk
+    ignores (cash-only, price-less, close-against-flat) contributes nothing.
+
+    Exists for reconcile's group-level ``realized_pnl`` on bare futures: TastyTrade pays
+    futures P/L through daily ``Money Movement / Mark to Market`` rows that are position-
+    level and never become group members, so a futures group's member transaction values
+    are settlement-relative fragments — only price moves recover the trade's economics.
+    (Found 2026-08-04: a delivered short /ESM6 6600 covered at 6625 carried a +14,887.50
+    member credit — intrinsic vs that day's settle — for a trade that lost $1,250.)
+    """
+    ordered = sorted(rows, key=lambda r: (r.executed_at or _EPOCH, _closes_last(r)))
+    lot = _Lot()
+    realized = Decimal("0")
+    for row in ordered:
+        if row.quantity is None:
+            continue
+        delta, price = _effective_delta_price(row, lot)
+        if delta == 0 or price is None:
+            continue
+        old_signed = lot.signed_quantity
+        new_signed = old_signed + delta
+        if old_signed == 0:
+            lot = _Lot(signed_quantity=new_signed, average_open_price=price)
+            continue
+        if old_signed * delta > 0:
+            total_qty = abs(old_signed) + abs(delta)
+            lot.average_open_price = (abs(old_signed) * lot.average_open_price + abs(delta) * price) / total_qty
+            lot.signed_quantity = new_signed
+            continue
+        closing_qty = min(abs(delta), abs(old_signed))
+        sign = Decimal(1) if old_signed > 0 else Decimal(-1)
+        realized += (price - lot.average_open_price) * closing_qty * multiplier * sign
+        if new_signed == 0:
+            lot = _Lot()
+        elif (new_signed > 0) != (old_signed > 0):
+            lot = _Lot(signed_quantity=new_signed, average_open_price=price)
+        else:
+            lot.signed_quantity = new_signed
+    return realized
+
+
+_EPOCH = datetime.min.replace(tzinfo=UTC)
+
+
 async def _multiplier_of(store: "LedgerStore", security_id: str) -> int:
     sec = await store.get_security(security_id)
     return sec.multiplier if sec is not None and sec.multiplier else 1

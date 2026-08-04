@@ -296,6 +296,30 @@ def build_app():
 
         _run(_do())
 
+    @app.command("recompute-futures-pnl")
+    def recompute_futures_pnl(
+        ctx: typer.Context,
+        account: str | None = typer.Option(None, "--account", help="Omit to repair every account with activity."),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Preview without rewriting realized_pnl."),
+    ) -> None:
+        """Re-stamp realized_pnl on futures-containing groups (price-based semantics, 2026-08-04 fix)."""
+
+        async def _do():
+            client = _open_client(ctx)
+            try:
+                changes = await client.recompute_futures_pnl(account, dry_run=dry_run)
+                verb = "would change" if dry_run else "changed"
+                console.print(f"groups {verb}: {len(changes)}")
+                for ch in changes:
+                    console.print(
+                        f"  - group {ch['group_pk']} ({ch['account']}): "
+                        f"{_money(ch['old'])} -> {_money(ch['new'])}"
+                    )
+            finally:
+                await client.close()
+
+        _run(_do())
+
     @app.command("rebuild-positions")
     def rebuild_positions(
         ctx: typer.Context,

@@ -15,7 +15,7 @@ from .enums import Ingest, Origin, ReviewStatus, TradeGroupEventType
 from .identity import PassthroughResolver
 from .ingest.pull import sync_all
 from .ingest.push import StreamConsumer
-from .ingest.reconcile import find_misattributed_open_groups, reconcile
+from .ingest.reconcile import find_misattributed_open_groups, reconcile, recompute_futures_group_pnl
 from .ingest.remap import (
     dismiss_trade_group,
     mark_trade_group_unfilled,
@@ -475,6 +475,12 @@ class LedgerClient:
         """Rebuild ``positions``/``closed_positions`` from transaction history
         (``ingest/replay.py``) -- no broker pull, safe to re-run any time after ``sync``."""
         return await rebuild_positions_from_transactions(self._store, account)
+
+    async def recompute_futures_pnl(self, account: str | None = None, *, dry_run: bool = False) -> list[dict]:
+        """Re-stamp ``realized_pnl`` on futures-containing groups under the price-based
+        semantics (``ingest.reconcile.recompute_futures_group_pnl``) — the one-time repair
+        for groups stamped before the 2026-08-04 fix. Idempotent; returns the changes."""
+        return await recompute_futures_group_pnl(self._store, account, dry_run=dry_run)
 
     async def misattributed_open_groups(self, account: str) -> list[dict]:
         """Open groups whose closes are attached to OTHER groups (Class B misattribution) --

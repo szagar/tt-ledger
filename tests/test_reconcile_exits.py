@@ -19,7 +19,7 @@ from tt_ledger.ingest.broker import BrokerTransaction, PlacedLeg, PlacedOrder
 from tt_ledger.ingest.mock_broker import MockTastyTradeClient
 from tt_ledger.ingest.pull import sync_orders, sync_transactions
 from tt_ledger.ingest.reconcile import reconcile
-from tt_ledger.rows import TradeFilter
+from tt_ledger.rows import SecurityRow, TradeFilter
 from tt_ledger.store.memory import InMemoryStore
 
 T0 = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
@@ -276,12 +276,15 @@ async def test_assignment_delivery_forms_linked_group_and_bare_cover_closes_it(s
         action="Sell to Open", quantity=Decimal("1"), price=Decimal("7350"),
         executed_at=T0 + timedelta(days=6), transaction_date=(T0 + timedelta(days=6)).date(),
     ))
-    # bare futures Buy covers the delivered short the next day
+    # bare futures Buy covers the delivered short the next day. Its net_value is the
+    # broker's SETTLEMENT-RELATIVE figure (7421.25 vs the 7363.00 prior settle — the
+    # real trade-550 row), NOT the trade's P&L: the missing $650 was paid as an
+    # unlinked Mark-to-Market row. Group realized must come from prices.
     client.add_transaction(BrokerTransaction(
         id="TXN-COVER", account_number="ACCT1", order_id="O-2", symbol="/ESM6",
         instrument_type="Future", underlying_symbol="/ES", transaction_type="Trade",
         transaction_sub_type="Buy", action="Buy", quantity=Decimal("1"), price=Decimal("7421.25"),
-        net_value=Decimal("-3562.50"), net_value_effect=None,
+        net_value=Decimal("2912.50"), net_value_effect="Debit",
         executed_at=T0 + timedelta(days=7), transaction_date=(T0 + timedelta(days=7)).date(),
     ))
     client.add_order(PlacedOrder(
@@ -291,7 +294,12 @@ async def test_assignment_delivery_forms_linked_group_and_bare_cover_closes_it(s
                         quantity=Decimal("1"), remaining_quantity=Decimal("0"))],
     ))
 
-    await _sync_and_reconcile(store, accounts, resolver, client)
+    await sync_orders(store, "main", client=client, accounts=accounts, resolver=resolver)
+    await sync_transactions(store, "main", client=client, accounts=accounts, resolver=resolver)
+    # the zts resolver stamps the futures multiplier during sync; passthrough carries none
+    await store.upsert_security(SecurityRow(security_id="/ESM6", product_type="F",
+                                            underlying="/ES", multiplier=50, tt_symbol="/ESM6"))
+    await reconcile(store, "main")
 
     trades = sorted(await _trades(store), key=lambda t: t.executed_at)
     assert len(trades) == 2, [t.underlying for t in trades]
@@ -304,7 +312,8 @@ async def test_assignment_delivery_forms_linked_group_and_bare_cover_closes_it(s
     future_pk = await store.get_trade_group_id(future_group.group_id)
     assert assignment.rolled_to_group_id == future_pk
 
-    # delivery group: closed by the bare cover, cash-basis P&L booked
+    # delivery group: closed by the bare cover, PRICE-basis P&L booked
+    # (short 7350 -> 7421.25 at 50x, not the settlement-relative transaction value)
     assert future_group.status == TradeGroupStatus.CLOSED.value
     assert future_group.realized_pnl == Decimal("-3562.50")
     future_events = await _events(store, future_group.group_id)
