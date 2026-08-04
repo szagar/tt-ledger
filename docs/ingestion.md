@@ -82,9 +82,13 @@ Turns ungrouped broker activity into reviewable trades.
      matching lifecycle event (`partial_exit` / `full_exit` / `expiration` / `assignment` /
      `exercise`). A fully-offset group's `status` flips (closed/expired/assigned/exercised;
      `mixed` when causes differ), `closed_at` is stamped, and GROSS `realized_pnl` (signed
-     across all member transactions, fees added back) plus the lifecycle-complete `total_fees`
+     across all member transactions, fees added back; bare-futures legs are PRICE-based via
+     replay's lot walk instead — TastyTrade pays futures P/L through daily Mark-to-Market
+     rows that never join a group, so futures member values are settlement-relative
+     fragments) plus the lifecycle-complete `total_fees`
      are written — the `ClosedPositionRow` trio convention (gross + fees stored, `pnl_net`
-     derived via `TradeRow.pnl_net`).
+     derived via `TradeRow.pnl_net`). Groups stamped before the futures fix are repaired by
+     `recompute-futures-pnl` (CLI / `LedgerClient.recompute_futures_pnl`), idempotently.
    - **rolls**: closes + opens in one cluster on the same underlying, or a close-cluster and an
      open-cluster within 60s (same underlying/option type/quantity), add a `roll` event with
      `rolled_to_group_id` on the old group.
