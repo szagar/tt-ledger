@@ -413,11 +413,28 @@ class TransactionDetailRow:
     net_value: Decimal | None = None
     net_value_effect: str | None = None  # "Credit" | "Debit" | "None" -- net_value is a magnitude
     commission: Decimal | None = None
+    clearing_fees: Decimal | None = None
+    regulatory_fees: Decimal | None = None
+    proprietary_index_option_fees: Decimal | None = None
     executed_at: datetime | None = None
     order_id: int | None = None
     tt_order_id: str | None = None
     trade_group_id: int | None = None
     signal_id: str | None = None  # from the joined order; None when unreconciled/broker-origin
+
+    @property
+    def total_fees(self) -> Decimal:
+        """Every fee TT itemizes on this transaction (missing fields count as zero) --
+        the per-row twin of ``TradeRow.total_fees``, matching ``reconcile._row_fees``.
+        Derived, never stored. NOTE ``net_value`` already bakes these in (a credit is
+        value - fees, a debit's magnitude is value + fees), so this is the drag inside
+        the cash figure, not something to subtract from it again."""
+        return (
+            (self.commission or Decimal("0"))
+            + (self.clearing_fees or Decimal("0"))
+            + (self.regulatory_fees or Decimal("0"))
+            + (self.proprietary_index_option_fees or Decimal("0"))
+        )
 
 
 @dataclass

@@ -120,6 +120,8 @@ async def _seed_transactions(store) -> int:
                security_id="option:SPXW:2026-07-03:put:6200", underlying="SPXW",
                quantity=Decimal("1"), price=Decimal("1.20"),
                net_value=Decimal("119.34"), net_value_effect="Credit",
+               commission=Decimal("0.50"), clearing_fees=Decimal("0.10"),
+               regulatory_fees=Decimal("0.04"), proprietary_index_option_fees=Decimal("0.12"),
                order_id=order_ids[0], trade_group_id=group_pk,
                executed_at=datetime(2026, 7, 1, 14, 30, tzinfo=UTC)),
         TxnRow(tt_transaction_id="T-2", tt_order_id=None, account="main",
@@ -146,6 +148,13 @@ async def test_query_transactions_pages_newest_first_with_joined_signal(any_stor
     assert trade.signal_id == "sig-1"  # joined from the order
     assert trade.trade_group_id == group_pk
     assert rows[1].signal_id is None  # money movement: no order join
+
+    # Itemized fees ride the read shape; total_fees is derived (never stored).
+    assert trade.clearing_fees == Decimal("0.10")
+    assert trade.regulatory_fees == Decimal("0.04")
+    assert trade.proprietary_index_option_fees == Decimal("0.12")
+    assert trade.total_fees == Decimal("0.76")  # 0.50 + 0.10 + 0.04 + 0.12
+    assert rows[1].total_fees == Decimal("0")  # no fee fields -> zero, not None
 
     page, total = await any_store.query_transactions(TransactionQuery(limit=1, offset=1))
     assert total == 3
