@@ -55,6 +55,7 @@ if TYPE_CHECKING:
         OrderInput,
         PositionRow,
         TradeRow,
+        TransactionBandPage,
         TransactionDetailRow,
     )
     from .store import LedgerStore
@@ -377,6 +378,15 @@ class LedgerClient:
         ``TransactionQuery`` fields (account/accounts/start/end/underlying/transaction_type/
         trade_group_id/limit/offset)."""
         return await self._store.query_transactions(TransactionQuery(**f))
+
+    async def transaction_bands(self, **f) -> "TransactionBandPage":
+        """Transactions paged in BAND units — a band being a trade group (all of its
+        transactions) or an unattributed row on its own. Same filters as
+        ``transactions``, except ``limit``/``offset`` count bands, so a group is never
+        split across a page boundary. For hosts that render transactions grouped by
+        trade group: row-unit paging truncates the last group on every page and its
+        per-group totals are then wrong."""
+        return await self._store.query_transaction_bands(TransactionQuery(**f))
 
     async def transaction_value_total(self, account: str) -> "Decimal":
         """Signed sum of ``value`` across the account's entire transaction history.

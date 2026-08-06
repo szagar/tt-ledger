@@ -16,7 +16,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import bindparam, case, func, select, text, update
+from sqlalchemy import String, bindparam, case, cast, func, select, text, update
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -40,6 +40,7 @@ from ..rows import (
     TradeGroupRow,
     TradeRow,
     TransactionDetailRow,
+    TransactionBandPage,
     TransactionQuery,
     TxnRow,
     fold_open_group_legs as _fold_open_group_legs,
@@ -654,10 +655,10 @@ class SqlLedgerStore:
             rows = (await session.execute(stmt)).all()
         return [_mapping_to(FillRow, r) for r in rows]
 
-    async def query_transactions(self, q: TransactionQuery) -> tuple[list[TransactionDetailRow], int]:
+    @staticmethod
+    def _transaction_conditions(q: TransactionQuery) -> list:
+        """The WHERE terms shared by ``query_transactions`` and the band-paged read."""
         txns = models.Transaction.__table__
-        orders = models.Order.__table__
-
         conditions = []
         if q.account is not None:
             conditions.append(txns.c.account == q.account)
@@ -673,6 +674,13 @@ class SqlLedgerStore:
             conditions.append(txns.c.transaction_type == q.transaction_type)
         if q.trade_group_id is not None:
             conditions.append(txns.c.trade_group_id == q.trade_group_id)
+        return conditions
+
+    async def query_transactions(self, q: TransactionQuery) -> tuple[list[TransactionDetailRow], int]:
+        txns = models.Transaction.__table__
+        orders = models.Order.__table__
+
+        conditions = self._transaction_conditions(q)
 
         cols = [
             *[c for c in txns.columns if c.name in {f.name for f in TransactionDetailRow.__dataclass_fields__.values()}],
@@ -691,6 +699,73 @@ class SqlLedgerStore:
             rows = (await session.execute(stmt)).all()
             total = (await session.execute(count_stmt)).scalar_one()
         return [_mapping_to(TransactionDetailRow, r) for r in rows], total
+
+    async def query_transaction_bands(self, q: TransactionQuery) -> TransactionBandPage:
+        """Transactions paged in BAND units — see ``TransactionBandPage``.
+
+        Three statements over the same filtered set: pick the page's bands (ordered
+        by each band's newest transaction), fetch every row of those bands, and count
+        bands + rows for the page denominators."""
+        txns = models.Transaction.__table__
+        orders = models.Order.__table__
+        conditions = self._transaction_conditions(q)
+
+        # A band is the trade group, or the lone row when unattributed. Prefixed so
+        # a group pk and a transaction pk can never collide on the same key.
+        band = case(
+            (
+                txns.c.trade_group_id.is_not(None),
+                func.concat("g", cast(txns.c.trade_group_id, String)),
+            ),
+            else_=func.concat("t", cast(txns.c.id, String)),
+        ).label("band")
+
+        base = select(*txns.columns, band).where(*conditions).subquery("base")
+        # Newest band first; ties (same second, or a whole band with no executed_at)
+        # break on the band's newest row id so the order is total and stable.
+        page = (
+            select(
+                base.c.band,
+                func.max(base.c.executed_at).label("band_ts"),
+                func.max(base.c.id).label("band_id"),
+            )
+            .group_by(base.c.band)
+            .order_by(func.max(base.c.executed_at).desc().nulls_last(), func.max(base.c.id).desc())
+            .limit(q.limit)
+            .offset(q.offset)
+            .subquery("page")
+        )
+        fields = {f.name for f in TransactionDetailRow.__dataclass_fields__.values()}
+        stmt = (
+            select(
+                *[c for c in base.c if c.name in fields],
+                orders.c.signal_id.label("signal_id"),
+            )
+            .select_from(
+                base.join(page, base.c.band == page.c.band).outerjoin(
+                    orders, base.c.order_id == orders.c.id
+                )
+            )
+            .order_by(
+                page.c.band_ts.desc().nulls_last(),
+                page.c.band_id.desc(),
+                base.c.executed_at.desc().nulls_last(),
+                base.c.id.desc(),
+            )
+        )
+        band_count_stmt = select(func.count()).select_from(
+            select(base.c.band).group_by(base.c.band).subquery("all_bands")
+        )
+        row_count_stmt = select(func.count()).select_from(txns).where(*conditions)
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).all()
+            band_total = (await session.execute(band_count_stmt)).scalar_one()
+            row_total = (await session.execute(row_count_stmt)).scalar_one()
+        return TransactionBandPage(
+            rows=[_mapping_to(TransactionDetailRow, r) for r in rows],
+            band_total=band_total,
+            row_total=row_total,
+        )
 
     async def transaction_value_total(self, account: str) -> Decimal:
         """Signed cash total of an account's entire transaction history.

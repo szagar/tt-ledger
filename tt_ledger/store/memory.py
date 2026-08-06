@@ -10,7 +10,7 @@ same way the SQL test suite queries the underlying tables directly.
 
 from __future__ import annotations
 
-from dataclasses import fields as dc_fields
+from dataclasses import fields as dc_fields, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Generic, TypeVar
@@ -33,6 +33,7 @@ from ..rows import (
     TradeFilter,
     TradeGroupRow,
     TradeRow,
+    TransactionBandPage,
     TransactionDetailRow,
     TransactionQuery,
     TxnRow,
@@ -436,14 +437,34 @@ class InMemoryStore:
         )
         total = len(matched)
         page = matched[q.offset : q.offset + q.limit]
-        out = []
-        for row_id, txn in page:
-            order = self._orders.get(txn.order_id) if txn.order_id is not None else None
-            out.append(
-                _project(txn, TransactionDetailRow, id=row_id,
-                         signal_id=order.signal_id if order is not None else None)
-            )
-        return out, total
+        return [self._transaction_detail(row_id, txn) for row_id, txn in page], total
+
+    def _transaction_detail(self, row_id: int, txn: TxnRow) -> TransactionDetailRow:
+        order = self._orders.get(txn.order_id) if txn.order_id is not None else None
+        return _project(
+            txn, TransactionDetailRow, id=row_id,
+            signal_id=order.signal_id if order is not None else None,
+        )
+
+    async def query_transaction_bands(self, q: TransactionQuery) -> TransactionBandPage:
+        """Band-unit paging — the in-memory twin of the SQL store's window query.
+        Reuses ``query_transactions`` for filtering + newest-first ordering (asking
+        for everything), then folds rows into bands in that same order, so the two
+        stores agree on which band a page starts and ends with."""
+        all_rows, row_total = await self.query_transactions(
+            replace(q, limit=len(self._transactions.all()) + 1, offset=0)
+        )
+        bands: dict[str, list[TransactionDetailRow]] = {}
+        for row in all_rows:
+            key = f"g{row.trade_group_id}" if row.trade_group_id is not None else f"t{row.id}"
+            bands.setdefault(key, []).append(row)
+        keys = list(bands)  # first-seen == newest-band-first (all_rows is newest-first)
+        page = keys[q.offset : q.offset + q.limit]
+        return TransactionBandPage(
+            rows=[row for key in page for row in bands[key]],
+            band_total=len(keys),
+            row_total=row_total,
+        )
 
     async def transaction_value_total(self, account: str) -> Decimal:
         total = Decimal("0")

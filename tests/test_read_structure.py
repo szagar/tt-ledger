@@ -161,6 +161,41 @@ async def test_query_transactions_pages_newest_first_with_joined_signal(any_stor
     assert [r.tt_transaction_id for r in page] == ["T-2"]
 
 
+async def test_query_transaction_bands_pages_whole_groups(any_store):
+    """A band is a trade group (every one of its rows) or a lone unattributed row;
+    limit/offset count bands, so no group is ever split across a page."""
+    group_pk = await _seed_transactions(any_store)
+    # A second row in the SAME group as T-1, but OLDER than the ungrouped rows --
+    # row-unit paging would separate the two; band paging must keep them together.
+    await any_store.upsert_transactions([
+        TxnRow(tt_transaction_id="T-0", tt_order_id=None, account="main",
+               transaction_type="Trade",
+               action="Buy to Close", security_id="option:SPXW:2026-07-03:put:6200",
+               underlying="SPXW", quantity=Decimal("1"), price=Decimal("0.10"),
+               net_value=Decimal("10.66"), net_value_effect="Debit",
+               trade_group_id=group_pk,
+               executed_at=datetime(2026, 6, 30, 14, 0, tzinfo=UTC)),
+    ])
+
+    page = await any_store.query_transaction_bands(TransactionQuery(limit=10))
+    assert page.row_total == 4  # every matching transaction
+    assert page.band_total == 3  # group g1 + two unattributed rows on their own
+    # Bands ordered by their NEWEST row; the group's two rows stay adjacent even
+    # though T-0 predates everything else.
+    assert [r.tt_transaction_id for r in page.rows] == ["T-3", "T-2", "T-1", "T-0"]
+
+    first = await any_store.query_transaction_bands(TransactionQuery(limit=1))
+    assert [r.tt_transaction_id for r in first.rows] == ["T-3"]
+    assert (first.band_total, first.row_total) == (3, 4)
+
+    third = await any_store.query_transaction_bands(TransactionQuery(limit=1, offset=2))
+    assert [r.tt_transaction_id for r in third.rows] == ["T-1", "T-0"]  # whole group
+    assert third.rows[0].signal_id == "sig-1"  # still joined from the order
+
+    scoped = await any_store.query_transaction_bands(TransactionQuery(account="main", limit=10))
+    assert (scoped.band_total, scoped.row_total) == (2, 3)  # filters apply to bands too
+
+
 async def test_query_transactions_filters(any_store):
     await _seed_transactions(any_store)
 

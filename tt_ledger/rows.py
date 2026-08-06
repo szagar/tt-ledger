@@ -576,6 +576,24 @@ class TransactionQuery:
 
 
 @dataclass
+class TransactionBandPage:
+    """One page of ``query_transaction_bands`` — transactions paged in BAND units,
+    where a band is a trade group (its every transaction) or, for an unattributed
+    row, that row alone.
+
+    ``limit``/``offset`` count bands, not rows, so a band is never split across a
+    page: a host that renders transactions grouped by trade group can trust that
+    every band it shows is complete (row-unit paging truncates the last one, and
+    its per-band totals are then silently wrong). ``rows`` stays band-contiguous
+    and newest-band-first; ``band_total`` is the page denominator, ``row_total``
+    the matching transaction count for display."""
+
+    rows: list[TransactionDetailRow]
+    band_total: int
+    row_total: int
+
+
+@dataclass
 class SyncResult:
     orders: int = 0
     transactions: int = 0
