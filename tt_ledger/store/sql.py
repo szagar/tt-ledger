@@ -664,9 +664,14 @@ class SqlLedgerStore:
             conditions.append(txns.c.account == q.account)
         if q.accounts is not None:
             conditions.append(txns.c.account.in_(q.accounts))
-        if q.start is not None:
+        # Instant bounds win over the calendar-day ones (see TransactionQuery).
+        if q.start_at is not None:
+            conditions.append(txns.c.executed_at >= q.start_at)
+        elif q.start is not None:
             conditions.append(txns.c.executed_at >= _day_start(q.start))
-        if q.end is not None:
+        if q.end_at is not None:
+            conditions.append(txns.c.executed_at < q.end_at)
+        elif q.end is not None:
             conditions.append(txns.c.executed_at < _day_start(q.end) + timedelta(days=1))
         if q.underlying is not None:
             conditions.append(txns.c.underlying == q.underlying)

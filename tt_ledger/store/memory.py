@@ -107,6 +107,21 @@ def _in_range(value: datetime | None, start, end) -> bool:
     return True
 
 
+def _in_window(value: datetime | None, q: TransactionQuery) -> bool:
+    """A transaction's ``executed_at`` against a ``TransactionQuery``'s window —
+    instant bounds (``end_at`` exclusive) if given, else the UTC calendar days.
+    Mirrors the SQL store's precedence."""
+    if q.start_at is not None or q.end_at is not None:
+        if value is None:
+            return False
+        if q.start_at is not None and value < q.start_at:
+            return False
+        if q.end_at is not None and value >= q.end_at:
+            return False
+        return True
+    return _in_range(value, q.start, q.end)
+
+
 class InMemoryStore:
     def __init__(self) -> None:
         self._accounts: _Table[AccountRow] = _Table(key=lambda r: r.nickname)
@@ -418,7 +433,7 @@ class InMemoryStore:
                 continue
             if q.accounts is not None and txn.account not in q.accounts:
                 continue
-            if not _in_range(txn.executed_at, q.start, q.end):
+            if not _in_window(txn.executed_at, q):
                 continue
             if q.underlying is not None and txn.underlying != q.underlying:
                 continue

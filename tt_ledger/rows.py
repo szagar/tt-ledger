@@ -566,8 +566,16 @@ class TransactionQuery:
 
     account: str | None = None
     accounts: list[str] | None = None
+    # Calendar-day window, bounded at UTC midnight (``end`` inclusive).
     start: date | None = None
     end: date | None = None
+    # Explicit instant window (``end_at`` EXCLUSIVE), taking precedence over
+    # start/end when set. For callers whose "day" is not a UTC day: a session
+    # that runs past 20:00 in a western zone spills into the next UTC date, so
+    # a UTC-midnight window silently files those fills under the wrong day.
+    # Pass the session's real boundaries as instants instead.
+    start_at: datetime | None = None
+    end_at: datetime | None = None
     underlying: str | None = None
     transaction_type: str | None = None
     trade_group_id: int | None = None

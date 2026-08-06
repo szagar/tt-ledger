@@ -161,6 +161,55 @@ async def test_query_transactions_pages_newest_first_with_joined_signal(any_stor
     assert [r.tt_transaction_id for r in page] == ["T-2"]
 
 
+async def test_query_transactions_instant_window_beats_calendar_day(any_store):
+    """``start_at``/``end_at`` bound on instants, so a caller whose session day
+    isn't a UTC day (an evening ET fill lands on the NEXT UTC date) can ask for
+    the window it actually means. T-2 is 2026-07-02 20:00Z."""
+    await _seed_transactions(any_store)
+
+    # The UTC calendar day containing T-2 -- what a date window can express.
+    rows, _ = await any_store.query_transactions(
+        TransactionQuery(start=date(2026, 7, 2), end=date(2026, 7, 2))
+    )
+    assert [r.tt_transaction_id for r in rows] == ["T-2"]
+
+    # An instant window ending BEFORE it excludes it, though the day matches.
+    rows, total = await any_store.query_transactions(
+        TransactionQuery(
+            start_at=datetime(2026, 7, 2, tzinfo=UTC),
+            end_at=datetime(2026, 7, 2, 19, tzinfo=UTC),
+        )
+    )
+    assert (rows, total) == ([], 0)
+
+    # ...and one spanning the boundary picks up both days' rows.
+    rows, total = await any_store.query_transactions(
+        TransactionQuery(
+            start_at=datetime(2026, 7, 2, 19, tzinfo=UTC),
+            end_at=datetime(2026, 7, 3, 19, tzinfo=UTC),
+        )
+    )
+    assert [r.tt_transaction_id for r in rows] == ["T-3", "T-2"]
+    assert total == 2
+
+    # Instant bounds win when both are set (start/end here would match nothing).
+    rows, _ = await any_store.query_transactions(
+        TransactionQuery(
+            start=date(2020, 1, 1), end=date(2020, 1, 2),
+            start_at=datetime(2026, 7, 2, 19, tzinfo=UTC),
+            end_at=datetime(2026, 7, 3, 19, tzinfo=UTC),
+        )
+    )
+    assert [r.tt_transaction_id for r in rows] == ["T-3", "T-2"]
+
+    # Bands honour the same window.
+    page = await any_store.query_transaction_bands(
+        TransactionQuery(start_at=datetime(2026, 7, 3, tzinfo=UTC))
+    )
+    assert [r.tt_transaction_id for r in page.rows] == ["T-3"]
+    assert (page.band_total, page.row_total) == (1, 1)
+
+
 async def test_query_transaction_bands_pages_whole_groups(any_store):
     """A band is a trade group (every one of its rows) or a lone unattributed row;
     limit/offset count bands, so no group is ever split across a page."""
