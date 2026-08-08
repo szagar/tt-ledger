@@ -20,6 +20,10 @@ class ReviewStatus(StrEnum):
     NEEDS_REVIEW = "needs_review"
     CONFIRMED = "confirmed"
     IGNORED = "ignored"
+    #: Operator-flagged bad data (fabricated/unrepairable rows): excluded from
+    #: analytics (sweeps, trade_facts) but retained for audit. Distinct from
+    #: IGNORED (an attribution-review verdict).
+    INVALID = "invalid"
 
 
 class OrderStatus(StrEnum):
