@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from ..identity import AccountMapper, SecurityResolver
     from ..ingest.broker import BrokerClient
     from ..store import LedgerStore
+    from .reconcile import SettlementPriceResolver
 
 _EPOCH = date(1970, 1, 1)
 
@@ -100,6 +101,7 @@ async def sync_all(
     accounts: "AccountMapper",
     resolver: "SecurityResolver",
     since: date | None = None,
+    settlement_price: "SettlementPriceResolver | None" = None,
 ) -> "SyncResult":
     """orders -> transactions -> positions -> reconcile.
 
@@ -135,7 +137,7 @@ async def sync_all(
         logger.warning("sync_balances failed for %s: %s", account, exc)
 
     try:
-        reconcile_result = await reconcile(store, account, since=since)
+        reconcile_result = await reconcile(store, account, since=since, settlement_price=settlement_price)
         result.trade_groups += reconcile_result.trade_groups
         result.errors.extend(reconcile_result.errors)
     except Exception as exc:  # noqa: BLE001

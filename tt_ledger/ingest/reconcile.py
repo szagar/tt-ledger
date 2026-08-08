@@ -43,7 +43,15 @@ from .replay import net_open_quantities, price_realized_gross
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from ..store import LedgerStore
+
+    #: async (security_id, expiry) -> underlying settlement price, or None when
+    #: unresolvable. Receives the lapsing OPTION's security_id; the caller's
+    #: resolver owns deriving the underlying and sourcing the price (the
+    #: ledger stays market-data-free).
+    SettlementPriceResolver = Callable[[str, date], Awaitable[Decimal | None]]
 
 # Transactions executed within this window of each other cluster into one trade_group — covers
 # both a single multi-leg order's near-simultaneous fills and a multi-order strategy a human
@@ -87,6 +95,7 @@ async def synthesize_lapsed_settlements(
     store: "LedgerStore",
     account: str,
     *,
+    settlement_price: "SettlementPriceResolver | None" = None,
     dry_run: bool = False,
 ) -> "list[TxnRow]":
     """Synthesize the MISSING broker settlement rows for open lots past expiry — per group.
@@ -121,7 +130,18 @@ async def synthesize_lapsed_settlements(
       replay's backstop, so nothing is lost in between.
     * id = ``lapse-<account>-<group_pk>-<security_id>`` — re-runs upsert the
       same row.
-    * price 0 at expiry 21:15Z; replay's ``_effective_delta_price`` offsets
+    * **settlement value, never a blind zero for options** (2026-08-07 —
+      phantom-full-credit fix): a lapsing OPTION lot (``securities.strike`` +
+      ``option_type`` present) settles at INTRINSIC against the underlying's
+      settlement price from the injected ``settlement_price`` resolver —
+      ``price`` = intrinsic points, ``net_value`` = ±intrinsic × qty ×
+      multiplier (long receives, short pays). A zero-price lapse fabricated
+      full-credit profits on every ITM expiry (six /ES paper iron flies,
+      +$6,230 phantom). When the resolver is absent or returns None the leg
+      is SKIPPED — loudly, not fabricated — and re-synthesizes on a later
+      pass once a price resolves (stuck-open beats wrong-forever). Non-option
+      lots (no strike metadata) keep the legacy zero-lapse.
+    * timestamp expiry 21:15Z; replay's ``_effective_delta_price`` offsets
       the open lot exactly like a feed-delivered expiration.
 
     Returns the synthesized transactions (already written and applied unless
@@ -144,6 +164,37 @@ async def synthesize_lapsed_settlements(
         expiry = sec.expiry if sec is not None else None
         if expiry is None or last_activity.date() <= expiry + timedelta(days=1):
             continue
+
+        # Settlement value per contract (points). Options settle at intrinsic
+        # against the underlying's settlement price; without a resolvable
+        # price we refuse to synthesize (a zero would fabricate full-credit
+        # profit on ITM lapses). Non-option lots keep the legacy zero.
+        strike = getattr(sec, "strike", None) if sec is not None else None
+        option_type = getattr(sec, "option_type", None) if sec is not None else None
+        settle_points = Decimal("0")
+        if strike is not None and option_type in ("C", "P"):
+            settle = (
+                await settlement_price(security_id, expiry)
+                if settlement_price is not None
+                else None
+            )
+            if settle is None:
+                logger.warning(
+                    "lapse synthesis SKIPPED %s %s: option lot past expiry but no "
+                    "settlement price resolvable — refusing to fabricate a zero-value "
+                    "lapse; lot stays open until a price resolves",
+                    account,
+                    security_id,
+                )
+                continue
+            intrinsic = (
+                max(Decimal("0"), settle - strike)
+                if option_type == "C"
+                else max(Decimal("0"), strike - settle)
+            )
+            settle_points = intrinsic
+
+        multiplier = (getattr(sec, "multiplier", None) if sec is not None else None) or 1
         remaining = abs(net)
         for group in sorted(open_groups, key=lambda g: g.pk):
             if remaining == 0:
@@ -153,6 +204,8 @@ async def synthesize_lapsed_settlements(
                 continue
             qty = min(abs(group_net), remaining)
             remaining -= qty
+            # Long lots receive the settlement value, short lots pay it.
+            cash = settle_points * qty * Decimal(multiplier)
             common = {
                 "tt_transaction_id": f"lapse-{account}-{group.pk}-{security_id}",
                 "account": account,
@@ -161,8 +214,8 @@ async def synthesize_lapsed_settlements(
                 "security_id": security_id,
                 "underlying": sec.underlying if sec is not None else None,
                 "quantity": qty,
-                "price": Decimal("0"),
-                "net_value": Decimal("0"),
+                "price": settle_points,
+                "net_value": cash if net > 0 else -cash,
                 "executed_at": datetime.combine(expiry, datetime.min.time(), tzinfo=UTC).replace(
                     hour=21, minute=15
                 ),
@@ -500,6 +553,7 @@ async def reconcile(
     account: str | None = None,
     *,
     since: date | None = None,
+    settlement_price: "SettlementPriceResolver | None" = None,
     dry_run: bool = False,
 ) -> "SyncResult":
     """Link → group → classify → create trade_groups, for ``account`` (every account with
@@ -527,7 +581,9 @@ async def reconcile(
             # Self-heal: recreate the settlement rows the broker never sent for
             # open lots past expiry and apply them straight to the stuck groups
             # (pre-attributed — they never enter the candidate/cluster path).
-            synthesized = await synthesize_lapsed_settlements(store, acct, dry_run=dry_run)
+            synthesized = await synthesize_lapsed_settlements(
+                store, acct, settlement_price=settlement_price, dry_run=dry_run
+            )
             result.transactions += len(synthesized)
 
             activity = await store.account_activity(ActivityFilter(account=acct, start=since))

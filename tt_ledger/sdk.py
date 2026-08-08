@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
     from .identity import AccountMapper, SecurityResolver
     from .ingest.broker import BalanceMessage, BrokerClient, BrokerTransaction
+    from .ingest.reconcile import SettlementPriceResolver
     from .ingest.push import MessageSource
     from .rows import (
         ActivityRow,
@@ -69,9 +70,15 @@ class LedgerClient:
         accounts: "AccountMapper",
         resolver: "SecurityResolver | None" = None,
         client: "BrokerClient | None" = None,
+        settlement_price: "SettlementPriceResolver | None" = None,
     ) -> None:
         self._store = store
         self._accounts = accounts
+        # Optional async (security_id, expiry) -> underlying settlement price,
+        # used by lapse synthesis to settle expired option lots at intrinsic.
+        # Without it, option lapse synthesis refuses rather than fabricating
+        # zero-value settlements (see ingest.reconcile).
+        self._settlement_price = settlement_price
         # Injectable symbology. Default: canonical security_id == the raw vendor symbol.
         self._resolver: SecurityResolver = resolver or PassthroughResolver()
         # No default: required only by sync(); every other method works without one. Pass
@@ -88,6 +95,7 @@ class LedgerClient:
         accounts: "AccountMapper",
         resolver: "SecurityResolver | None" = None,
         client: "BrokerClient | None" = None,
+        settlement_price: "SettlementPriceResolver | None" = None,
         pool_size: int | None = None,
         max_overflow: int | None = None,
         pool_timeout: int | None = None,
@@ -107,6 +115,7 @@ class LedgerClient:
             accounts=accounts,
             resolver=resolver,
             client=client,
+            settlement_price=settlement_price,
         )
 
     # --- capture ---
@@ -123,6 +132,7 @@ class LedgerClient:
         return await sync_all(
             self._store, account, client=self._client, accounts=self._accounts,
             resolver=self._resolver, since=since,
+            settlement_price=self._settlement_price,
         )
 
     async def record_order(self, order: "OrderInput") -> "OrderRow":
@@ -250,7 +260,7 @@ class LedgerClient:
             txns, account=account, source_system=source_system,
         )
         if reconcile_after:
-            rec = await reconcile(self._store, account)
+            rec = await reconcile(self._store, account, settlement_price=self._settlement_price)
             result.trade_groups = rec.trade_groups
             result.errors.extend(rec.errors)
         return result
@@ -479,7 +489,10 @@ class LedgerClient:
 
     async def reconcile(self, account: str | None = None, *, since: date | None = None, dry_run: bool = False) -> "SyncResult":
         """Re-run reconcile without a broker pull (e.g. after backfilling data another way)."""
-        return await reconcile(self._store, account, since=since, dry_run=dry_run)
+        return await reconcile(
+            self._store, account, since=since,
+            settlement_price=self._settlement_price, dry_run=dry_run,
+        )
 
     async def rebuild_positions(self, account: str | None = None) -> "SyncResult":
         """Rebuild ``positions``/``closed_positions`` from transaction history

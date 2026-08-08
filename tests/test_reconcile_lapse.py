@@ -280,3 +280,105 @@ async def test_dry_run_counts_but_writes_nothing(store, accounts, resolver):
     assert await _lapse_rows(store) == []  # ...but never written
     trade = (await _trades(store))[0]
     assert trade.status == TradeGroupStatus.OPEN.value  # and the group didn't flip
+
+
+# ── intrinsic settlement (the 2026-08-07 phantom-full-credit fix) ────────────
+#
+# An option lot with strike metadata must settle at INTRINSIC against the
+# injected settlement_price resolver, not lapse at zero: a zero-price lapse on
+# an ITM short fabricated a full-credit profit (six /ES paper iron flies).
+# Without a resolvable price the leg is refused — stuck-open beats
+# wrong-forever. Lots without strike metadata keep the legacy zero-lapse
+# (covered by the tests above).
+
+
+class StrikeAwareResolver:
+    """ExpiryResolver plus the option-metadata fields intrinsic needs."""
+
+    def resolve(self, vendor_symbol, instrument_type=None):  # noqa: ANN001, ANN201
+        is_option = instrument_type == "Equity Option"
+        return ResolvedSecurity(
+            security_id=vendor_symbol,
+            product_type="OS" if is_option else "S",
+            underlying="SPY" if is_option else None,
+            expiry=EXPIRY if is_option else None,
+            strike=Decimal("580") if is_option else None,
+            option_type="P" if is_option else None,
+            multiplier=100 if is_option else 1,
+        )
+
+
+def _settle_at(price: str | None):
+    async def resolver(security_id, expiry):  # noqa: ANN001, ANN202
+        return Decimal(price) if price is not None else None
+
+    return resolver
+
+
+@pytest.fixture
+def strike_resolver() -> StrikeAwareResolver:
+    return StrikeAwareResolver()
+
+
+async def test_itm_lapse_settles_at_intrinsic(store, accounts, strike_resolver):
+    """Short 580P, settle 550 → intrinsic 30: the lapse row carries price 30 /
+    net −3000 (short pays), and realized = 250 credit − 3000 = −2750 — never
+    the fabricated full credit."""
+    await _sync(store, accounts, strike_resolver, _entry_client())
+    await reconcile(store, "main")
+    await reconcile(store, "main", settlement_price=_settle_at("550"))
+
+    lapse = (await _lapse_rows(store))[0]
+    assert lapse.price == Decimal("30")
+    assert lapse.net_value == Decimal("-3000")
+    trade = (await _trades(store))[0]
+    assert trade.status == TradeGroupStatus.EXPIRED.value
+    assert trade.realized_pnl == Decimal("-2750")
+
+
+async def test_otm_lapse_keeps_full_credit(store, accounts, strike_resolver):
+    """Short 580P, settle 600 → intrinsic 0: legacy economics, full credit."""
+    await _sync(store, accounts, strike_resolver, _entry_client())
+    await reconcile(store, "main")
+    await reconcile(store, "main", settlement_price=_settle_at("600"))
+
+    lapse = (await _lapse_rows(store))[0]
+    assert lapse.price == Decimal("0")
+    assert lapse.net_value == Decimal("0")
+    assert (await _trades(store))[0].realized_pnl == Decimal("250")
+
+
+async def test_unresolvable_price_refuses_to_fabricate(store, accounts, strike_resolver):
+    """Strike metadata present but no price resolvable (resolver absent OR
+    returning None) → NO lapse row, group stays open for a later pass."""
+    await _sync(store, accounts, strike_resolver, _entry_client())
+    await reconcile(store, "main")
+
+    await reconcile(store, "main")  # no resolver at all
+    assert await _lapse_rows(store) == []
+    assert (await _trades(store))[0].status == TradeGroupStatus.OPEN.value
+
+    await reconcile(store, "main", settlement_price=_settle_at(None))
+    assert await _lapse_rows(store) == []
+    assert (await _trades(store))[0].status == TradeGroupStatus.OPEN.value
+
+    # a price arriving later un-sticks it
+    await reconcile(store, "main", settlement_price=_settle_at("550"))
+    assert (await _trades(store))[0].status == TradeGroupStatus.EXPIRED.value
+
+
+async def test_long_itm_lapse_receives_intrinsic(store, accounts, strike_resolver):
+    """A LONG 580P bought for 250, settle 550 → receives +3000: realized
+    −250 − fees? no — gross realized = 3000 − 250 = +2750, net_value +3000."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Buy to Open", quantity="1",
+           net_value="-250", executed_at=T0)
+    _clock_trade(client, executed_at=datetime(2026, 2, 2, 15, 0, tzinfo=UTC))
+    await _sync(store, accounts, strike_resolver, client)
+    await reconcile(store, "main")
+    await reconcile(store, "main", settlement_price=_settle_at("550"))
+
+    lapse = (await _lapse_rows(store))[0]
+    assert lapse.price == Decimal("30")
+    assert lapse.net_value == Decimal("3000")
+    assert (await _trades(store))[0].realized_pnl == Decimal("2750")
