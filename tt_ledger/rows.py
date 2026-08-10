@@ -175,6 +175,12 @@ class OpenGroupLegRow:
     Σ(opening qty) − Σ(closing qty), and ``average_open_price`` is the VWAP of the group's
     OWN opening fills, not the blend across sibling groups.
 
+    ``net_open`` is a MAGNITUDE — how much of the leg is still open, the same
+    direction-blind convention as ``net_open_by_group`` (which clamps closing quantities,
+    where the group's own single direction makes the sign redundant). ``direction`` carries
+    the way this group holds the leg, and ``signed_net_open`` combines the two; anything
+    comparing claims ACROSS groups needs the signed form.
+
     Consumers attribute a pooled position row across its claiming groups with these
     shares — per-group quantity, cost basis, and therefore per-group unrealized P&L
     against the (correctly shared) live mark."""
@@ -184,6 +190,17 @@ class OpenGroupLegRow:
     trade_group_id: int
     net_open: int
     average_open_price: Decimal | None = None
+    direction: str = "Long"
+
+    @property
+    def signed_net_open(self) -> int:
+        """The stake as a signed position — negative when the group holds it short.
+
+        Magnitudes cannot be summed across sibling groups: one contract is routinely a
+        short call in one group's condor and a long wing in another's (laddered entries
+        into a shared expiry), so Σ``net_open`` exceeds the broker's net and a consumer
+        reconciling the two would wrongly conclude the claims don't add up."""
+        return -self.net_open if self.direction == "Short" else self.net_open
 
 
 def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
@@ -194,19 +211,29 @@ def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
     backends cannot drift. ``net_open`` counts only ``* to Open`` / ``* to Close``
     (settlements and corporate actions contribute 0, matching ``net_open_by_group``);
     ``average_open_price`` is the quantity-weighted mean of the OPENING fills only, so
-    scaling out of a leg never moves its entry basis."""
-    acc: dict[tuple[str, str, int], list[Decimal]] = {}  # [net, opening qty, Σ price×qty]
+    scaling out of a leg never moves its entry basis.
+
+    ``direction`` comes from the sign of the group's OWN opening fills — ``Sell to Open``
+    short, ``Buy to Open`` long — so a caller can tell a sold strike from a bought wing at
+    the same strike. It is tracked separately from ``net_open`` rather than folded into it
+    because that magnitude is the load-bearing "how much is still open" number for close
+    clamping, and closes (``Buy to Close`` of a short, ``Sell to Close`` of a long) reduce
+    it regardless of which way the leg is held."""
+    # [net, opening qty, Σ price×qty, signed opening qty]
+    acc: dict[tuple[str, str, int], list[Decimal]] = {}
     for account, security_id, trade_group_id, action, quantity, price in records:
         if security_id is None or trade_group_id is None:
             continue
         verb = (action or "").strip()
         qty = Decimal(str(quantity or 0))
         slot = acc.setdefault(
-            (account, security_id, trade_group_id), [Decimal(0), Decimal(0), Decimal(0)]
+            (account, security_id, trade_group_id),
+            [Decimal(0), Decimal(0), Decimal(0), Decimal(0)],
         )
         if verb.endswith("to Open"):
             slot[0] += qty
             slot[1] += qty
+            slot[3] += -qty if verb.lower().startswith("sell") else qty
             if price is not None:
                 slot[2] += Decimal(str(price)) * qty
         elif verb.endswith("to Close"):
@@ -218,8 +245,14 @@ def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
             trade_group_id=trade_group_id,
             net_open=int(net),
             average_open_price=(notional / open_qty) if open_qty else None,
+            direction="Short" if signed_open < 0 else "Long",
         )
-        for (account, security_id, trade_group_id), (net, open_qty, notional) in acc.items()
+        for (account, security_id, trade_group_id), (
+            net,
+            open_qty,
+            notional,
+            signed_open,
+        ) in acc.items()
     ]
 
 

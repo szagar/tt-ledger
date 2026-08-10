@@ -436,6 +436,56 @@ async def test_open_group_legs_splits_a_shared_strike(any_store):
     assert {leg.account for leg in legs.values()} == {"main"}
 
 
+async def test_open_group_legs_carry_their_own_direction(any_store):
+    """Both groups SOLD the shared strike, so both claims are short — and the
+    partial close on B reduces the magnitude without flipping the direction."""
+    pk_a, pk_b = await _seed_shared_strike(any_store)
+    legs = {leg.trade_group_id: leg for leg in await any_store.open_group_legs()}
+    assert legs[pk_a].direction == "Short"
+    assert legs[pk_b].direction == "Short"
+    # net_open stays the direction-blind magnitude the close-clamping path wants.
+    assert [legs[pk_a].net_open, legs[pk_b].net_open] == [1, 1]
+    assert [legs[pk_a].signed_net_open, legs[pk_b].signed_net_open] == [-1, -1]
+
+
+async def test_opposite_direction_claims_net_like_the_broker(any_store):
+    """One contract held OPPOSITE ways by two open groups — the same strike is a
+    short call in one group's condor and the long wing of another's (laddered
+    entries into a shared expiry).
+
+    Both magnitudes read 1, so Σ``net_open`` is 2 while the broker's book is flat.
+    Only the signed form reconciles, which is what lets a consumer split the pooled
+    row instead of refusing and showing the account's net as one group's leg."""
+    pk_short = await any_store.upsert_trade_group(
+        TradeGroupRow(group_id="d-short", account="main", origin=Origin.ZTS,
+                      review_status=ReviewStatus.CONFIRMED, status="open")
+    )
+    pk_long = await any_store.upsert_trade_group(
+        TradeGroupRow(group_id="d-long", account="main", origin=Origin.ZTS,
+                      review_status=ReviewStatus.CONFIRMED, status="open")
+    )
+    sid = "future_option:ES:Z6:2026-09-30:call:7925"
+    await any_store.upsert_transactions([
+        TxnRow(tt_transaction_id="D-S1", tt_order_id=None, account="main",
+               transaction_type="Trade", action="Sell to Open", security_id=sid,
+               quantity=Decimal("1"), price=Decimal("49.75"), trade_group_id=pk_short,
+               executed_at=datetime(2026, 7, 22, 14, 45, tzinfo=UTC)),
+        TxnRow(tt_transaction_id="D-L1", tt_order_id=None, account="main",
+               transaction_type="Trade", action="Buy to Open", security_id=sid,
+               quantity=Decimal("1"), price=Decimal("27.25"), trade_group_id=pk_long,
+               executed_at=datetime(2026, 7, 31, 14, 45, tzinfo=UTC)),
+    ])
+
+    legs = {leg.trade_group_id: leg for leg in await any_store.open_group_legs()}
+    assert legs[pk_short].direction == "Short"
+    assert legs[pk_long].direction == "Long"
+    # Each keeps its OWN entry basis — the blend across the two is meaningless here.
+    assert legs[pk_short].average_open_price == Decimal("49.75")
+    assert legs[pk_long].average_open_price == Decimal("27.25")
+    assert sum(legs[pk].net_open for pk in (pk_short, pk_long)) == 2  # magnitudes
+    assert sum(legs[pk].signed_net_open for pk in (pk_short, pk_long)) == 0  # the book
+
+
 async def test_open_group_legs_excludes_closed_groups(any_store):
     """Only OPEN groups claim a contract — a closed sibling must not appear."""
     pk_a, _ = await _seed_net_open(any_store)  # group B there is status="closed"

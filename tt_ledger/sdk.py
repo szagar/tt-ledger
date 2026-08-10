@@ -435,7 +435,9 @@ class LedgerClient:
         Consumers split a pooled position row across the returned shares to get per-group
         quantity, cost basis, and unrealized P&L against the (correctly shared) live mark.
         Only shares with ``net_open > 0`` are returned — a group that has closed its side of
-        a shared strike no longer claims it.
+        a shared strike no longer claims it (``net_open`` is a magnitude, so this filter
+        keeps short claims; reconcile against the broker with ``signed_net_open``, since
+        claiming groups may hold the same contract in OPPOSITE directions).
         """
         shares: dict[tuple[str, str], list[OpenGroupLegRow]] = {}
         for leg in await self._store.open_group_legs(account):
