@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import reduce
+from math import gcd
 from typing import TYPE_CHECKING
 
 from ..enums import Ingest, Origin, OrderStatus
@@ -125,19 +127,65 @@ def _vwap(fills: "list[PlacedFill]") -> Decimal | None:
     return sum((f.quantity * f.fill_price for f in fills), Decimal("0")) / total_qty
 
 
-def order_level_fill_fields(legs: "list") -> tuple[Decimal | None, Decimal | None, Decimal | None]:
-    """(average_fill_price, filled_quantity, remaining_quantity) for a SINGLE-leg order only.
+def order_level_fill_fields(
+    legs: "list", *, price_effect: str | None = None
+) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """(average_fill_price, filled_quantity, remaining_quantity) derived from the legs.
 
     TastyTrade's real Order object has no order-level fill fields at all (verified against their
-    OpenAPI spec) — only each leg's own quantity/remaining-quantity/fills. A multi-leg spread's
-    net execution price isn't a plain average of its legs' fill prices either, so this stays
-    ``(None, None, None)`` for anything but exactly one leg.
+    OpenAPI spec) — only each leg's own quantity/remaining-quantity/fills — so the order-level
+    aggregates are derived here.
+
+    Single-leg: the leg's fill VWAP / Σ fill quantities / remaining-quantity, unchanged.
+
+    Multi-leg: aggregates per STRUCTURE UNIT. The unit count is the gcd of the legs' quantities
+    (a 2-lot iron fly's 2/2/2/2 legs are 2 units of a 1/1/1/1 structure; a 1×2 ratio spread's
+    1/2 legs are 1 unit), each leg's per-unit ratio is quantity ÷ units, and:
+
+    - ``filled_quantity``: min over legs of (Σ fill quantities ÷ ratio) — structure units
+      completely filled.
+    - ``remaining_quantity``: max over legs of (remaining-quantity ÷ ratio).
+    - ``average_fill_price``: Σ of ±(leg VWAP × ratio) with Sell legs positive and Buy legs
+      negative (a net CREDIT is positive), then negated when ``price_effect == "Debit"`` so
+      the stored value reads on the same axis as the order's limit price. ``None`` until
+      EVERY leg has fills — a partial net would compare a half-executed spread against a
+      whole-spread limit.
+
+    A leg with a non-positive or non-integral quantity keeps the old conservative behaviour:
+    ``(None, None, None)``.
     """
-    if len(legs) != 1:
+    if not legs:
         return None, None, None
-    leg = legs[0]
-    filled_quantity = sum((f.quantity for f in leg.fills), Decimal("0"))
-    return _vwap(leg.fills), filled_quantity, leg.remaining_quantity
+    if len(legs) == 1:
+        leg = legs[0]
+        filled_quantity = sum((f.quantity for f in leg.fills), Decimal("0"))
+        return _vwap(leg.fills), filled_quantity, leg.remaining_quantity
+
+    quantities: list[int] = []
+    for leg in legs:
+        if leg.quantity <= 0 or leg.quantity != leg.quantity.to_integral_value():
+            return None, None, None
+        quantities.append(int(leg.quantity))
+    units = reduce(gcd, quantities)
+    ratios = [Decimal(q) // units for q in quantities]
+
+    filled_units = min(
+        sum((f.quantity for f in leg.fills), Decimal("0")) / ratio
+        for leg, ratio in zip(legs, ratios)
+    )
+    remaining_units = max(leg.remaining_quantity / ratio for leg, ratio in zip(legs, ratios))
+
+    net: Decimal | None = Decimal("0")
+    for leg, ratio in zip(legs, ratios):
+        vwap = _vwap(leg.fills)
+        if vwap is None:
+            net = None
+            break
+        sign = 1 if leg.action.lower().startswith("sell") else -1
+        net += sign * vwap * ratio
+    if net is not None and price_effect == "Debit":
+        net = -net
+    return net, filled_units, remaining_units
 
 
 class OrderRepository(_Repo):
@@ -169,7 +217,7 @@ class OrderRepository(_Repo):
             await self._build_order_row(
                 po, account=account,
                 security_id=(resolved_legs[i][0].security_id if len(po.legs) == 1 else None),
-                fill_fields=order_level_fill_fields(po.legs),
+                fill_fields=order_level_fill_fields(po.legs, price_effect=po.price_effect),
             )
             for i, po in enumerate(placed_orders)
         ]

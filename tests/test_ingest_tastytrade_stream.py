@@ -106,18 +106,20 @@ def test_parse_order_notification_derives_single_leg_fill_fields():
     assert fill_event.filled_at == datetime(2023, 7, 5, 19, 7, 32, 737000, tzinfo=UTC)
 
 
-def test_parse_order_notification_multi_leg_leaves_aggregates_none():
+def test_parse_order_notification_multi_leg_derives_unit_aggregates():
+    # Multi-leg aggregates are now DERIVED per structure unit (they used to stay
+    # None): no fills yet -> 0 units filled, no net price until every leg fills.
     data = {
         **ORDER_NOTIFICATION_DATA,
         "legs": [
-            {"instrument-type": "Equity Option", "symbol": "AAPL  260117C00150000", "action": "Sell to Open", "quantity": 1, "remaining-quantity": 0, "fills": []},
-            {"instrument-type": "Equity Option", "symbol": "AAPL  260117P00150000", "action": "Sell to Open", "quantity": 1, "remaining-quantity": 0, "fills": []},
+            {"instrument-type": "Equity Option", "symbol": "AAPL  260117C00150000", "action": "Sell to Open", "quantity": 1, "remaining-quantity": 1, "fills": []},
+            {"instrument-type": "Equity Option", "symbol": "AAPL  260117P00150000", "action": "Sell to Open", "quantity": 1, "remaining-quantity": 1, "fills": []},
         ],
     }
     fill_event = _order_notification_to_fill_event(data)
     assert fill_event.average_fill_price is None
-    assert fill_event.filled_quantity is None
-    assert fill_event.remaining_quantity is None
+    assert fill_event.filled_quantity == Decimal("0")
+    assert fill_event.remaining_quantity == Decimal("1")
 
 
 def test_parse_position_notification():

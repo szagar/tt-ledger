@@ -145,7 +145,9 @@ def _parse_notification(msg: dict) -> "FillEvent | BrokerPosition | BalanceMessa
 
 def _order_notification_to_fill_event(data: dict) -> FillEvent:
     order = order_from_json(data)
-    average_fill_price, filled_quantity, remaining_quantity = order_level_fill_fields(order.legs)
+    average_fill_price, filled_quantity, remaining_quantity = order_level_fill_fields(
+        order.legs, price_effect=order.price_effect
+    )
     is_filled = map_order_status(order.status) is OrderStatus.FILLED
     return FillEvent(
         tt_order_id=order.id,

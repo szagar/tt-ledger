@@ -155,12 +155,12 @@ async def test_sync_orders_multi_leg_iron_condor(store, accounts, resolver):
     orders = await store.query_orders(OrderFilter(account="main"))
     assert orders[0].security_id is None  # ambiguous across 2 legs -> left unset
     assert orders[0].underlying == "SPX"
-    # a 2-leg spread's net price isn't a plain average of its legs' fill prices, and TastyTrade's
-    # real Order object has no order-level fill fields anyway (verified against their OpenAPI
-    # spec) -- these stay unset for anything but a single-leg order.
-    assert orders[0].average_fill_price is None
-    assert orders[0].filled_quantity is None
-    assert orders[0].remaining_quantity is None
+    # TastyTrade's real Order object has no order-level fill fields (verified against their
+    # OpenAPI spec) -- they are DERIVED per structure unit from the legs: two short strikes
+    # at 2.5 each net a 5.0 credit for 1 unit filled.
+    assert orders[0].average_fill_price == Decimal("5.0")
+    assert orders[0].filled_quantity == Decimal("1")
+    assert orders[0].remaining_quantity == Decimal("0")
     assert orders[0].is_complex is True
     assert orders[0].complex_order_type == "Iron Condor"
 
