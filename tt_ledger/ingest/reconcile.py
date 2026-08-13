@@ -77,6 +77,11 @@ _RD_EVENT_BY_SUBTYPE = {
     "Cash Settled Exercise": TradeGroupEventType.EXERCISE,
 }
 
+# The MONEY half of a cash-settled index settlement — the strike-priced partner
+# of a bare Assignment / Exercise removal row for the same contracts at the same
+# instant. One event, two rows; see ``_settled_quantity``.
+_RD_CASH_SETTLED_SUBTYPES = frozenset({"Cash Settled Assignment", "Cash Settled Exercise"})
+
 # TradeGroupStatus a fully-offset group lands on, by the single event type that closed it;
 # more than one distinct cause -> MIXED.
 _STATUS_BY_EVENT = {
@@ -401,6 +406,36 @@ async def find_misattributed_open_groups(store: "LedgerStore", account: str) -> 
 
 def _is_nontrade_close(row) -> bool:  # noqa: ANN001 -- ActivityRow | TxnRow (duck-typed)
     return row.transaction_type == "Receive Deliver" and row.transaction_sub_type in _RD_EVENT_BY_SUBTYPE
+
+
+def _settled_quantity(rd_rows: list) -> Decimal:
+    """Contracts a settlement event actually retired, per security.
+
+    A cash-settled index settlement arrives as TWO rows for the SAME contracts:
+    the bare ``Assignment`` / ``Exercise`` removal row and its ``Cash Settled …``
+    money partner. Summing both double-counted the event's quantity_change (an
+    XSP 773 put assigned 1 lot recorded -2 against an entry of +1). The removal
+    row is the contract count; the money row only prices it. Equity and futures
+    options send the removal row alone, and repeat settlements of one security
+    on the same pass still add up.
+
+    ``_net_quantities`` already clamps the redundant row to zero, so this is the
+    display/audit field only — no group's status or P&L moved either way."""
+    by_security: dict[tuple[str | None, bool], Decimal] = {}
+    for r in rd_rows:
+        if r.quantity is None:
+            continue
+        is_money_row = r.transaction_sub_type in _RD_CASH_SETTLED_SUBTYPES
+        key = (r.security_id, is_money_row)
+        by_security[key] = by_security.get(key, Decimal("0")) + abs(r.quantity)
+    securities = {sid for sid, _ in by_security}
+    return sum(
+        (
+            by_security.get((sid, False)) or by_security.get((sid, True), Decimal("0"))
+            for sid in securities
+        ),
+        Decimal("0"),
+    )
 
 
 def _is_delivery(row) -> bool:  # noqa: ANN001
@@ -969,7 +1004,7 @@ async def _apply_exit(
         await store.add_trade_group_event(
             EventRow(
                 trade_group_id=group.pk, event_type=event_type.value,
-                quantity_change=-sum(abs(r.quantity) for r in rd_rows if r.quantity is not None),
+                quantity_change=-_settled_quantity(rd_rows),
                 premium_change=sum((_signed_net(r) for r in rd_rows), Decimal("0")),
                 event_at=max(rd_ats) if rd_ats else event_at,
                 rolled_to_group_id=(delivery_pk if links_delivery else None),

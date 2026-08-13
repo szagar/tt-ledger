@@ -320,6 +320,57 @@ async def test_assignment_delivery_forms_linked_group_and_bare_cover_closes_it(s
     assert TradeGroupEventType.FULL_EXIT.value in [e.event_type for e in future_events]
 
 
+async def test_cash_settled_pair_counts_its_contracts_once(store, accounts, resolver):
+    """The XSP group-3227 shape (stefano, 2026-08-11): a cash-settled index
+    option settles as TWO Receive Deliver rows for the SAME contract at the same
+    instant — the bare ``Assignment`` removal row and its ``Cash Settled
+    Assignment`` money partner (strike as price, the dollars, no action).
+
+    Summing both recorded ``quantity_change = -2`` against an entry of +1. The
+    removal row is the contract count; the money row only prices it. Cash still
+    sums across BOTH rows — the fees ride the removal row."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="14", executed_at=T0)
+    settled_at = T0 + timedelta(days=6)
+    _receive_deliver(client, txn_id="RD-REMOVE", symbol=PUT_A, sub_type="Assignment",
+                     quantity="1", net_value="0", executed_at=settled_at)
+    _receive_deliver(client, txn_id="RD-CASH", symbol=PUT_A, sub_type="Cash Settled Assignment",
+                     quantity="1", net_value="-23", executed_at=settled_at)
+
+    await _sync_and_reconcile(store, accounts, resolver, client)
+
+    trades = await _trades(store)
+    assert len(trades) == 1
+    assert trades[0].status == TradeGroupStatus.ASSIGNED.value
+
+    events = await _events(store, trades[0].group_id)
+    assignment = next(e for e in events if e.event_type == TradeGroupEventType.ASSIGNMENT.value)
+    # ONE contract was assigned — not the two rows that describe it.
+    assert assignment.quantity_change == Decimal("-1")
+    # ...while the cash is the sum across both rows.
+    assert assignment.premium_change == Decimal("-23")
+
+
+async def test_repeat_settlements_of_one_security_still_add_up(store, accounts, resolver):
+    """The dedupe is per (security, row-kind) — two genuine partial assignments
+    of the same contract on one pass must still total their contracts."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="2",
+           net_value="500", executed_at=T0)
+    _receive_deliver(client, txn_id="RD-1", symbol=PUT_A, sub_type="Assignment",
+                     quantity="1", net_value="-10", executed_at=T0 + timedelta(days=6))
+    _receive_deliver(client, txn_id="RD-2", symbol=PUT_A, sub_type="Assignment",
+                     quantity="1", net_value="-10", executed_at=T0 + timedelta(days=6))
+
+    await _sync_and_reconcile(store, accounts, resolver, client)
+
+    trades = await _trades(store)
+    events = await _events(store, trades[0].group_id)
+    assignment = next(e for e in events if e.event_type == TradeGroupEventType.ASSIGNMENT.value)
+    assert assignment.quantity_change == Decimal("-2")
+
+
 # ------------------------------------------------- net-aware close routing (2026-07-12 fix)
 
 
