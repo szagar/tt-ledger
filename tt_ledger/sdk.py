@@ -55,6 +55,7 @@ if TYPE_CHECKING:
         OpenGroupLegRow,
         OrderInput,
         PositionRow,
+        SecurityRow,
         TradeRow,
         TransactionBandPage,
         TransactionDetailRow,
@@ -476,6 +477,21 @@ class LedgerClient:
 
     async def closed_positions(self, account: str, security_id: str | None = None) -> "list[ClosedPositionRow]":
         return await self._store.get_closed_positions(account, security_id)
+
+    async def securities_for(self, security_ids: "list[str]") -> "dict[str, SecurityRow]":
+        """The securities dimension rows for a batch of ``security_id``s.
+
+        The read twin of the ingest-side upsert (``record_order`` writes every
+        leg's resolver output + vendor ``tt_symbol`` here): the broker-native
+        symbol and product metadata for a security the ledger has seen. The
+        primary consumer is trade-group order construction (a closing order
+        needs the broker symbol the position rows deliberately don't carry).
+        Missing ids are simply absent from the result -- a security the ledger
+        has never ingested an order leg for has no row (e.g. a hypothetical
+        transactions-only position); callers keep their own fallback.
+        """
+        rows = await self._store.get_securities(security_ids)
+        return {row.security_id: row for row in rows}
 
     async def latest_balance(self, account: str) -> "BalanceSnapshotRow | None":
         """The most recent balance snapshot (stream- or sync-written) for ``account``."""

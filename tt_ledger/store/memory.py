@@ -313,6 +313,10 @@ class InMemoryStore:
     async def get_security(self, security_id: str) -> SecurityRow | None:
         return self._securities.get_by_key(security_id)
 
+    async def get_securities(self, security_ids: list[str]) -> list[SecurityRow]:
+        rows = (self._securities.get_by_key(sid) for sid in dict.fromkeys(security_ids))
+        return [row for row in rows if row is not None]
+
     async def get_trade_group(self, group_id: str) -> TradeGroupRow | None:
         return self._trade_groups.get_by_key(group_id)
 

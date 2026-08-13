@@ -510,6 +510,18 @@ class SqlLedgerStore:
             row = (await session.execute(select(table).where(table.c.security_id == security_id))).first()
         return _mapping_to(SecurityRow, row) if row is not None else None
 
+    async def get_securities(self, security_ids: list[str]) -> list[SecurityRow]:
+        if not security_ids:
+            return []
+        table = models.Security.__table__
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(table).where(table.c.security_id.in_(list(dict.fromkeys(security_ids))))
+                )
+            ).all()
+        return [_mapping_to(SecurityRow, r) for r in rows]
+
     async def get_trade_group(self, group_id: str) -> TradeGroupRow | None:
         table = models.TradeGroup.__table__
         async with self._sessionmaker() as session:
