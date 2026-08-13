@@ -536,6 +536,52 @@ def test_close_against_a_flat_lot_is_a_window_artifact_noop():
     assert plan == [("T1", False, None)]
 
 
+def test_close_against_a_lot_this_walk_flattened_is_a_real_fill():
+    """The mirror of the test above: once the walk HAS held the security, a
+    close-against-flat is real and must apply.
+
+    A sibling group's ``Sell to Open`` nets the account's long to zero (a broker
+    keeps ONE position per contract), so the matching ``Buy to Close`` lands on a
+    flat lot — but its opening counterpart is right there in the same history, so
+    dropping it silently loses a contract. szagar_paper's
+    ``future_option:ES:Z6:2026-09-18:put:6850`` replayed to 2 while three open
+    groups each legitimately claimed one, which made cockpit's attribution guard
+    refuse to split the row (2026-08-13).
+    """
+    rows = [
+        _row("T1", quantity=Decimal("1"), action="Buy to Open", price=Decimal("39.625")),
+        _row("T2", quantity=Decimal("1"), action="Sell to Open", price=Decimal("40.00"),
+             executed_at=T0 + timedelta(days=3)),
+        _row("T3", quantity=Decimal("1"), action="Buy to Close", price=Decimal("49.875"),
+             executed_at=T0 + timedelta(days=4)),
+        _row("T4", quantity=Decimal("1"), action="Buy to Open", price=Decimal("48.625"),
+             executed_at=T0 + timedelta(days=4, hours=1)),
+        _row("T5", quantity=Decimal("1"), action="Buy to Open", price=Decimal("46.375"),
+             executed_at=T0 + timedelta(days=7)),
+    ]
+    position, _plan = _replay_security("main", "ES_PUT", rows, 50, None)
+
+    # T2 closed T1's lot (broker netting); T3 re-opened, T4/T5 added.
+    assert position.quantity == Decimal("3")
+    assert position.quantity_direction == "Long"
+
+
+def test_net_open_quantities_agrees_with_the_replay_walk():
+    """``net_open_quantities`` is documented to net exactly as ``_replay_security``
+    does — the lapse synthesis keys off it, so the two must not drift."""
+    from tt_ledger.ingest.replay import net_open_quantities
+
+    rows = [
+        _row("T1", quantity=Decimal("1"), action="Buy to Open", price=Decimal("39.625"),
+             security_id="ES_PUT"),
+        _row("T2", quantity=Decimal("1"), action="Sell to Open", price=Decimal("40.00"),
+             executed_at=T0 + timedelta(days=3), security_id="ES_PUT"),
+        _row("T3", quantity=Decimal("1"), action="Buy to Close", price=Decimal("49.875"),
+             executed_at=T0 + timedelta(days=4), security_id="ES_PUT"),
+    ]
+    assert net_open_quantities(rows) == {"ES_PUT": Decimal("1")}
+
+
 async def test_same_timestamp_delivery_batch_applies_opens_before_closes(store_url):
     """An option-exercise delivery books the delivered future's open and its offsetting close
     at the same instant; close-first would hit the close-on-flat no-op and strand the open."""

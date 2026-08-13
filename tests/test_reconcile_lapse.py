@@ -382,3 +382,42 @@ async def test_long_itm_lapse_receives_intrinsic(store, accounts, strike_resolve
     assert lapse.price == Decimal("30")
     assert lapse.net_value == Decimal("3000")
     assert (await _trades(store))[0].realized_pnl == Decimal("2750")
+
+
+async def test_offsetting_sibling_groups_each_settle(store, accounts, strike_resolver):
+    """Two open groups holding the SAME contract in OPPOSITE directions both settle.
+
+    A laddered multi-entry strategy reuses strikes across rungs: the strike one
+    rung sells short is the next rung's long wing. That nets the ACCOUNT to zero
+    while both groups sit open, so discovery driven off the account-level net
+    could not see the contract at all and left every such group stuck open
+    forever — 68 MEIC groups across three paper accounts over ten sessions
+    (2026-08-03..08-12), invisible because 134 expired contracts netted to zero.
+
+    Each group must settle its own leg at its own sign: short pays intrinsic,
+    long receives it, and the two cancel at the account level exactly as they
+    should.
+    """
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="250", executed_at=T0)
+    _trade(client, order_id="O-2", symbol=PUT_A, action="Buy to Open", quantity="1",
+           net_value="-200", executed_at=T0 + timedelta(minutes=30))  # own cluster -> own group
+    _clock_trade(client, executed_at=datetime(2026, 2, 2, 15, 0, tzinfo=UTC))
+    await _sync(store, accounts, strike_resolver, client)
+    first = await reconcile(store, "main")
+    assert first.trade_groups == 2
+
+    # Settle 550 against the 580 put -> intrinsic 30 (x100 = 3000 per contract).
+    result = await reconcile(store, "main", settlement_price=_settle_at("550"))
+
+    assert result.transactions == 2  # one settlement PER group, not zero
+    lapses = await _lapse_rows(store)
+    assert sorted(r.net_value for r in lapses) == [Decimal("-3000"), Decimal("3000")]
+    assert {r.price for r in lapses} == {Decimal("30")}
+    # Both groups closed, and the offsetting settlements cancel account-wide.
+    trades = await _trades(store)
+    assert [t.status for t in trades] == [TradeGroupStatus.EXPIRED.value] * 2
+    assert sum(r.net_value for r in lapses) == Decimal("0")
+    # Short group: 250 credit - 3000 = -2750. Long group: -200 debit + 3000 = 2800.
+    assert sorted(t.realized_pnl for t in trades) == [Decimal("-2750"), Decimal("2800")]

@@ -113,26 +113,29 @@ async def synthesize_lapsed_settlements(
     should have sent and applies them straight to the stuck groups.
 
     Rules (deterministic, idempotent):
-    * open lots come from ``net_open_quantities`` over the account's FULL
-      transaction history — never the positions table, which replay's lapse
-      backstop has already flattened for exactly these lots. A real settlement
-      (or a prior synthetic one) already nets the lot to zero, so re-runs and
-      late-arriving broker truth no-op.
+    * open lots come from each OPEN GROUP's own transaction net — never the
+      positions table (replay's lapse backstop has already flattened exactly
+      these lots) and never the account-level net. Sibling groups routinely
+      hold one contract in opposite directions, which zeroes the account net
+      while both groups are still open; discovery off that net could not see
+      them at all (the 2026-08 MEIC backlog). A real settlement (or a prior
+      synthetic one) already nets the GROUP's own book to zero, so re-runs and
+      late-arriving broker truth still no-op.
     * clock = the account's own latest transaction, never wall-clock (same
       rule as replay's ``_lapse_expired_lot``); a lot lapses only once the
       account has activity a full day past the contract's expiry.
-    * ONE ROW PER (OPEN GROUP, SECURITY), quantity = the group's own net,
-      capped by the account-level net, pre-attributed to that group and
-      applied via ``_apply_exit`` directly — NOT routed through clustering.
-      The same contract is routinely held open by several groups (parallel
-      paper strategies on one chain), and ``_route_cluster``'s first-match
-      would hand a single whole-quantity settlement to one group and leave
-      the rest stuck. Only groups whose net direction matches the account
-      net participate (mismatches are misattribution messes for regroup);
-      allocation walks groups in pk order until the account net is spent.
-      A lot whose entry hasn't been grouped yet synthesizes on the NEXT
-      pass, once its group exists — position-level flattening is already
-      replay's backstop, so nothing is lost in between.
+    * ONE ROW PER (OPEN GROUP, SECURITY), quantity and SIGN = the group's own
+      net, pre-attributed to that group and applied via ``_apply_exit``
+      directly — NOT routed through clustering. The same contract is routinely
+      held open by several groups (parallel paper strategies on one chain), and
+      ``_route_cluster``'s first-match would hand a single whole-quantity
+      settlement to one group and leave the rest stuck. Every holding group
+      settles, in pk order, whichever way it holds the contract — a short leg
+      pays intrinsic and a long leg receives it, so offsetting siblings cancel
+      at the account level exactly as they should. A lot whose entry hasn't
+      been grouped yet synthesizes on the NEXT pass, once its group exists —
+      position-level flattening is already replay's backstop, so nothing is
+      lost in between.
     * id = ``lapse-<account>-<group_pk>-<security_id>`` — re-runs upsert the
       same row.
     * **settlement value, never a blind zero for options** (2026-08-07 —
@@ -160,11 +163,25 @@ async def synthesize_lapsed_settlements(
     open_groups = await _load_open_groups(store, account)
     group_nets = {group.pk: _net_quantities(group.rows) for group in open_groups}
 
+    # Securities still held open by SOME group, from the GROUPS' OWN books --
+    # never the account-level net. Sibling groups routinely hold one contract in
+    # OPPOSITE directions (a strike that is one ladder rung's short and the next
+    # rung's long wing), so the account nets to zero while both groups sit stuck
+    # open. Driving discovery off that net made those structurally unsettleable:
+    # 134 expired SPXW contracts across three paper accounts were invisible here
+    # and stranded 68 MEIC groups over ten sessions (2026-08-03..08-12). Each
+    # group settles its own leg at its own sign, which sums back to the
+    # account's real exposure by construction.
+    held: set[str] = {
+        security_id
+        for nets in group_nets.values()
+        for security_id, group_net in nets.items()
+        if group_net != 0
+    }
+
     synthesized: list[TxnRow] = []
     by_group: dict[int, list[ActivityRow]] = {}
-    for security_id, net in sorted(net_open_quantities(activity).items()):
-        if net == 0:
-            continue
+    for security_id in sorted(held):
         sec = await store.get_security(security_id)
         expiry = sec.expiry if sec is not None else None
         if expiry is None or last_activity.date() <= expiry + timedelta(days=1):
@@ -200,15 +217,11 @@ async def synthesize_lapsed_settlements(
             settle_points = intrinsic
 
         multiplier = (getattr(sec, "multiplier", None) if sec is not None else None) or 1
-        remaining = abs(net)
         for group in sorted(open_groups, key=lambda g: g.pk):
-            if remaining == 0:
-                break
             group_net = group_nets[group.pk].get(security_id, Decimal("0"))
-            if group_net == 0 or (group_net > 0) != (net > 0):
+            if group_net == 0:
                 continue
-            qty = min(abs(group_net), remaining)
-            remaining -= qty
+            qty = abs(group_net)
             # Long lots receive the settlement value, short lots pay it.
             cash = settle_points * qty * Decimal(multiplier)
             common = {
@@ -220,7 +233,7 @@ async def synthesize_lapsed_settlements(
                 "underlying": sec.underlying if sec is not None else None,
                 "quantity": qty,
                 "price": settle_points,
-                "net_value": cash if net > 0 else -cash,
+                "net_value": cash if group_net > 0 else -cash,
                 "executed_at": datetime.combine(expiry, datetime.min.time(), tzinfo=UTC).replace(
                     hour=21, minute=15
                 ),

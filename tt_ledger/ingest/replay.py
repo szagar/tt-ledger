@@ -192,6 +192,7 @@ def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
     for security_id, sec_rows in by_security.items():
         sec_rows.sort(key=lambda r: (r.executed_at, _closes_last(r)))
         lot = _Lot()
+        had_position = False
         for row in sec_rows:
             if row.transaction_type == "Money Movement":
                 continue
@@ -200,11 +201,16 @@ def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
                     continue
                 qty = min(abs(row.quantity), abs(lot.signed_quantity))
                 delta = -qty if lot.signed_quantity > 0 else qty
-            elif lot.signed_quantity == 0 and (row.action or "").strip().endswith("to Close"):
-                continue  # history window didn't reach the opening
+            elif (
+                lot.signed_quantity == 0
+                and not had_position
+                and (row.action or "").strip().endswith("to Close")
+            ):
+                continue  # history window didn't reach the opening (see _effective_delta_price)
             else:
                 delta = _signed_delta(row.action, row.quantity)
             lot.signed_quantity += delta
+            had_position = True
         nets[security_id] = lot.signed_quantity
     return nets
 
@@ -228,14 +234,16 @@ def price_realized_gross(rows: "list[ActivityRow]", multiplier: int) -> Decimal:
     ordered = sorted(rows, key=lambda r: (r.executed_at or _EPOCH, _closes_last(r)))
     lot = _Lot()
     realized = Decimal("0")
+    had_position = False
     for row in ordered:
         if row.quantity is None:
             continue
-        delta, price = _effective_delta_price(row, lot)
+        delta, price = _effective_delta_price(row, lot, had_position=had_position)
         if delta == 0 or price is None:
             continue
         old_signed = lot.signed_quantity
         new_signed = old_signed + delta
+        had_position = True
         if old_signed == 0:
             lot = _Lot(signed_quantity=new_signed, average_open_price=price)
             continue
@@ -293,7 +301,7 @@ def _is_settlement(row) -> bool:  # noqa: ANN001 -- ActivityRow (duck-typed)
     return row.transaction_type == "Receive Deliver" and row.transaction_sub_type in _SETTLEMENT_SUBTYPES
 
 
-def _effective_delta_price(row, lot: "_Lot") -> "tuple[Decimal, Decimal | None]":  # noqa: ANN001
+def _effective_delta_price(row, lot: "_Lot", *, had_position: bool = False) -> "tuple[Decimal, Decimal | None]":  # noqa: ANN001
     """(signed delta, effective price) for one row against the current lot.
 
     Trades use the action-signed quantity + trade price. Settlements offset the open lot
@@ -305,8 +313,19 @@ def _effective_delta_price(row, lot: "_Lot") -> "tuple[Decimal, Decimal | None]"
     * ``Money Movement`` rows -- cash-only; futures daily Mark to Market carries a
       quantity + price but is NOT a fill (counting it inflated futures lots by one
       contract per settlement day in the first live rehearsal).
-    * an explicit ``* to Close`` against a FLAT lot -- the matching open predates the
-      sync window; fabricating a fresh lot from it produced phantom "open" positions.
+    * an explicit ``* to Close`` against a flat lot the walk has NEVER seen open
+      (``had_position`` false) -- the matching open predates the sync window;
+      fabricating a fresh lot from it produced phantom "open" positions.
+
+    ``had_position`` is what keeps that exclusion honest. Once this walk HAS held the
+    security, a later close-against-flat is a real fill whose opening counterpart we also
+    saw -- the lot was flattened by an offsetting open from a sibling group, not by a gap
+    in history. Dropping it silently understated the account: szagar_paper's
+    ``future_option:ES:Z6:2026-09-18:put:6850`` replayed to 2 contracts while three open
+    groups each legitimately claimed one, so cockpit's attribution guard refused to split
+    the row (2026-08-13). It also cut the other way -- a dropped close left a phantom open
+    lot that only replay's lapse backstop then cleaned up. A broker nets one position per
+    contract per account and re-opens on a close that exceeds it; this mirrors that.
     """
     if row.transaction_type == "Money Movement":
         return Decimal("0"), None
@@ -316,7 +335,7 @@ def _effective_delta_price(row, lot: "_Lot") -> "tuple[Decimal, Decimal | None]"
         qty = min(abs(row.quantity), abs(lot.signed_quantity))
         delta = -qty if lot.signed_quantity > 0 else qty
         return delta, (row.price if row.price is not None else Decimal("0"))
-    if lot.signed_quantity == 0 and (row.action or "").strip().endswith("to Close"):
+    if lot.signed_quantity == 0 and not had_position and (row.action or "").strip().endswith("to Close"):
         return Decimal("0"), None
     return _signed_delta(row.action, row.quantity), row.price
 
@@ -371,16 +390,18 @@ def _replay_security(
 ) -> "tuple[PositionRow, list[tuple[str, bool, ClosedPositionRow | None]]]":
     lot = _Lot()
     last_direction = "Long"
+    had_position = False
     plan: list[tuple[str, bool, ClosedPositionRow | None]] = []
 
     for row in rows:
-        delta, price = _effective_delta_price(row, lot)
+        delta, price = _effective_delta_price(row, lot, had_position=had_position)
         if delta == 0 or price is None:
             plan.append((row.tt_transaction_id, False, None))
             continue
 
         old_signed = lot.signed_quantity
         new_signed = old_signed + delta
+        had_position = True
 
         if old_signed == 0:
             lot = _Lot(
