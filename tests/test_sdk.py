@@ -85,6 +85,21 @@ async def test_record_order_creates_a_zts_row_with_no_tt_order_id(client):
     assert orders[0].security_id == "AAPL"
 
 
+async def test_record_order_round_trips_client_order_id(client):
+    """The host-minted submit tag (e.g. COCKPIT-CLOSE-*) is the durable mark
+    distinguishing an operator-initiated order from a bot fire's — it must
+    land on the stored row (it is already in _ORDER_LINKAGE_COLS, so later
+    broker-pull re-upserts preserve it)."""
+    await client.record_order(
+        OrderInput(
+            account="main", security_id="AAPL", order_type="Limit",
+            client_order_id="COCKPIT-CLOSE-20260813T200000-1234",
+        )
+    )
+    orders = await client.orders(account="main")
+    assert orders[0].client_order_id == "COCKPIT-CLOSE-20260813T200000-1234"
+
+
 async def test_apply_fill_enriches_an_existing_order_by_tt_order_id(client):
     await client._store.upsert_orders(
         [OrderRow(tt_order_id="O-1", account="main", origin=Origin.ZTS, ingest=Ingest.OMS_SUBMIT, oms_status="submitted")]

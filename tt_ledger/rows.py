@@ -530,6 +530,8 @@ class OrderInput:
     account: str
     tt_order_id: str | None = None
     oms_order_id: str | None = None  # the host OMS's own order id, for cross-referencing
+    client_order_id: str | None = None  # host-minted submit tag (e.g. COCKPIT-CLOSE-*) -- the
+    # durable mark distinguishing an operator-initiated order from a bot fire's
     security_id: str | None = None
     underlying: str | None = None
     order_type: str | None = None
