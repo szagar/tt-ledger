@@ -421,3 +421,49 @@ async def test_offsetting_sibling_groups_each_settle(store, accounts, strike_res
     assert sum(r.net_value for r in lapses) == Decimal("0")
     # Short group: 250 credit - 3000 = -2750. Long group: -200 debit + 3000 = 2800.
     assert sorted(t.realized_pnl for t in trades) == [Decimal("-2750"), Decimal("2800")]
+
+
+async def test_paper_settle_after_zero_lapses_on_expiry_day(store, accounts, resolver):
+    """``settle_after=timedelta(0)`` synthesizes as soon as the account has expiry-day
+    activity — the paper case, where no broker settlement is ever coming.
+
+    The default waits for activity at expiry+2 so a synthetic row never races the
+    broker's real T+1 settlement. Paper accounts have no broker behind them, so that
+    wait only holds every expiry open for 2 calendar days (4 across a weekend) with
+    its P&L unrecorded.
+    """
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="250", executed_at=T0)
+    # The account's clock stops ON expiry day — the exact case the default refuses.
+    _clock_trade(client, executed_at=datetime.combine(EXPIRY, datetime.min.time(), tzinfo=UTC))
+    await _sync(store, accounts, resolver, client)
+    await reconcile(store, "main")
+
+    # Default: still waiting.
+    await reconcile(store, "main")
+    assert await _lapse_rows(store) == []
+    assert (await _trades(store))[0].status == TradeGroupStatus.OPEN.value
+
+    # No broker to wait for → settle now.
+    await reconcile(store, "main", settle_after=timedelta(0))
+
+    assert len(await _lapse_rows(store)) == 1
+    assert (await _trades(store))[0].status != TradeGroupStatus.OPEN.value
+
+
+async def test_settle_after_default_is_unchanged_for_broker_accounts(store, accounts, resolver):
+    """The default must reproduce the pre-parameter behaviour exactly: activity on
+    expiry+1 is NOT enough, activity on expiry+2 is."""
+    client = MockTastyTradeClient()
+    _trade(client, order_id="O-1", symbol=PUT_A, action="Sell to Open", quantity="1",
+           net_value="250", executed_at=T0)
+    _clock_trade(
+        client,
+        executed_at=datetime.combine(EXPIRY + timedelta(days=1), datetime.min.time(), tzinfo=UTC),
+    )
+    await _sync(store, accounts, resolver, client)
+    await reconcile(store, "main")
+
+    await reconcile(store, "main")
+    assert await _lapse_rows(store) == [], "expiry+1 activity must not lapse under the default"

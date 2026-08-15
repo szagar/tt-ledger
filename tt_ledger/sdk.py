@@ -7,7 +7,7 @@ server (tt_ledger.api) and CLI (tt_ledger.cli) are thin wrappers over this.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -505,11 +505,28 @@ class LedgerClient:
 
     # --- reconcile ---
 
-    async def reconcile(self, account: str | None = None, *, since: date | None = None, dry_run: bool = False) -> "SyncResult":
-        """Re-run reconcile without a broker pull (e.g. after backfilling data another way)."""
+    async def reconcile(
+        self,
+        account: str | None = None,
+        *,
+        since: date | None = None,
+        settle_after: "timedelta | None" = None,
+        dry_run: bool = False,
+    ) -> "SyncResult":
+        """Re-run reconcile without a broker pull (e.g. after backfilling data another way).
+
+        ``settle_after`` overrides how much post-expiry account activity the lapse
+        synthesis waits for before standing in for a missing broker settlement.
+        Leave it unset for broker-backed accounts; pass ``timedelta(0)`` for paper,
+        where no real settlement is ever coming (see ``synthesize_lapsed_settlements``).
+        """
+        from .ingest.reconcile import DEFAULT_SETTLE_AFTER
+
         return await reconcile(
             self._store, account, since=since,
-            settlement_price=self._settlement_price, dry_run=dry_run,
+            settlement_price=self._settlement_price,
+            settle_after=DEFAULT_SETTLE_AFTER if settle_after is None else settle_after,
+            dry_run=dry_run,
         )
 
     async def rebuild_positions(self, account: str | None = None) -> "SyncResult":

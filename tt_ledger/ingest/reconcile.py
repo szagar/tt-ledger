@@ -96,11 +96,21 @@ _STATUS_BY_EVENT = {
 _BARE_ACTIONS = {"Buy", "Sell"}  # futures trade without open/close intent -- direction from context
 
 
+#: How much account activity past a contract's expiry must exist before a missing
+#: broker settlement is synthesized. The default waits for activity on expiry+2:
+#: a real settlement row normally arrives T+1, and synthesizing before it lands
+#: would race the broker's own truth with a substitute. Accounts with NO broker
+#: behind them (paper) have nothing to race and pass ``timedelta(0)`` — see
+#: ``synthesize_lapsed_settlements``.
+DEFAULT_SETTLE_AFTER = timedelta(days=2)
+
+
 async def synthesize_lapsed_settlements(
     store: "LedgerStore",
     account: str,
     *,
     settlement_price: "SettlementPriceResolver | None" = None,
+    settle_after: timedelta = DEFAULT_SETTLE_AFTER,
     dry_run: bool = False,
 ) -> "list[TxnRow]":
     """Synthesize the MISSING broker settlement rows for open lots past expiry — per group.
@@ -121,9 +131,20 @@ async def synthesize_lapsed_settlements(
       them at all (the 2026-08 MEIC backlog). A real settlement (or a prior
       synthetic one) already nets the GROUP's own book to zero, so re-runs and
       late-arriving broker truth still no-op.
-    * clock = the account's own latest transaction, never wall-clock (same
-      rule as replay's ``_lapse_expired_lot``); a lot lapses only once the
-      account has activity a full day past the contract's expiry.
+    * clock = the account's own latest transaction, never wall-clock (so a
+      replay reproduces the same rows); a lot lapses only once the account has
+      activity at ``expiry + settle_after``. The ``timedelta(days=2)`` default
+      is the live-broker rule replay's ``_lapse_expired_lot`` also applies: a
+      real settlement lands T+1, and synthesizing sooner races the broker's own
+      truth with a substitute for it.
+
+      **Paper accounts pass ``timedelta(0)``.** There is no broker behind them,
+      so no real settlement will ever arrive and the wait buys nothing — it only
+      holds every expiry open for 2 calendar days (4 across a weekend), which is
+      how a whole session's groups stayed open with unrecorded P&L. Measured
+      2026-08-14: every lapse settlement in the store sat at that +2d floor or
+      the weekend-stretched +3/+4. Callers that iterate paper accounts (the host
+      expiration job) pass 0; every other caller keeps the default.
     * ONE ROW PER (OPEN GROUP, SECURITY), quantity and SIGN = the group's own
       net, pre-attributed to that group and applied via ``_apply_exit``
       directly — NOT routed through clustering. The same contract is routinely
@@ -184,7 +205,7 @@ async def synthesize_lapsed_settlements(
     for security_id in sorted(held):
         sec = await store.get_security(security_id)
         expiry = sec.expiry if sec is not None else None
-        if expiry is None or last_activity.date() <= expiry + timedelta(days=1):
+        if expiry is None or last_activity.date() < expiry + settle_after:
             continue
 
         # Settlement value per contract (points). Options settle at intrinsic
@@ -602,10 +623,15 @@ async def reconcile(
     *,
     since: date | None = None,
     settlement_price: "SettlementPriceResolver | None" = None,
+    settle_after: timedelta = DEFAULT_SETTLE_AFTER,
     dry_run: bool = False,
 ) -> "SyncResult":
     """Link → group → classify → create trade_groups, for ``account`` (every account with
     activity in range when ``account`` is omitted).
+
+    ``settle_after`` tunes only the lapse-synthesis clock (see
+    ``synthesize_lapsed_settlements``); pass ``timedelta(0)`` for accounts with no
+    broker behind them.
 
     ``dry_run`` skips the trade_group-creation writes (upsert, attach, attribution, event) but
     still runs the link step — deterministic exact-match linking is always safe to apply, and
@@ -630,7 +656,11 @@ async def reconcile(
             # open lots past expiry and apply them straight to the stuck groups
             # (pre-attributed — they never enter the candidate/cluster path).
             synthesized = await synthesize_lapsed_settlements(
-                store, acct, settlement_price=settlement_price, dry_run=dry_run
+                store,
+                acct,
+                settlement_price=settlement_price,
+                settle_after=settle_after,
+                dry_run=dry_run,
             )
             result.transactions += len(synthesized)
 
