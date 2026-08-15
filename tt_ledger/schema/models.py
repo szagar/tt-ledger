@@ -285,7 +285,13 @@ class Transaction(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    tt_transaction_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # Text, not String(n): besides broker ids this column carries the settlement
+    # ids WE compose — ``lapse-<account>-<group_pk>-<security_id>`` and
+    # ``paper-settle-<account>-<security_id>-<expiry>`` — whose width follows the
+    # account nickname and security_id, not anything we control. String(64) was
+    # already exhausted (longest production row: exactly 64) and account-scoping
+    # the paper-settle key pushed it to 69. See migration a7b8c9d0e5f6.
+    tt_transaction_id: Mapped[str] = mapped_column(Text, unique=True, index=True)
     tt_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     account: Mapped[str] = mapped_column(ForeignKey("accounts.nickname"), index=True)
     account_number: Mapped[str | None] = mapped_column(String(32), nullable=True)  # audit
