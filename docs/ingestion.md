@@ -77,7 +77,11 @@ Turns ungrouped broker activity into reviewable trades.
      still holding an offsetting net** in their security (long for `Sell to Close`, short for
      `Buy to Close`, either for an action-less settlement), drawing that group's remaining net
      down as rows are assigned — so several closes in one cluster spread across the several
-     groups they offset instead of first-match piling onto one. A close no group has net for
+     groups they offset instead of first-match piling onto one. **One over-sized close row
+     draws down every group it offsets, in order**, but can only ATTACH to the first: a
+     transaction carries one `trade_group_id` and cannot split. The groups it also covered
+     are left with a zero remaining net and no row — see *Shared closes* below.
+     A close no group has net for
      falls back to membership match (over-close / window artifact); the attach emits the
      matching lifecycle event (`partial_exit` / `full_exit` / `expiration` / `assignment` /
      `exercise`). A fully-offset group's `status` flips (closed/expired/assigned/exercised;
@@ -111,9 +115,42 @@ attach to a manually-attributed group: that records the group's own lifecycle.)
   — set attribution, cascade to the group's orders/positions/transactions, flip
   `manually_attributed=true` + `review_status=CONFIRMED`, write an `ADJUSTMENT` event.
 - `regroup_transactions(txn_ids, target_group_id | new)` — split/merge when grouping was wrong;
-  recompute both groups' P&L; `ADJUSTMENT` events on both.
+  recompute both groups' P&L, classification **and lifecycle**; `ADJUSTMENT` events on both.
+  A target left fully closed is stamped (status / `closed_at` / gross `realized_pnl` /
+  `total_fees`) with the same rules the exit machinery uses — recomputed even if it was
+  already closed, since a move changes what it realized. A source left with NO transactions
+  becomes `review_status=IGNORED`: an empty group is not a trade, and left open it is a
+  0-leg ghost row every portfolio view has to special-case.
 - `dismiss_trade_group(group_id)` — `review_status=IGNORED` (transfers / non-trades) so it leaves the
   review queue without attribution.
+
+### Shared closes — one fill, several groups
+
+One broker fill routinely flattens lots held by SEVERAL groups (laddered entries, A/B arms,
+assignment deliveries that arrived on different days). A transaction carries exactly one
+`trade_group_id`, so the row lands whole on the first group it offsets. Two consequences,
+one fixed and one irreducible:
+
+- **The receiving group clamps.** Its close offsets at most what it holds; the excess does
+  NOT drive its net through zero. Before 2026-08-26 it did, so a group that had only ever
+  bought 1 and was handed a `Sell 2` concluded it was SHORT 1 — never fully closed, never
+  stamped with its realized P&L, stuck open forever. Settlements always clamped; trade
+  closes now do too, at group grain only (`_group_net_step`). Replay's ACCOUNT-level walk
+  still flips through zero deliberately: there a close beyond the lot is a real fill whose
+  opening counterpart the walk also saw. A group has no such counterpart.
+- **The covered siblings still get no row**, so they stay open. That residue is reported by
+  `find_misattributed_open_groups`, which names the over-closing counterparty in
+  `covered_by` — the repair is a `regroup()` decision (merge the lots into the group holding
+  the close), not something to infer automatically.
+
+Worked example (`individual` 4243 / 4727, repaired 2026-08-26): two put calendars had their
+short leg assigned on 08-18 and 08-20, each delivering a long /ESU6 — at 7800 and at 7745 —
+into its own broker group; one `Sell 2 @ 7676.50` flattened the account on 08-24. Both groups
+stayed open with no realized P&L, hiding −$9,600.00 — which is exactly the daily
+Mark-to-Market cash TastyTrade paid (−4,300 + 750 − 3,325 − 4,125 + 2,875 − 1,475). The two
+calendars meanwhile booked +4,737.50 and +2,162.50 on their option legs alone, so the
+account's realized P&L read POSITIVE for a losing trade. Regrouping the stranded delivery onto
+the group holding the close books the pair's −9,600.00 on one group.
 
 ### Edge cases
 

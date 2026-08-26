@@ -481,20 +481,26 @@ async def test_misattributed_open_groups_detector(store, accounts, resolver):
 
     await _sync_and_reconcile(store, accounts, resolver, client)
 
-    # the whole-quantity close over-closes the first group (net +1) and never reaches the
-    # second (net -1): BOTH stay open, and BOTH are the entangled pair an operator must
-    # untangle — exactly the 155<->156 shape from the 2026-07-12 production sweep
+    # The row lands whole on the first group, which holds only 1 — its close CLAMPS there,
+    # so that group closes properly instead of concluding it is long 1 of something it only
+    # ever sold (the pre-2026-08-26 behaviour: both groups stuck open forever). The second
+    # group gets no row at all and IS the residue an operator must untangle.
     trades = sorted(await _trades(store), key=lambda t: t.executed_at)
-    assert [t.status for t in trades] == [TradeGroupStatus.OPEN.value] * 2
+    assert [t.status for t in trades] == [
+        TradeGroupStatus.CLOSED.value, TradeGroupStatus.OPEN.value,
+    ]
 
+    pks = [await store.get_trade_group_id(t.group_id) for t in trades]
     found = await find_misattributed_open_groups(store, "main")
-    pks = sorted([await store.get_trade_group_id(t.group_id) for t in trades])
-    assert [f["group_pk"] for f in found] == pks
-    assert all(f["securities"] == [PUT_A] for f in found)
+    assert [f["group_pk"] for f in found] == [pks[1]]
+    assert found[0]["securities"] == [PUT_A]
+    # and the report NAMES the group whose over-sized close flattened it, so the operator
+    # has the regroup counterparty without going to look for it
+    assert found[0]["covered_by"] == [pks[0]]
 
     # a genuinely-open lot (account net nonzero) is NOT misattribution
     client2 = MockTastyTradeClient()
     _trade(client2, order_id="O-4", symbol=PUT_B, action="Sell to Open", quantity="1",
            net_value="300", executed_at=T0 + timedelta(days=1))
     await _sync_and_reconcile(store, accounts, resolver, client2)
-    assert [f["group_pk"] for f in await find_misattributed_open_groups(store, "main")] == pks
+    assert [f["group_pk"] for f in await find_misattributed_open_groups(store, "main")] == [pks[1]]

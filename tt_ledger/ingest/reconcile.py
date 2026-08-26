@@ -419,23 +419,80 @@ async def find_misattributed_open_groups(store: "LedgerStore", account: str) -> 
     auto-fixed. Typical source: a manual close order or settlement spanning lots held by
     several groups (one row, one ``trade_group_id`` column — it cannot split).
 
-    Returns ``[{"group_pk", "group_id", "securities"}]``, ordered by pk.
+    Returns ``[{"group_pk", "group_id", "securities", "covered_by"}]``, ordered by pk.
+
+    ``covered_by`` names the sibling group pks holding an OVER-SIZED close in one of those
+    securities — the fill that actually flattened this group — AND only those a merge would
+    genuinely resolve: a pk appears iff combining the two groups' rows leaves every security
+    netted to zero. So it is not merely a hint about who the counterparty was, it is the
+    statement "merging into this group closes both", which is what makes it safe for an
+    automated healer to act on rather than only a human.
+
+    This is the pairing signal for the shape where only ONE side is left stuck. Callers used
+    to infer the pair from two misattributed groups whose net_open directions were a clean
+    open/close — but that inference fails twice over: it is blind to futures (a bare ``Buy``
+    / ``Sell`` carries no open/close intent, so a flattened futures group still reads as
+    "open" — which is why ``individual`` 4243/4727 were skipped hourly for a week), and once
+    the receiving group correctly clamps its close it is no longer misattributed at all, so
+    there is no second group left to pair with.
     """
     activity = await store.account_activity(ActivityFilter(account=account))
     account_nets = net_open_quantities(activity)
+    rows_by_group: dict[int, list] = {}
+    for row in activity:
+        pk = getattr(row, "trade_group_id", None)
+        if pk is not None:
+            rows_by_group.setdefault(pk, []).append(row)
+    over_closers = _over_closing_groups(rows_by_group)
     found: list[dict] = []
     for group in await _load_open_groups(store, account):
         group_nets = {sid: n for sid, n in _net_quantities(group.rows).items() if n != 0}
         if group_nets and all(account_nets.get(sid, Decimal("0")) == 0 for sid in group_nets):
             tg = await store.get_trade_group_by_id(group.pk)
+            candidates = {
+                pk
+                for sid in group_nets
+                for pk in over_closers.get(sid, ())
+                if pk != group.pk
+            }
+            covered_by = sorted(
+                pk
+                for pk in candidates
+                if _fully_closed(list(group.rows) + rows_by_group.get(pk, []))
+            )
             found.append(
                 {
                     "group_pk": group.pk,
                     "group_id": tg.group_id if tg is not None else None,
                     "securities": sorted(group_nets),
+                    "covered_by": covered_by,
                 }
             )
     return sorted(found, key=lambda f: f["group_pk"])
+
+
+def _over_closing_groups(rows_by_group: dict[int, list]) -> dict[str, list[int]]:
+    """``{security_id: [group_pk, ...]}`` for groups whose attached closing quantity EXCEEDS
+    the position they ever held in that security — the signature of one broker fill closing
+    lots that belonged to several groups.
+
+    Measured against ``_peak_exposures`` rather than the group's net: the net is clamped (a
+    group cannot go short what it never opened), so it can no longer show the overshoot at
+    all. The peak is what the group genuinely held; anything the closes carry beyond it went
+    to a sibling.
+    """
+    over: dict[str, list[int]] = {}
+    for pk, rows in rows_by_group.items():
+        peaks = _peak_exposures(rows)
+        closed_qty: dict[str, Decimal] = {}
+        for row in _ordered_position_rows(rows):
+            if _is_closing(row) or row.action in _BARE_ACTIONS:
+                sid = row.security_id
+                closed_qty[sid] = closed_qty.get(sid, Decimal("0")) + abs(row.quantity)
+        for sid, qty in closed_qty.items():
+            if qty > peaks.get(sid, Decimal("0")):
+                over.setdefault(sid, []).append(pk)
+    return over
 
 
 def _is_nontrade_close(row) -> bool:  # noqa: ANN001 -- ActivityRow | TxnRow (duck-typed)
@@ -492,55 +549,83 @@ def _action_delta(row) -> Decimal:  # noqa: ANN001
     return -qty if (row.action or "").strip().lower().startswith("sell") else qty
 
 
-def _net_quantities(rows: list) -> dict[str, Decimal]:
-    """Net signed position per security from a group's member rows, walked in time order:
-    trade-like rows apply their action-signed delta; settlement rows (no action) offset the
-    running net toward zero; cash-only rows are ignored."""
-    ordered = sorted(
+def _group_net_step(current: Decimal, row) -> Decimal | None:  # noqa: ANN001
+    """The group's running net in one security after ``row`` — or None when the row does not
+    move it (cash-only, or a close against a flat group net).
+
+    A CLOSE CLAMPS AT WHAT THE GROUP HOLDS. Settlements always did; trade closes did not, and
+    that asymmetry is a bug with a name: one broker fill routinely closes lots held by SEVERAL
+    groups, but a transaction carries exactly one ``trade_group_id``, so the whole row lands on
+    the first group it offsets. Unclamped, a group that only ever bought 1 and received a
+    "Sell 2" concluded it was SHORT 1 — never fully closed, never stamped with its realized
+    P&L, stuck open forever, while the sibling the other contract came from stayed open too
+    (``individual`` groups 4243/4727: two /ES lots delivered by put-calendar assignments on
+    different days, flattened by one ``Sell 2``; both stuck, ~$9.6k of realized loss invisible
+    to every per-group roll-up). ``_route_cluster``'s own fallback comment already promised
+    this — "attaching there is harmless (nets clamp)" — the walk just never did it.
+
+    So a group's close can drive its net toward zero and stop. The excess belongs to the
+    sibling groups the same fill covered; finding them is ``find_misattributed_open_groups``'s
+    job, because moving it is a ``regroup()`` decision (one row cannot split).
+
+    This is group grain ONLY. Replay's account-level walk deliberately flips through zero —
+    there, a close beyond the current lot IS a real fill whose opening counterpart the walk
+    also saw. A GROUP has no such counterpart: it never opened the side it would flip to.
+    """
+    if getattr(row, "transaction_type", None) == "Money Movement":
+        return None
+    if _is_nontrade_close(row):
+        if current == 0:
+            return None
+        qty = min(abs(row.quantity), abs(current))
+        return current - qty if current > 0 else current + qty
+    if not row.action:
+        return None
+    delta = _action_delta(row)
+    closes = row.action in _CLOSING_ACTIONS or (
+        row.action in _BARE_ACTIONS and current != 0 and current * delta < 0
+    )
+    if not closes:
+        return current + delta
+    if current == 0:
+        return None
+    qty = min(abs(delta), abs(current))
+    return current - qty if current > 0 else current + qty
+
+
+def _ordered_position_rows(rows: list) -> list:
+    return sorted(
         (r for r in rows if r.security_id and r.quantity is not None),
         key=lambda r: (r.executed_at is None, r.executed_at),
     )
+
+
+def _net_quantities(rows: list) -> dict[str, Decimal]:
+    """Net signed position per security from a group's member rows, walked in time order:
+    opening rows apply their action-signed delta; closes and settlements offset the running
+    net toward zero and STOP there (see ``_group_net_step``); cash-only rows are ignored."""
     net: dict[str, Decimal] = {}
-    for r in ordered:
-        if getattr(r, "transaction_type", None) == "Money Movement":
-            continue
-        current = net.get(r.security_id, Decimal("0"))
-        if _is_nontrade_close(r):
-            if current == 0:
-                continue
-            qty = min(abs(r.quantity), abs(current))
-            net[r.security_id] = current - qty if current > 0 else current + qty
-        elif r.action:
-            net[r.security_id] = current + _action_delta(r)
+    for r in _ordered_position_rows(rows):
+        stepped = _group_net_step(net.get(r.security_id, Decimal("0")), r)
+        if stepped is not None:
+            net[r.security_id] = stepped
     return net
 
 
 def _peak_exposures(rows: list) -> dict[str, Decimal]:
     """Peak |running net| per security — the position size the group actually HELD, walked
-    with the same rules as ``_net_quantities``. This is the classification-grade quantity:
-    per-row quantities misread scale-ins (1 + 3 = two legs, not a 4-lot), partial fills
-    (2 filled as 1+1 = a "ratio"), and closes (open + close = a two-leg "spread")."""
-    ordered = sorted(
-        (r for r in rows if r.security_id and r.quantity is not None),
-        key=lambda r: (r.executed_at is None, r.executed_at),
-    )
+    with the same rules as ``_net_quantities`` (one shared step, so the two can never
+    disagree). This is the classification-grade quantity: per-row quantities misread
+    scale-ins (1 + 3 = two legs, not a 4-lot), partial fills (2 filled as 1+1 = a "ratio"),
+    and closes (open + close = a two-leg "spread")."""
     net: dict[str, Decimal] = {}
     peak: dict[str, Decimal] = {}
-    for r in ordered:
-        if getattr(r, "transaction_type", None) == "Money Movement":
+    for r in _ordered_position_rows(rows):
+        stepped = _group_net_step(net.get(r.security_id, Decimal("0")), r)
+        if stepped is None:
             continue
-        current = net.get(r.security_id, Decimal("0"))
-        if _is_nontrade_close(r):
-            if current == 0:
-                continue
-            qty = min(abs(r.quantity), abs(current))
-            new = current - qty if current > 0 else current + qty
-        elif r.action:
-            new = current + _action_delta(r)
-        else:
-            continue
-        net[r.security_id] = new
-        peak[r.security_id] = max(peak.get(r.security_id, Decimal("0")), abs(new))
+        net[r.security_id] = stepped
+        peak[r.security_id] = max(peak.get(r.security_id, Decimal("0")), abs(stepped))
     return peak
 
 
@@ -613,7 +698,7 @@ async def _group_realized(store: "LedgerStore", rows: "list") -> Decimal:
             total += _signed_gross(row)
     for sid, sec_rows in futures_rows.items():
         multiplier = getattr(securities[sid], "multiplier", None) or 1
-        total += price_realized_gross(sec_rows, multiplier)
+        total += price_realized_gross(sec_rows, multiplier, clamp_closes=True)
     return total
 
 
@@ -871,6 +956,35 @@ def _route_cluster(
     by_id: dict[int, list["ActivityRow"]] = {}
     rest: list["ActivityRow"] = []
     remaining = {id(g): _net_quantities(g.rows) for g in open_groups}  # drawn down per assignment
+
+    def _draw_down(sid: str, quantity: Decimal, delta: "Decimal | None") -> "_OpenGroup | None":
+        """Consume ``quantity`` of a closing row against every open group it offsets, in
+        order, and return the FIRST one (the row can only carry one ``trade_group_id``).
+
+        The excess past that first group used to be applied to it in full, driving its net
+        THROUGH zero and leaving it looking short something it never opened. Draw down only
+        what each group holds and carry the remainder to the next — so ``remaining`` tells
+        the truth for later rows in this same cluster, and the groups the row also covered
+        are left with a zero net rather than a stale one.
+
+        Those later groups still get no ROW, so they stay open; that residue is the Class B
+        shape ``find_misattributed_open_groups`` reports for an operator ``regroup()``.
+        """
+        left = abs(quantity)
+        first: _OpenGroup | None = None
+        for g in open_groups:
+            net = remaining[id(g)].get(sid)
+            if not net or (delta is not None and net * delta >= 0):
+                continue
+            take = min(left, abs(net))
+            remaining[id(g)][sid] = net - take if net > 0 else net + take
+            if first is None:
+                first = g
+            left -= take
+            if left <= 0:
+                break
+        return first
+
     for row in cluster:
         group = None
         if row.security_id is not None:
@@ -878,30 +992,14 @@ def _route_cluster(
             if _is_closing(row):
                 # settlements carry no action -> any nonzero net; trade closes must offset
                 delta = _action_delta(row) if row.action else None
-                group = next(
-                    (
-                        g for g in open_groups
-                        if (net := remaining[id(g)].get(sid)) and (delta is None or net * delta < 0)
-                    ),
-                    None,
-                )
-                if group is not None:
-                    net = remaining[id(group)][sid]
-                    qty = min(abs(row.quantity or Decimal("0")), abs(net))
-                    remaining[id(group)][sid] = net - qty if net > 0 else net + qty
-                else:
+                group = _draw_down(sid, row.quantity or Decimal("0"), delta)
+                if group is None:
                     group = next((g for g in open_groups if sid in g.security_ids()), None)
             elif row.action in _BARE_ACTIONS:
                 # a bare futures Buy/Sell closes when an open group holds the OPPOSITE
                 # position in that security (e.g. covering an assignment-delivered short);
                 # same-sign or no holder -> it opens/extends nothing here, falls to rest.
-                delta = _action_delta(row)
-                group = next(
-                    (g for g in open_groups if (net := remaining[id(g)].get(sid)) and net * delta < 0),
-                    None,
-                )
-                if group is not None:
-                    remaining[id(group)][sid] += delta
+                group = _draw_down(sid, row.quantity or Decimal("0"), _action_delta(row))
         if group is None:
             rest.append(row)
             continue
