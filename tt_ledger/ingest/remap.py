@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import replace
+from decimal import Decimal
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from ..enums import Origin, ReviewStatus, TradeGroupEventType, TradeGroupStatus
 from ..rows import ActivityFilter, EventRow, OrderFilter, TradeGroupRow, trade_group_to_row
-from .reconcile import compute_group_fields, reconcile
+from .reconcile import (
+    _close_causes,
+    _fully_closed,
+    _group_realized,
+    _row_fees,
+    compute_group_fields,
+    reconcile,
+)
 
 if TYPE_CHECKING:
     from ..rows import TradeRow
@@ -129,10 +137,54 @@ async def regroup_transactions(
 
 
 async def _recompute_group(store: "LedgerStore", trade_group_id: int, tg: TradeGroupRow) -> TradeGroupRow:
+    """Re-derive a group's financials, classification AND lifecycle from the transactions it
+    holds after a move.
+
+    The lifecycle half was missing: ``compute_group_fields`` derives no ``status`` /
+    ``closed_at`` / ``realized_pnl``, so a regroup that COMPLETED a group left it sitting
+    ``open`` with a stale (or absent) realized P&L — the exact thing an operator regroups to
+    fix. Reconcile's healer would eventually catch it, but only on the next pass over that
+    account, and only for the target; the source group it emptied was never revisited at all.
+
+    Both ends are settled here, with the same rules ``_apply_exit`` / ``heal_fully_closed_groups``
+    use, so one regroup leaves a consistent pair:
+
+    * target fully closed -> status from ``_close_causes``, ``closed_at`` = last activity,
+      GROSS ``realized_pnl`` + complete ``total_fees``. Recomputed whether or not it was
+      ALREADY closed: a move that adds a lot to a closed group changes what that group
+      realized, and keeping the pre-move number is the same stale-value bug one rung up
+      (merging a stranded 7745 delivery into a group that had booked only its 7800 lot must
+      restate −6,175 as the pair's −9,600, not leave the first lot's answer standing).
+    * source left with NO transactions -> ``review_status=ignored`` AND ``realized_pnl``
+      cleared. An empty group is not a trade; left ``open`` it becomes a 0-leg ghost row that
+      every portfolio view has to special-case, and ``ignored`` is already the ledger's word
+      for "not a real trade" and already filtered out of every cockpit surface. Clearing the
+      P&L matters independently of that filter: a group emptied INTO another one keeps a
+      realized figure for rows it no longer holds, so any sum that does not honour
+      ``ignored`` counts the same dollars twice.
+
+    A group that is neither is left as it was — this never REOPENS a closed group, since a
+    move that removes a close is a decision to make explicitly, not a side effect.
+    """
     activity = await store.account_activity(ActivityFilter(account=tg.account))
     cluster = [row for row in activity if row.trade_group_id == trade_group_id]
     fields = await compute_group_fields(store, cluster)
     updated = replace(tg, **fields)
+
+    if not cluster:
+        updated = replace(updated, review_status=ReviewStatus.IGNORED, realized_pnl=None)
+    elif _fully_closed(cluster):
+        causes = _close_causes(cluster)
+        status = causes.pop() if len(causes) == 1 else TradeGroupStatus.MIXED
+        event_ats = [row.executed_at for row in cluster if row.executed_at is not None]
+        updated = replace(
+            updated,
+            status=status.value,
+            closed_at=max(event_ats) if event_ats else None,
+            realized_pnl=await _group_realized(store, cluster),
+            total_fees=sum((_row_fees(row) for row in cluster), Decimal("0")),
+        )
+
     await store.upsert_trade_group(updated)
     return updated
 

@@ -215,7 +215,7 @@ def net_open_quantities(rows: "list[ActivityRow]") -> dict[str, Decimal]:
     return nets
 
 
-def price_realized_gross(rows: "list[ActivityRow]", multiplier: int) -> Decimal:
+def price_realized_gross(rows: "list[ActivityRow]", multiplier: int, *, clamp_closes: bool = False) -> Decimal:
     """Price-based GROSS realized P&L over ONE security's rows, using replay's lot rules.
 
     The same walk ``_replay_security`` does (weighted-average open, partial closes, flips
@@ -230,6 +230,15 @@ def price_realized_gross(rows: "list[ActivityRow]", multiplier: int) -> Decimal:
     are settlement-relative fragments — only price moves recover the trade's economics.
     (Found 2026-08-04: a delivered short /ESM6 6600 covered at 6625 carried a +14,887.50
     member credit — intrinsic vs that day's settle — for a trade that lost $1,250.)
+
+    ``clamp_closes`` is GROUP grain (reconcile's ``_group_realized`` passes it): a close is
+    capped at the lot the group actually holds instead of flipping it through zero. One
+    broker fill routinely closes lots held by several groups but carries one
+    ``trade_group_id``, so the whole row lands on the first — and unclamped, the excess
+    opened a phantom opposite lot at the CLOSING price that the group never traded. It
+    contributed nothing here only because it never closed; the cap makes that a rule rather
+    than an accident. Account grain leaves it False: there a close beyond the current lot is
+    a real fill whose opening counterpart the walk also saw (see ``_effective_delta_price``).
     """
     ordered = sorted(rows, key=lambda r: (r.executed_at or _EPOCH, _closes_last(r)))
     lot = _Lot()
@@ -239,6 +248,9 @@ def price_realized_gross(rows: "list[ActivityRow]", multiplier: int) -> Decimal:
         if row.quantity is None:
             continue
         delta, price = _effective_delta_price(row, lot, had_position=had_position)
+        if clamp_closes and delta != 0 and lot.signed_quantity != 0 and lot.signed_quantity * delta < 0:
+            capped = min(abs(delta), abs(lot.signed_quantity))
+            delta = capped if delta > 0 else -capped
         if delta == 0 or price is None:
             continue
         old_signed = lot.signed_quantity
