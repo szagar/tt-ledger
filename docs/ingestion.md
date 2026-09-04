@@ -152,6 +152,36 @@ calendars meanwhile booked +4,737.50 and +2,162.50 on their option legs alone, s
 account's realized P&L read POSITIVE for a losing trade. Regrouping the stranded delivery onto
 the group holding the close books the pair's −9,600.00 on one group.
 
+### Orphan settlements — a close that arrived after its group was stamped closed
+
+Routing considers only OPEN groups. So a settlement (or any close carrying no submit-time
+intent) for a contract whose group has ALREADY closed cannot see its owner: it falls into
+`rest` and `_create_trade_group` mints a fresh group with `status=open` and an ENTRY event of
+`+quantity`. A pure close becomes a phantom opening that nothing holds.
+
+Neither existing healer can see it, for structural reasons:
+
+- `heal_fully_closed_groups` requires `_fully_closed`, which demands `opened_something` — a
+  membership of only closes never opened anything.
+- `find_misattributed_open_groups` keys on a NON-ZERO group net whose account-wide net is
+  zero; here every close clamps against a flat running net, so the group's net is EMPTY and
+  its guard skips it.
+
+`find_orphan_settlement_groups` reports this shape, naming in `covered_by` the sibling groups
+— **of any status**, since the owner is typically closed, which is the whole reason the row
+missed it — that still hold a non-zero net in one of those securities AND which merging into
+would leave fully closed. As with `find_misattributed_open_groups` that is a statement, not a
+hint, so an automated healer can act on a single unambiguous entry; an empty `covered_by`
+(the position was opened before the ledger's window) is reportable, never guessed.
+
+Worked example (`individual` 5251): a `disc_iron_man_es` /ES iron condor (group 4968) closed
+its call side at 15:30 and its put side at 15:35, at which point the group was stamped
+`closed`. At 15:36 the exit re-fired against the now-flat position and the broker filled it
+as an OPEN — those fills still carried submit-time intent, so they attached to the closed
+group. A 15:40 re-close caught three of the four legs; the long 7695 call was left behind and
+expired at 17:00. That settlement carried no order, found no open group, and minted 5251 —
+which then sat `open` while 4968 kept a `realized_pnl` frozen at its 15:35 value.
+
 ### Edge cases
 
 - Multi-leg strategy spanning several `tt_order_id`s executed together → joined by the grouping window.
