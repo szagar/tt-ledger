@@ -471,6 +471,75 @@ async def find_misattributed_open_groups(store: "LedgerStore", account: str) -> 
     return sorted(found, key=lambda f: f["group_pk"])
 
 
+async def find_orphan_settlement_groups(store: "LedgerStore", account: str) -> list[dict]:
+    """OPEN groups whose ENTIRE membership is unmatched closes — a settlement that missed its group.
+
+    The shape: a ``Receive Deliver`` expiration/assignment (or a bare trade close) arrives for a
+    contract whose group has ALREADY been stamped closed, so ``_route_cluster`` — which only ever
+    considers OPEN groups — cannot see the owner and drops the row into ``rest``, where
+    ``_create_trade_group`` mints a fresh group with ``status=open`` and an ENTRY event of
+    ``+quantity``. A pure close becomes a phantom opening, and nothing holds it.
+
+    It is invisible to both existing healers, which is why it needs its own detector rather than
+    a widened predicate on one of them:
+
+    * ``heal_fully_closed_groups`` requires ``_fully_closed``, which demands ``opened_something`` —
+      a membership of only closes never opened, so it returns False.
+    * ``find_misattributed_open_groups`` keys on a NON-ZERO group net whose account-wide net is
+      zero; here ``_group_net_step`` clamps every close against a flat running net to ``None``, so
+      the group's net is EMPTY and the ``if group_nets`` guard skips it.
+
+    Seen on ``individual`` 5251: a ``/ESU6`` 7695 call re-opened at 15:36 by an exit that fired
+    against an already-flat position, left behind by the 15:40 re-close, and expired at 17:00 —
+    85 minutes after its group (4968) had been stamped closed.
+
+    Returns ``[{"group_pk", "group_id", "securities", "covered_by"}]``, ordered by pk.
+
+    ``covered_by`` names the sibling groups — of ANY status, since the owner is typically closed,
+    which is the whole reason the row missed it — that still hold a non-zero net in one of those
+    securities AND which merging this group into would leave fully closed. As in
+    ``find_misattributed_open_groups`` that is a statement ("merging into this group closes both"),
+    not a hint, so an automated healer can act on a single unambiguous entry. An empty
+    ``covered_by`` means the owner is not in the account's history at all (a settlement for a
+    position opened before the ledger's window) — reportable, not mergeable.
+    """
+    activity = await store.account_activity(ActivityFilter(account=account))
+    rows_by_group: dict[int, list] = {}
+    for row in activity:
+        pk = getattr(row, "trade_group_id", None)
+        if pk is not None:
+            rows_by_group.setdefault(pk, []).append(row)
+
+    found: list[dict] = []
+    for group in await _load_open_groups(store, account):
+        position_rows = _ordered_position_rows(group.rows)
+        if not position_rows or not all(_is_closing(row) for row in position_rows):
+            continue
+        # A group holding a real net is Class B's job, not this one; an all-closes membership
+        # that still nets nonzero cannot happen (closes clamp), but the guard keeps the two
+        # detectors provably disjoint.
+        if _net_quantities(group.rows):
+            continue
+        securities = sorted({row.security_id for row in position_rows})
+        covered_by = sorted(
+            pk
+            for pk, host_rows in rows_by_group.items()
+            if pk != group.pk
+            and any(_net_quantities(host_rows).get(sid, Decimal("0")) != 0 for sid in securities)
+            and _fully_closed(list(host_rows) + list(group.rows))
+        )
+        tg = await store.get_trade_group_by_id(group.pk)
+        found.append(
+            {
+                "group_pk": group.pk,
+                "group_id": tg.group_id if tg is not None else None,
+                "securities": securities,
+                "covered_by": covered_by,
+            }
+        )
+    return sorted(found, key=lambda f: f["group_pk"])
+
+
 def _over_closing_groups(rows_by_group: dict[int, list]) -> dict[str, list[int]]:
     """``{security_id: [group_pk, ...]}`` for groups whose attached closing quantity EXCEEDS
     the position they ever held in that security — the signature of one broker fill closing
@@ -950,7 +1019,8 @@ def _route_cluster(
     (history doesn't reach the entry, or the broker over-closes) falls back to the first group
     whose MEMBERSHIP includes the security — attaching there is harmless (nets clamp) and beats
     orphaning it into a junk rest-group; with no membership match either, it falls into ``rest``
-    like any opener.
+    like any opener — and if that row was a CLOSE, the group minted for it is the orphan-settlement
+    shape ``find_orphan_settlement_groups`` reports (the owner is closed, so it isn't here to match).
     """
     buckets: list[tuple[_OpenGroup, list["ActivityRow"]]] = []
     by_id: dict[int, list["ActivityRow"]] = {}

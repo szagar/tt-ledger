@@ -15,7 +15,12 @@ from .enums import Ingest, Origin, ReviewStatus, TradeGroupEventType
 from .identity import PassthroughResolver
 from .ingest.pull import sync_all
 from .ingest.push import StreamConsumer
-from .ingest.reconcile import find_misattributed_open_groups, reconcile, recompute_futures_group_pnl
+from .ingest.reconcile import (
+    find_misattributed_open_groups,
+    find_orphan_settlement_groups,
+    reconcile,
+    recompute_futures_group_pnl,
+)
 from .ingest.remap import (
     dismiss_trade_group,
     mark_trade_group_unfilled,
@@ -545,6 +550,12 @@ class LedgerClient:
         candidates for an operator ``regroup()`` decision; reconcile cannot repair them.
         Read-only; see ``ingest.reconcile.find_misattributed_open_groups``."""
         return await find_misattributed_open_groups(self._store, account)
+
+    async def orphan_settlement_groups(self, account: str) -> list[dict]:
+        """Open groups whose entire membership is unmatched closes — a settlement that arrived
+        after its group was already closed and minted a phantom open group. Read-only; see
+        ``ingest.reconcile.find_orphan_settlement_groups``."""
+        return await find_orphan_settlement_groups(self._store, account)
 
     # --- remap ---
 
