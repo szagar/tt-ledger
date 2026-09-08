@@ -299,20 +299,24 @@ async def _seed_net_open(store) -> tuple[int, int]:
                       review_status=ReviewStatus.CONFIRMED, status="closed")
     )
 
-    def _txn(tid, group_pk, action, sid, qty, *, at):
+    def _txn(tid, group_pk, action, sid, qty, *, at, ttype="Trade", sub_type=None):
         return TxnRow(tt_transaction_id=tid, tt_order_id=None, account="main",
-                      transaction_type="Trade", action=action, security_id=sid,
+                      transaction_type=ttype, transaction_sub_type=sub_type,
+                      action=action, security_id=sid,
                       quantity=Decimal(qty), trade_group_id=group_pk,
                       executed_at=datetime(2026, 7, 1, at, 30, tzinfo=UTC))
 
     await store.upsert_transactions([
         # Group A: short 6200 opened then bought back (net 0); long 6180 still open;
-        # 6100 opened then cash-SETTLED (settlement action must NOT net it out).
+        # 6100 opened then EXPIRED — the broker's real wire shape for a settlement
+        # (type "Receive Deliver", sub_type "Expiration", action NULL), which removes
+        # the contract and so nets the leg to 0.
         _txn("A-1", pk_a, "Sell to Open", "option:SPXW:2026-07-03:put:6200", "2", at=14),
         _txn("A-2", pk_a, "Buy to Open", "option:SPXW:2026-07-03:put:6180", "2", at=14),
         _txn("A-3", pk_a, "Buy to Close", "option:SPXW:2026-07-03:put:6200", "2", at=15),
         _txn("A-4", pk_a, "Sell to Open", "option:SPXW:2026-07-03:put:6100", "1", at=14),
-        _txn("A-5", pk_a, "Receive Deliver", "option:SPXW:2026-07-03:put:6100", "1", at=16),
+        _txn("A-5", pk_a, None, "option:SPXW:2026-07-03:put:6100", "1", at=16,
+             ttype="Receive Deliver", sub_type="Expiration"),
         # Group B: SAME 6200 strike + 6180, both fully closed → all net 0.
         _txn("B-1", pk_b, "Sell to Open", "option:SPXW:2026-07-03:put:6200", "1", at=14),
         _txn("B-2", pk_b, "Buy to Open", "option:SPXW:2026-07-03:put:6180", "1", at=14),
@@ -330,7 +334,9 @@ async def test_net_open_by_group_scopes_shared_strike_per_group(any_store):
     # The reused 6200 strike nets independently per group — never collapsed.
     assert net[pk_a]["option:SPXW:2026-07-03:put:6200"] == 0
     assert net[pk_a]["option:SPXW:2026-07-03:put:6180"] == 2  # long still open
-    assert net[pk_a]["option:SPXW:2026-07-03:put:6100"] == 1  # settled, NOT netted by the settlement
+    # The expired leg nets to 0: a settlement REMOVES the contract, like any close.
+    # This asserted 1 before 2026-09, and the leg read open forever.
+    assert net[pk_a]["option:SPXW:2026-07-03:put:6100"] == 0
     # Group B is fully closed: every leg nets to 0 (present, so "closed", not "unknown").
     assert net[pk_b] == {
         "option:SPXW:2026-07-03:put:6200": 0,
@@ -526,3 +532,151 @@ async def test_sdk_open_position_shares_drops_fully_closed_legs(client):
     ])
     claims = (await client.open_position_shares())[("main", sid)]
     assert [c.trade_group_id for c in claims] == [pk_b]
+
+
+# --- settlement netting (2026-09) -------------------------------------------------
+#
+# A position leaves the book either by being traded out or by being REMOVED — expired,
+# assigned, exercised. Netting only the first left every settled leg reading open
+# forever, because whether a settlement carries an ``action`` is the broker's choice:
+# TastyTrade sends ``Receive Deliver / Expiration`` both with a ``* to Close`` action
+# and without. These pin the removal set, the once-per-leg rule, and the exclusions.
+
+
+async def _settle_store(store, rows):
+    """One open group holding `rows` — (tid, action, ttype, sub_type, sid, qty)."""
+    await store.upsert_account(
+        AccountRow(nickname="main", account_number="ACCT1", login="user1")
+    )
+    pk = await store.upsert_trade_group(
+        TradeGroupRow(
+            group_id="g-settle",
+            account="main",
+            origin=Origin.ZTS,
+            review_status=ReviewStatus.CONFIRMED,
+            status="open",
+        )
+    )
+    await store.upsert_transactions(
+        [
+            TxnRow(
+                tt_transaction_id=tid,
+                tt_order_id=None,
+                account="main",
+                transaction_type=ttype,
+                transaction_sub_type=sub_type,
+                action=action,
+                security_id=sid,
+                quantity=Decimal(qty),
+                trade_group_id=pk,
+                executed_at=datetime(2026, 7, 1, 14 + i, 30, tzinfo=UTC),
+            )
+            for i, (tid, action, ttype, sub_type, sid, qty) in enumerate(rows)
+        ]
+    )
+    return pk
+
+
+SID = "option:SPXW:2026-07-03:put:6100"
+
+
+async def test_expiration_without_an_action_nets_the_leg_closed(any_store):
+    """The core regression: action is NULL on the settlement, and the leg must still close."""
+    pk = await _settle_store(
+        any_store,
+        [
+            ("t1", "Sell to Open", "Trade", None, SID, "1"),
+            ("t2", None, "Receive Deliver", "Expiration", SID, "1"),
+        ],
+    )
+    assert (await any_store.net_open_by_group([pk]))[pk][SID] == 0
+
+
+async def test_expiration_carrying_an_action_is_not_double_counted(any_store):
+    """TT populates ``action`` on ~40% of expirations. Those already net via the action;
+    counting the sub-type too would drive the leg to -1, which callers read as an
+    over-closed anomaly and refuse to act on."""
+    pk = await _settle_store(
+        any_store,
+        [
+            ("t1", "Sell to Open", "Trade", None, SID, "1"),
+            ("t2", "Buy to Close", "Receive Deliver", "Expiration", SID, "1"),
+        ],
+    )
+    assert (await any_store.net_open_by_group([pk]))[pk][SID] == 0
+
+
+async def test_assignment_and_its_cash_settlement_count_as_one_event(any_store):
+    """A cash-settled assignment arrives as TWO rows for one leg — the physical removal
+    and the cash side. Summing both would net -1."""
+    pk = await _settle_store(
+        any_store,
+        [
+            ("t1", "Sell to Open", "Trade", None, SID, "1"),
+            ("t2", None, "Receive Deliver", "Assignment", SID, "1"),
+            ("t3", None, "Receive Deliver", "Cash Settled Assignment", SID, "1"),
+        ],
+    )
+    assert (await any_store.net_open_by_group([pk]))[pk][SID] == 0
+
+
+async def test_cash_settlement_alone_still_closes_the_leg(any_store):
+    """A cash-settled index option can send only the cash half — observed on the live
+    book (trade group 4424), so the cash sub-types cannot simply be excluded."""
+    pk = await _settle_store(
+        any_store,
+        [
+            ("t1", "Buy to Open", "Trade", None, SID, "1"),
+            ("t2", None, "Receive Deliver", "Cash Settled Exercise", SID, "1"),
+        ],
+    )
+    assert (await any_store.net_open_by_group([pk]))[pk][SID] == 0
+
+
+async def test_partial_close_then_expiry_of_the_remainder(any_store):
+    """2 opened, 1 traded out, the remaining 1 expires → flat."""
+    pk = await _settle_store(
+        any_store,
+        [
+            ("t1", "Sell to Open", "Trade", None, SID, "2"),
+            ("t2", "Buy to Close", "Trade", None, SID, "1"),
+            ("t3", None, "Receive Deliver", "Expiration", SID, "1"),
+        ],
+    )
+    assert (await any_store.net_open_by_group([pk]))[pk][SID] == 0
+
+
+async def test_corporate_actions_that_reshape_do_not_close_the_leg(any_store):
+    """A split or symbol change alters a position; it does not remove it. These must
+    keep contributing 0 or a live holding would be pruned out from under its bot."""
+    pk = await _settle_store(
+        any_store,
+        [
+            ("t1", "Buy to Open", "Trade", None, SID, "1"),
+            ("t2", None, "Receive Deliver", "Forward Split", SID, "1"),
+            ("t3", None, "Receive Deliver", "Symbol Change", SID, "1"),
+            ("t4", None, "Money Movement", "Dividend", SID, "1"),
+        ],
+    )
+    assert (await any_store.net_open_by_group([pk]))[pk][SID] == 1
+
+
+async def test_open_group_legs_agrees_with_net_open_by_group_on_settlements(any_store):
+    """The anti-drift property. Both read the same book through different code paths
+    (``fold_open_group_legs`` vs the store aggregate); a settled leg that is flat in one
+    and open in the other is how the shared close service comes to offer a close on a
+    contract that no longer exists."""
+    pk = await _settle_store(
+        any_store,
+        [
+            ("t1", "Sell to Open", "Trade", None, SID, "1"),
+            ("t2", None, "Receive Deliver", "Assignment", SID, "1"),
+            ("t3", None, "Receive Deliver", "Cash Settled Assignment", SID, "1"),
+        ],
+    )
+    by_group = (await any_store.net_open_by_group([pk]))[pk][SID]
+    legs = {
+        leg.security_id: leg.net_open for leg in await any_store.open_group_legs("main")
+    }
+    assert by_group == 0
+    assert legs[SID] == by_group

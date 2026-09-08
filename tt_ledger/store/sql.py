@@ -16,7 +16,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import String, bindparam, case, cast, func, select, text, update
+from sqlalchemy import String, and_, bindparam, case, cast, func, not_, or_, select, text, update
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -44,6 +44,7 @@ from ..rows import (
     TransactionQuery,
     TxnRow,
     fold_open_group_legs as _fold_open_group_legs,
+    POSITION_REMOVING_SUB_TYPES,
 )
 from ..schema import metadata, models
 from ..schema.namespace import pg_schema, translate_map_for
@@ -834,6 +835,7 @@ class SqlLedgerStore:
                 txns.c.security_id,
                 txns.c.trade_group_id,
                 txns.c.action,
+                txns.c.transaction_sub_type,
                 txns.c.quantity,
                 txns.c.price,
             )
@@ -845,7 +847,15 @@ class SqlLedgerStore:
         async with self._sessionmaker() as session:
             rows = (await session.execute(stmt)).all()
         return _fold_open_group_legs(
-            (r.account, r.security_id, r.trade_group_id, r.action, r.quantity, r.price)
+            (
+                r.account,
+                r.security_id,
+                r.trade_group_id,
+                r.action,
+                r.transaction_sub_type,
+                r.quantity,
+                r.price,
+            )
             for r in rows
         )
 
@@ -853,21 +863,55 @@ class SqlLedgerStore:
         if not trade_group_ids:
             return {}
         txns = models.Transaction.__table__
-        # Net open = Σ(opening qty) − Σ(closing qty) per (group, security_id). Only
-        # trade actions move the count; settlements / corporate actions (NULL or
-        # other actions) contribute 0, so a cash-settled leg's opening rows keep
-        # the security present at a positive net (the caller's positions-gone path
-        # confirms such a leg closed). Grouped in the DB over the indexed
-        # trade_group_id FK — one round-trip regardless of how many groups.
-        net = func.sum(
+        # Net open = Σ(opening qty) − Σ(closing qty) − the leg's settlement removal,
+        # per (group, security_id). A position leaves the book either by being traded
+        # out (``* to Close``) or by being REMOVED — expired, assigned, exercised —
+        # and only the first carries a reliable ``action``: the broker populates one
+        # on some settlement rows and not others, so netting on ``action`` alone left
+        # every unactioned settled leg reading open forever.
+        #
+        # The removal is MAX, not SUM: the physical (``Assignment``) and cash
+        # (``Cash Settled Assignment``) rows describe ONE event on one leg, and adding
+        # both drives the net negative, which callers treat as an over-closed anomaly
+        # and refuse to act on. Either row alone is also valid — a cash-settled index
+        # option can send only the cash half.
+        #
+        # ``coalesce`` is load-bearing: ``action`` is NULL (not "") on exactly the rows
+        # this clause must match, and a bare ``NOT (action LIKE ...)`` is NULL there,
+        # which silently drops them. Grouped in the DB over the indexed trade_group_id
+        # FK — one round-trip regardless of how many groups.
+        act = func.coalesce(txns.c.action, "")
+        action_nets = or_(act.like("%to Open"), act.like("%to Close"))
+        traded = func.sum(
             case(
-                (txns.c.action.like("%to Open"), txns.c.quantity),
-                (txns.c.action.like("%to Close"), -txns.c.quantity),
+                (act.like("%to Open"), txns.c.quantity),
+                (act.like("%to Close"), -txns.c.quantity),
                 else_=0,
             )
-        ).label("net_open")
+        )
+        removal = func.max(
+            case(
+                (
+                    and_(
+                        txns.c.transaction_sub_type.in_(POSITION_REMOVING_SUB_TYPES),
+                        not_(action_nets),
+                    ),
+                    txns.c.quantity,
+                ),
+                else_=0,
+            )
+        )
+        # Selected as two columns and subtracted in PYTHON, not combined in SQL.
+        # ``quantity`` is a ``Money`` — a native NUMERIC on Postgres but a SCALED
+        # INTEGER (micro-units) on SQLite — and an arithmetic expression over two
+        # such aggregates loses the type's result processor, so the difference comes
+        # back 10^6 times too large on SQLite while looking right on Postgres. Each
+        # aggregate decodes correctly on its own. Same reasoning, and the same remedy,
+        # as the Python fold in ``open_group_legs`` above.
+        traded = traded.label("traded")
+        removal = removal.label("removal")
         stmt = (
-            select(txns.c.trade_group_id, txns.c.security_id, net)
+            select(txns.c.trade_group_id, txns.c.security_id, traded, removal)
             .where(
                 txns.c.trade_group_id.in_(trade_group_ids),
                 txns.c.security_id.isnot(None),
@@ -878,7 +922,8 @@ class SqlLedgerStore:
             rows = (await session.execute(stmt)).all()
         result: dict[int, dict[str, int]] = {}
         for r in rows:
-            result.setdefault(r.trade_group_id, {})[r.security_id] = int(r.net_open or 0)
+            net_open = int(r.traded or 0) - int(r.removal or 0)
+            result.setdefault(r.trade_group_id, {})[r.security_id] = net_open
         return result
 
     async def account_activity(self, f: ActivityFilter) -> list[ActivityRow]:

@@ -13,6 +13,63 @@ from decimal import Decimal
 
 from .enums import Ingest, Origin, ReviewStatus
 
+# --- position-removing settlement events -------------------------------------------
+#
+# A position can leave the book two ways: it is TRADED out (``* to Close``), or the
+# contract is REMOVED by settlement — it expires, is assigned, or is exercised. Netting
+# only the first is why an expired leg used to read as still open forever.
+#
+# The trap this constant exists to close: whether a settlement carries an ``action`` is
+# the BROKER's choice, not a property of the event. TastyTrade sends ``Receive Deliver /
+# Expiration`` both with an action (``Buy to Close`` / ``Sell to Close``) and without —
+# 241 of 619 such rows carry one on the live book, going back to 2023. Keying the netting
+# on ``action`` therefore closed 42% of expirations and left the other 58% open, which is
+# not a policy, it is a field-selection bug.
+#
+# ``Cash Settled Assignment`` / ``Cash Settled Exercise`` are the CASH half of the same
+# event and routinely arrive alongside the physical ``Assignment`` / ``Exercise`` row for
+# one leg — but not always (a cash-settled index option can send the cash row alone). So
+# they belong in this set, and the removal must be counted ONCE PER LEG (see
+# ``removal_quantity``), never summed: summing the pair drives the leg to a negative net,
+# which callers read as an over-closed anomaly and refuse to act on.
+#
+# Deliberately EXCLUDED — these change a position without removing it: ``Symbol Change``,
+# ``Stock Split``, ``Reverse Split``, ``Merger``, ``Special Dividend``, and any
+# ``Receive Deliver`` row whose sub-type is itself a trade verb (``Buy to Open`` etc.,
+# which the action already nets).
+POSITION_REMOVING_SUB_TYPES: frozenset[str] = frozenset(
+    {
+        "Expiration",
+        "Assignment",
+        "Exercise",
+        "Cash Settled Assignment",
+        "Cash Settled Exercise",
+    }
+)
+
+
+def action_nets_as_trade(action: str | None) -> bool:
+    """True when ``action`` alone already moves the open count (``* to Open``/``* to Close``).
+
+    ``action`` is NULL (not ``""``) on every settlement row the broker sends without one,
+    so every caller must normalise before comparing — a bare ``NOT (action LIKE ...)``
+    predicate evaluates to NULL in SQL and silently drops the very rows it should match.
+    """
+    verb = (action or "").strip()
+    return verb.endswith("to Open") or verb.endswith("to Close")
+
+
+def is_position_removal(action: str | None, transaction_sub_type: str | None) -> bool:
+    """True when this row removes the leg from the book and no ``action`` accounted for it.
+
+    Rows whose ``action`` already nets are excluded so a settlement that carries one is
+    counted once, not twice.
+    """
+    if action_nets_as_trade(action):
+        return False
+    return (transaction_sub_type or "").strip() in POSITION_REMOVING_SUB_TYPES
+
+
 # --- write shapes -----------------------------------------------------------------
 
 
@@ -204,12 +261,16 @@ class OpenGroupLegRow:
 
 
 def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
-    """``(account, security_id, trade_group_id, action, quantity, price)`` tuples →
-    one ``OpenGroupLegRow`` per (account, security, group).
+    """``(account, security_id, trade_group_id, action, transaction_sub_type, quantity,
+    price)`` tuples → one ``OpenGroupLegRow`` per (account, security, group).
 
     The single netting/VWAP implementation both stores share, so the SQL and in-memory
-    backends cannot drift. ``net_open`` counts only ``* to Open`` / ``* to Close``
-    (settlements and corporate actions contribute 0, matching ``net_open_by_group``);
+    backends cannot drift. ``net_open`` is Σ(opening qty) − Σ(closing qty) − the leg's
+    settlement removal, where a removal is any ``POSITION_REMOVING_SUB_TYPES`` row whose
+    ``action`` did not already net it (see ``is_position_removal``). The removal is taken
+    ONCE PER LEG via ``max``, not summed: the physical + cash-settled pair describes one
+    event, and adding both would drive the leg negative.
+
     ``average_open_price`` is the quantity-weighted mean of the OPENING fills only, so
     scaling out of a leg never moves its entry basis.
 
@@ -219,16 +280,16 @@ def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
     because that magnitude is the load-bearing "how much is still open" number for close
     clamping, and closes (``Buy to Close`` of a short, ``Sell to Close`` of a long) reduce
     it regardless of which way the leg is held."""
-    # [net, opening qty, Σ price×qty, signed opening qty]
+    # [traded net, opening qty, Σ price×qty, signed opening qty, settlement removal]
     acc: dict[tuple[str, str, int], list[Decimal]] = {}
-    for account, security_id, trade_group_id, action, quantity, price in records:
+    for account, security_id, trade_group_id, action, sub_type, quantity, price in records:
         if security_id is None or trade_group_id is None:
             continue
         verb = (action or "").strip()
         qty = Decimal(str(quantity or 0))
         slot = acc.setdefault(
             (account, security_id, trade_group_id),
-            [Decimal(0), Decimal(0), Decimal(0), Decimal(0)],
+            [Decimal(0), Decimal(0), Decimal(0), Decimal(0), Decimal(0)],
         )
         if verb.endswith("to Open"):
             slot[0] += qty
@@ -238,12 +299,15 @@ def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
                 slot[2] += Decimal(str(price)) * qty
         elif verb.endswith("to Close"):
             slot[0] -= qty
+        elif is_position_removal(action, sub_type):
+            # max, not +=: the physical and cash-settled rows are one event.
+            slot[4] = max(slot[4], qty)
     return [
         OpenGroupLegRow(
             account=account,
             security_id=security_id,
             trade_group_id=trade_group_id,
-            net_open=int(net),
+            net_open=int(net - removal),
             average_open_price=(notional / open_qty) if open_qty else None,
             direction="Short" if signed_open < 0 else "Long",
         )
@@ -252,6 +316,7 @@ def fold_open_group_legs(records) -> "list[OpenGroupLegRow]":
             open_qty,
             notional,
             signed_open,
+            removal,
         ) in acc.items()
     ]
 

@@ -38,6 +38,7 @@ from ..rows import (
     TransactionQuery,
     TxnRow,
     fold_open_group_legs,
+    is_position_removal,
 )
 
 T = TypeVar("T")
@@ -339,7 +340,15 @@ class InMemoryStore:
             row_id for row_id, tg in self._trade_groups.all() if (tg.status or "") == "open"
         }
         return fold_open_group_legs(
-            (txn.account, txn.security_id, txn.trade_group_id, txn.action, txn.quantity, txn.price)
+            (
+                txn.account,
+                txn.security_id,
+                txn.trade_group_id,
+                txn.action,
+                txn.transaction_sub_type,
+                txn.quantity,
+                txn.price,
+            )
             for _, txn in self._transactions.all()
             if txn.trade_group_id in open_ids
             and (account is None or txn.account == account)
@@ -347,20 +356,31 @@ class InMemoryStore:
 
     async def net_open_by_group(self, trade_group_ids: list[int]) -> dict[int, dict[str, int]]:
         wanted = set(trade_group_ids)
-        result: dict[int, dict[str, int]] = {}
+        traded: dict[int, dict[str, int]] = {}
+        # Settlement removals are collected separately and applied once per leg —
+        # the physical + cash-settled rows are one event, so summing them would
+        # drive the leg negative (callers read that as an over-closed anomaly).
+        removed: dict[int, dict[str, int]] = {}
         for _, txn in self._transactions.all():
             if txn.trade_group_id not in wanted or txn.security_id is None:
                 continue
             action = (txn.action or "").strip()
+            qty = int(txn.quantity or 0)
             if action.endswith("to Open"):
-                delta = int(txn.quantity or 0)
+                delta = qty
             elif action.endswith("to Close"):
-                delta = -int(txn.quantity or 0)
+                delta = -qty
             else:
                 delta = 0
-            group = result.setdefault(txn.trade_group_id, {})
+                if is_position_removal(txn.action, txn.transaction_sub_type):
+                    group_rm = removed.setdefault(txn.trade_group_id, {})
+                    group_rm[txn.security_id] = max(group_rm.get(txn.security_id, 0), qty)
+            group = traded.setdefault(txn.trade_group_id, {})
             group[txn.security_id] = group.get(txn.security_id, 0) + delta
-        return result
+        for tg_id, legs in traded.items():
+            for security_id in legs:
+                legs[security_id] -= removed.get(tg_id, {}).get(security_id, 0)
+        return traded
 
     async def query_orders(self, f: OrderFilter) -> list[OrderRow]:
         return [row for _, row in await self.query_orders_with_ids(f)]

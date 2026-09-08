@@ -463,11 +463,17 @@ class LedgerClient:
         net here is ``> 0``. Because it is scoped to the group's own transactions,
         strikes shared across sibling groups never collapse (the account-wide
         position view can't distinguish them). Batched — the whole set is one
-        indexed ``GROUP BY`` round-trip, not one query per group. Settlements /
-        corporate actions don't net (only ``* to Open`` / ``* to Close`` do), so a
-        cash-settled leg stays present at its opening quantity; confirm those closed
-        via positions-gone, not this net. Groups with no transactions are absent
-        from the result (``.get(pk)`` is ``None``)."""
+        indexed ``GROUP BY`` round-trip, not one query per group.
+
+        Settlement events that REMOVE the contract — expiration, assignment, exercise,
+        and their cash-settled forms (``rows.POSITION_REMOVING_SUB_TYPES``) — net as
+        closes, counted once per leg. They must, because whether such a row carries an
+        ``action`` is the broker's choice: TastyTrade sends ``Expiration`` both with a
+        ``* to Close`` action and without, so keying on ``action`` alone netted some
+        expirations and not others and left settled legs reading open indefinitely.
+        Corporate actions that only RESHAPE a position (splits, symbol changes, special
+        dividends) still contribute 0. Groups with no transactions are absent from the
+        result (``.get(pk)`` is ``None``)."""
         return await self._store.net_open_by_group(trade_group_ids)
 
     async def position(self, account: str, security_id: str) -> "PositionRow | None":
