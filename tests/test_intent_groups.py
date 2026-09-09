@@ -305,3 +305,92 @@ async def test_import_transactions_settles_a_paper_expiration(client, store, acc
     assert len(trades) == 1
     assert trades[0].status == TradeGroupStatus.EXPIRED.value
     assert trades[0].realized_pnl == Decimal("250")
+
+
+async def test_concurrent_reconcile_passes_do_not_double_the_intent_header(
+    client, store, accounts
+):
+    """Two overlapping reconcile passes must not double an intent group's header.
+
+    ``reconcile`` is ACCOUNT-scoped, and every paper fill triggers one, so two entry
+    orders filling in the same instant on the same account run two passes concurrently.
+    Pass B can read ``account_activity`` while a row is still unattached, then load
+    ``_OpenGroup.rows`` after pass A commits the attach — so the row arrives in
+    ``group.rows`` twice and ``_refresh_group_financials`` recomputes the header off a
+    doubled list. That is exactly 2x, which is how nine szagar_paper groups came to
+    claim double their own fills (e.g. #8496 at $4,260 against $2,130 of transactions).
+
+    Reproduced deterministically here by handing ``_apply_intent_rows`` the state the
+    race produces: a group whose rows already contain the cluster being applied.
+    """
+    from tt_ledger.ingest.reconcile import _apply_intent_rows, _load_open_groups
+    from tt_ledger.rows import ActivityFilter
+
+    trade = await client.open_trade_group(
+        "main", strategy_type="single", underlying="SPY", bot="bot-1", signal="sig-1",
+    )
+    await client.record_order(
+        OrderInput(account="main", tt_order_id="O-1", underlying="SPY", trade_group=trade.group_id)
+    )
+    broker = MockTastyTradeClient()
+    _fill(broker, order_id="O-1", action="Sell to Open", net_value="250", executed_at=T0)
+    await _sync(store, accounts, broker)
+
+    # Pass A: the normal path — attaches the fill and refreshes the header.
+    await reconcile(store, "main")
+    trades = await store.unified_trades(TradeFilter(account="main"))
+    assert trades[0].total_premium == Decimal("250")
+
+    # Pass B (the racer): it read activity before pass A attached the row, but loads
+    # open groups after — so `rows` already holds what the cluster is about to re-add.
+    stale_cluster = [
+        a for a in await store.account_activity(ActivityFilter(account="main"))
+        if a.order_id is not None
+    ]
+    assert stale_cluster, "the fill should be visible as activity"
+    open_groups = await _load_open_groups(store, "main")
+    await _apply_intent_rows(store, open_groups, stale_cluster, dry_run=False)
+
+    trades = await store.unified_trades(TradeFilter(account="main"))
+    assert len(trades) == 1
+    refreshed = trades[0]
+    assert refreshed.total_premium == Decimal("250")  # not 500
+    assert refreshed.quantity == Decimal("1")  # not 2
+    assert refreshed.leg_count == 1
+
+
+async def test_reapplying_an_exit_row_does_not_double_the_close(client, store, accounts):
+    """The same dedupe must hold on the closing side: ``_apply_exit`` also does a bare
+    ``group.rows.extend(rows)``, so a re-applied closing row would append a duplicate and
+    emit a second exit event with doubled quantity/premium change."""
+    from tt_ledger.ingest.reconcile import _OpenGroup, _apply_exit
+
+    trade = await client.open_trade_group("main", strategy_type="single", underlying="SPY")
+    await client.record_order(
+        OrderInput(account="main", tt_order_id="O-1", trade_group=trade.group_id)
+    )
+    await client.record_order(
+        OrderInput(account="main", tt_order_id="O-2", trade_group=trade.group_id)
+    )
+    broker = MockTastyTradeClient()
+    _fill(broker, order_id="O-1", action="Sell to Open", net_value="250", executed_at=T0)
+    _fill(broker, order_id="O-2", action="Buy to Close", net_value="-100",
+          executed_at=T0 + timedelta(hours=3))
+    await _sync(store, accounts, broker)
+
+    await reconcile(store, "main")
+
+    pk = await store.get_trade_group_id(trade.group_id)
+    rows = list(await store.get_group_transactions(pk))
+    closing = [r for r in rows if (r.action or "").endswith("to Close")]
+    assert closing, "the exit fill should be attached"
+
+    # The racer re-applies a closing row the group already holds.
+    await _apply_exit(store, _OpenGroup(pk=pk, rows=rows), closing, rolled_to_pk=None)
+
+    trades = await store.unified_trades(TradeFilter(account="main"))
+    assert len(trades) == 1
+    assert trades[0].realized_pnl == Decimal("150")
+
+    events = [ev.event_type for _, ev in store._events.all() if ev.trade_group_id == pk]
+    assert events == [TradeGroupEventType.ENTRY.value, TradeGroupEventType.FULL_EXIT.value]
