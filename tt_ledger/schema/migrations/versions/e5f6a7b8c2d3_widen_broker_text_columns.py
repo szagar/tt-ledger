@@ -45,8 +45,20 @@ _COLUMNS: tuple[tuple[str, str, int], ...] = (
     ("securities", "streamer_symbol", 50),
 )
 
+# SQLite has no ``ALTER COLUMN ... TYPE`` (the statement is a syntax error there), and it
+# would not need one: VARCHAR(n) carries TEXT affinity and SQLite never enforces the
+# length, so the truncation this migration exists to prevent cannot happen on that
+# dialect. Widening is therefore a genuine no-op on SQLite, not a skipped step — the
+# cross-dialect END STATE is identical. Guarding here keeps the chain runnable on both
+# backends (the dual-dialect guarantee CI asserts) without a table-rebuild batch
+# migration that would drop and recreate this column's indexes.
+def _needs_widening() -> bool:
+    return op.get_bind().dialect.name != "sqlite"
+
 
 def upgrade() -> None:
+    if not _needs_widening():
+        return
     for table, column, length in _COLUMNS:
         op.alter_column(
             table, column,
@@ -58,6 +70,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # varchar -> text is lossless; going back can truncate, so cast explicitly.
+    if not _needs_widening():
+        return
     for table, column, length in _COLUMNS:
         op.alter_column(
             table, column,

@@ -17,6 +17,7 @@ from tt_ledger.rows import (
     FillRow,
     LegRow,
     OrderRow,
+    SecurityRow,
     TradeGroupRow,
     TransactionQuery,
     TxnRow,
@@ -28,10 +29,43 @@ from tt_ledger.store.sql import SqlLedgerStore
 T0 = datetime(2026, 7, 1, 14, 30, tzinfo=UTC)
 
 
+
+# Every security_id this module references. `transactions`, `order_legs`, `positions` and
+# `closed_positions` all carry a FOREIGN KEY to `securities.security_id`, so Postgres
+# rejects a row naming a security it has never seen. SQLite does not enforce foreign keys
+# unless `PRAGMA foreign_keys` is ON, so these writes silently succeeded there and failed
+# only against Postgres — precisely the backend divergence the `any_store`
+# parametrization exists to catch. Seed the referenced rows (what the ingest path does
+# before it writes a transaction) rather than weaken the schema.
+_SECURITIES: tuple[SecurityRow, ...] = (
+    SecurityRow(security_id="equity:AAPL", product_type="S", underlying="AAPL"),
+    SecurityRow(security_id="equity:TSLA", product_type="S", underlying="TSLA"),
+    SecurityRow(security_id="option:SPXW:2026-07-03:put:6100", product_type="OS",
+                underlying="SPX", expiry=date(2026, 7, 3), strike=Decimal("6100"),
+                option_type="P"),
+    SecurityRow(security_id="option:SPXW:2026-07-03:put:6180", product_type="OS",
+                underlying="SPX", expiry=date(2026, 7, 3), strike=Decimal("6180"),
+                option_type="P"),
+    SecurityRow(security_id="option:SPXW:2026-07-03:put:6200", product_type="OS",
+                underlying="SPX", expiry=date(2026, 7, 3), strike=Decimal("6200"),
+                option_type="P"),
+    SecurityRow(security_id="future_option:ES:Z6:2026-09-30:call:7925", product_type="OF",
+                underlying="/ESZ6", expiry=date(2026, 9, 30), strike=Decimal("7925"),
+                option_type="C"),
+)
+
+
+async def _seed_securities(store) -> None:
+    for row in _SECURITIES:
+        await store.upsert_security(row)
+
+
 @pytest.fixture(params=["sql", "memory"])
 async def any_store(request, store_url):
     if request.param == "memory":
-        yield InMemoryStore()
+        store = InMemoryStore()
+        await _seed_securities(store)
+        yield store
         return
     from tt_ledger.schema import metadata
 
@@ -39,6 +73,7 @@ async def any_store(request, store_url):
     async with s._engine.begin() as conn:
         await conn.run_sync(metadata.drop_all)
     await s.create_all()
+    await _seed_securities(s)
     yield s
     await s.dispose()
 
@@ -363,9 +398,11 @@ async def test_sdk_net_open_by_group(client):
 
 
 @pytest.fixture
-def client() -> LedgerClient:
+async def client() -> LedgerClient:
+    store = InMemoryStore()
+    await _seed_securities(store)
     return LedgerClient(
-        InMemoryStore(), accounts=AccountMapper({"main": "ACCT1", "other": "ACCT2"}),
+        store, accounts=AccountMapper({"main": "ACCT1", "other": "ACCT2"}),
         resolver=PassthroughResolver(),
     )
 
@@ -462,6 +499,11 @@ async def test_opposite_direction_claims_net_like_the_broker(any_store):
     Both magnitudes read 1, so Σ``net_open`` is 2 while the broker's book is flat.
     Only the signed form reconciles, which is what lets a consumer split the pooled
     row instead of refusing and showing the account's net as one group's leg."""
+    # trade_groups.account is a FOREIGN KEY to accounts.nickname — every other seeding
+    # helper here opens with this, and Postgres refuses the group without it.
+    await any_store.upsert_account(
+        AccountRow(nickname="main", account_number="ACCT1", login="user1")
+    )
     pk_short = await any_store.upsert_trade_group(
         TradeGroupRow(group_id="d-short", account="main", origin=Origin.ZTS,
                       review_status=ReviewStatus.CONFIRMED, status="open")

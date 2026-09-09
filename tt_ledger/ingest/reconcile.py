@@ -908,6 +908,25 @@ class _OpenGroup:
     def security_ids(self) -> set[str]:
         return {r.security_id for r in self.rows if r.security_id}
 
+    def extend_unique(self, rows: "list") -> None:
+        """Add ``rows`` as members, skipping any transaction already held.
+
+        ``rows`` is loaded from the store's CURRENT membership, so a row can arrive
+        here twice whenever two reconcile passes overlap: reconcile is account-scoped
+        and every fill triggers one, so two orders filling in the same instant race.
+        Pass B can read ``account_activity`` while a row is still unattached and then
+        load its ``rows`` after pass A commits the attach — the row is then both
+        already-a-member and in the incoming cluster. Counting it twice doubles
+        whatever is recomputed from ``rows`` (the group header via
+        ``_refresh_group_financials``, realized P&L and exit events via
+        ``_apply_exit``), which is how 256 paper groups came to claim exactly double
+        their own fills before this guard existed (2026-07-24 .. 2026-09-08, the
+        co-located same-minute MEIC arms worst hit). Membership is a set keyed by
+        transaction id; adding a member twice must be a no-op.
+        """
+        known = {r.tt_transaction_id for r in self.rows}
+        self.rows.extend(r for r in rows if r.tt_transaction_id not in known)
+
 
 @dataclass
 class _CreatedGroup:
@@ -961,7 +980,7 @@ async def _apply_intent_rows(
         closing = [r for r in rows if _is_closing(r)]
         if opening:
             await store.attach_transactions_to_trade_group([r.tt_transaction_id for r in opening], group.pk)
-            group.rows.extend(opening)
+            group.extend_unique(opening)
             await _refresh_group_financials(store, group)
         if closing:
             applied = await _apply_exit(store, group, closing, rolled_to_pk=None)
@@ -1178,7 +1197,21 @@ async def _apply_exit(
     assignment/exercise event to the group holding the position it delivered (the option's
     underlying future/shares) -- the same continuation edge rolls use."""
     await store.attach_transactions_to_trade_group([r.tt_transaction_id for r in rows], group.pk)
-    group.rows.extend(rows)
+    # Rows this group already holds are NOT re-applied: two overlapping reconcile passes
+    # can both route the same closing row (see _OpenGroup.extend_unique), and applying it
+    # twice would emit a second exit event and double the realized P&L (a 250/-100 close
+    # settling at 50 instead of 150). Nothing new left => the exit already landed; report
+    # the current state without rewriting it (re-deriving closed_at from an empty row set
+    # would blank the real one).
+    already_member = {r.tt_transaction_id for r in group.rows}
+    rows = [r for r in rows if r.tt_transaction_id not in already_member]
+    if not rows:
+        tg = await store.get_trade_group_by_id(group.pk)
+        return _AppliedExit(
+            group=group, rows=[], fully_closed=_fully_closed(group.rows),
+            rolled=False, closed_at=tg.closed_at if tg is not None else None,
+        )
+    group.extend_unique(rows)
 
     fully_closed = _fully_closed(group.rows)
     event_ats = [r.executed_at for r in rows if r.executed_at is not None]
