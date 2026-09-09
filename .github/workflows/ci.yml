@@ -42,13 +42,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package (dev + postgres + securities + tastytrade + api + cli extras)
+      - name: Install package (dev + every extra the test suite imports)
         # [securities] pulls security-universe from GitHub (not yet on PyPI). No --system: setup-uv
         # already provisions and activates a venv (VIRTUAL_ENV), and --system fights that under
-        # PEP 668 ("externally managed environment"). tastytrade/api/cli are required too -- their
-        # optional deps (websockets/fastapi/typer/rich) are imported at module load by
-        # test_ingest_tastytrade_stream.py / test_api.py / test_cli.py.
-        run: uv pip install -e ".[dev,postgres,securities,tastytrade,api,cli]"
+        # PEP 668 ("externally managed environment"). tastytrade/api/cli/redis are required too --
+        # their optional deps (websockets/fastapi/typer/rich/redis) are imported at module load by
+        # test_ingest_tastytrade_stream.py / test_api.py / test_cli.py /
+        # test_ingest_redis_stream_source.py. Every extra the suite imports must be listed here or
+        # those tests fail with ModuleNotFoundError and the whole job goes red.
+        run: uv pip install -e ".[dev,postgres,securities,tastytrade,api,cli,redis]"
 
       - name: Unit + smoke tests (SQLite and Postgres)
         env:

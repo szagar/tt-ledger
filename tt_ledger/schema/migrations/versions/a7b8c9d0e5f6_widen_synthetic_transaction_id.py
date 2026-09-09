@@ -39,8 +39,20 @@ down_revision: str | None = 'f6a7b8c9d4e5'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+# SQLite has no ``ALTER COLUMN ... TYPE`` (the statement is a syntax error there), and it
+# would not need one: VARCHAR(n) carries TEXT affinity and SQLite never enforces the
+# length, so the truncation this migration exists to prevent cannot happen on that
+# dialect. Widening is therefore a genuine no-op on SQLite, not a skipped step — the
+# cross-dialect END STATE is identical. Guarding here keeps the chain runnable on both
+# backends (the dual-dialect guarantee CI asserts) without a table-rebuild batch
+# migration that would drop and recreate this column's indexes.
+def _needs_widening() -> bool:
+    return op.get_bind().dialect.name != "sqlite"
+
 
 def upgrade() -> None:
+    if not _needs_widening():
+        return
     op.alter_column(
         "transactions",
         "tt_transaction_id",
@@ -53,6 +65,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     # Lossy in principle (scoped settlement ids exceed 64); truncate explicitly
     # rather than let the server refuse the whole ALTER.
+    if not _needs_widening():
+        return
     op.alter_column(
         "transactions",
         "tt_transaction_id",
