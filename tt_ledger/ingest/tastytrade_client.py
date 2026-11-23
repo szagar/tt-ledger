@@ -183,7 +183,7 @@ class TastyTradeClient:
         against the balances-and-positions OpenAPI spec; a ``/balances/{currency}`` variant
         exists too, but the currency-less form is the canonical current snapshot)."""
         body = await self._get(f"/accounts/{account_number}/balances", {})
-        return balance_from_json(body.get("data", {}))
+        return balance_from_json(_balance_object(body.get("data", {})))
 
 
 def now_with_margin(expires_in_seconds: int) -> datetime:
@@ -324,6 +324,25 @@ def position_from_json(item: dict) -> BrokerPosition:
         multiplier=int(float(multiplier)) if multiplier is not None else 1,
         expires_at=parse_datetime(item.get("expires-at")),
     )
+
+
+def _balance_object(data: dict) -> dict:
+    """The AccountBalance object from a ``/balances`` answer, in either shape.
+
+    Without an ``Accept-Version`` header ``data`` IS the balance object. Under
+    ``Accept-Version: 20261012`` (measured 2026-11-23, zts-lab ``docs/vendors/tastytrade.md`` §3)
+    ``data`` becomes ``{"items": [...]}``, one balance per currency — the ``/balances/{currency}``
+    variant keeps the old shape. Take the USD item, else the first; an empty list yields ``{}``.
+    """
+    if not isinstance(data, dict):
+        return {}
+    items = data.get("items")
+    if items is None:
+        return data
+    for item in items:
+        if item.get("currency") == "USD":
+            return item
+    return items[0] if items else {}
 
 
 def balance_from_json(item: dict) -> BalanceMessage:
