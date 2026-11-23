@@ -424,3 +424,44 @@ def test_from_login_config_builds_a_client():
     client = TastyTradeClient.from_login_config(config)
     assert client._client_id == "id"
     assert client._refresh_token == "refresh"
+
+
+BALANCE = {
+    "account-number": "5WT0001",
+    "currency": "USD",
+    "net-liquidating-value": "12345.67",
+    "cash-balance": "1000.00",
+    "updated-at": "2026-11-23T16:00:00.000+00:00",
+}
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        BALANCE,  # no Accept-Version: data is the balance object
+        {"items": [{**BALANCE, "currency": "EUR", "net-liquidating-value": "1.00"}, BALANCE]},  # 20261012
+    ],
+    ids=["object", "items"],
+)
+async def test_get_balances_reads_either_shape(data):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth/token":
+            return _json_response(200, TOKEN_RESPONSE)
+        if request.url.path == "/accounts/5WT0001/balances":
+            return _json_response(200, {"data": data})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    bal = await _make_client(handler).get_balances("5WT0001")
+    assert bal.account_number == "5WT0001"
+    assert bal.net_liquidating_value == Decimal("12345.67")
+    assert bal.cash_balance == Decimal("1000.00")
+
+
+async def test_get_balances_empty_items_is_an_empty_snapshot():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth/token":
+            return _json_response(200, TOKEN_RESPONSE)
+        return _json_response(200, {"data": {"items": []}})
+
+    bal = await _make_client(handler).get_balances("5WT0001")
+    assert bal.net_liquidating_value is None
